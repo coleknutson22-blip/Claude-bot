@@ -303,18 +303,142 @@ class Repo:
         return {r["symbol"]: r["reason"] for r in rows}
 
     # ------------------------------------------------------------- telegram
+    # Durable outbox. The state machine is:
+    #
+    #     (no row) --claim--> PENDING --deliver--> SENT     [terminal]
+    #                            |  ^                 
+    #                            |  +--release--+     (failed attempt, retryable)
+    #                            +--exhausted--> FAILED    [terminal, audited]
+    #
+    # Nothing is ever marked SENT before the transport confirms delivery, which
+    # is what makes a failed send recoverable instead of silently swallowed.
+    CLAIMED, ALREADY_SENT, IN_FLIGHT, GAVE_UP = (
+        "CLAIMED", "ALREADY_SENT", "IN_FLIGHT", "GAVE_UP")
+
     def telegram_already_sent(self, key: str) -> bool:
         return self.conn.execute(
-            "SELECT 1 FROM telegram_outbox WHERE dedupe_key=?", (key,)).fetchone() is not None
+            "SELECT 1 FROM telegram_outbox WHERE dedupe_key=? AND status='SENT'",
+            (key,)).fetchone() is not None
 
-    def mark_telegram_sent(self, key: str, kind: str = "") -> bool:
+    def telegram_status(self, key: str) -> dict | None:
+        r = self.conn.execute(
+            "SELECT * FROM telegram_outbox WHERE dedupe_key=?", (key,)).fetchone()
+        return dict(r) if r else None
+
+    def claim_telegram(self, key: str, kind: str = "", text: str = "",
+                       lease_ms: int = 120_000, max_attempts: int = 12) -> str:
+        """Reserve the right to deliver `key`, atomically.
+
+        Returns CLAIMED (go ahead and send), ALREADY_SENT (delivered before --
+        suppress), IN_FLIGHT (another attempt holds an unexpired lease --
+        suppress, this is the anti-duplicate-spam guard) or GAVE_UP (attempt
+        budget exhausted).
+        """
+        now = now_ms()
         try:
             self.conn.execute(
-                "INSERT INTO telegram_outbox(dedupe_key, sent_ms, kind) VALUES(?,?,?)",
-                (key, now_ms(), kind))
-            return True
+                """INSERT INTO telegram_outbox(dedupe_key, status, kind, text,
+                       created_ms, claimed_ms, sent_ms, attempts, last_error)
+                   VALUES(?, 'PENDING', ?, ?, ?, ?, 0, 1, '')""",
+                (key, kind, text, now, now))
+            return self.CLAIMED
         except sqlite3.IntegrityError:
-            return False
+            pass
+
+        row = self.conn.execute(
+            "SELECT status, claimed_ms, attempts FROM telegram_outbox WHERE dedupe_key=?",
+            (key,)).fetchone()
+        if row is None:                       # deleted between the two statements
+            return self.IN_FLIGHT
+        if row["status"] == "SENT":
+            return self.ALREADY_SENT
+        if row["status"] == "FAILED":
+            return self.GAVE_UP
+        if now - int(row["claimed_ms"]) < lease_ms:
+            # someone else is mid-delivery; sending now would duplicate it
+            return self.IN_FLIGHT
+        if int(row["attempts"]) >= max_attempts:
+            self.conn.execute(
+                "UPDATE telegram_outbox SET status='FAILED' WHERE dedupe_key=?", (key,))
+            return self.GAVE_UP
+        # compare-and-swap on claimed_ms: only one racer can take the lease
+        cur = self.conn.execute(
+            """UPDATE telegram_outbox SET claimed_ms=?, attempts=attempts+1
+               WHERE dedupe_key=? AND status='PENDING' AND claimed_ms=?""",
+            (now, key, int(row["claimed_ms"])))
+        return self.CLAIMED if cur.rowcount == 1 else self.IN_FLIGHT
+
+    def mark_telegram_delivered(self, key: str) -> None:
+        """Flip to SENT. Only ever called after the transport said OK."""
+        self.conn.execute(
+            """UPDATE telegram_outbox SET status='SENT', sent_ms=?, claimed_ms=0,
+                   last_error='' WHERE dedupe_key=?""", (now_ms(), key))
+
+    def release_telegram_claim(self, key: str, error: str = "",
+                               max_attempts: int = 12) -> None:
+        """Delivery failed. Drop the lease so the message stays retryable --
+        unless the attempt budget is spent, in which case park it as FAILED so
+        it stops consuming cycles but remains visible for audit."""
+        row = self.conn.execute(
+            "SELECT attempts FROM telegram_outbox WHERE dedupe_key=?", (key,)).fetchone()
+        if row is None:
+            return
+        status = "FAILED" if int(row["attempts"]) >= max_attempts else "PENDING"
+        self.conn.execute(
+            "UPDATE telegram_outbox SET status=?, claimed_ms=0, last_error=? "
+            "WHERE dedupe_key=? AND status='PENDING'",
+            (status, error[:200], key))
+
+    def pending_telegram(self, limit: int = 50, ready_before_ms: int | None = None
+                         ) -> list[dict]:
+        """Undelivered messages, oldest first. `ready_before_ms` filters out
+        rows whose lease has not yet expired."""
+        q = "SELECT * FROM telegram_outbox WHERE status='PENDING'"
+        args: list[Any] = []
+        if ready_before_ms is not None:
+            q += " AND claimed_ms <= ?"
+            args.append(ready_before_ms)
+        q += " ORDER BY created_ms LIMIT ?"
+        args.append(limit)
+        return [dict(r) for r in self.conn.execute(q, tuple(args))]
+
+    def telegram_outbox_counts(self) -> dict[str, int]:
+        return {r["status"]: int(r["n"]) for r in self.conn.execute(
+            "SELECT status, COUNT(*) AS n FROM telegram_outbox GROUP BY status")}
+
+    def prune_telegram_outbox(self, older_than_ms: int) -> None:
+        """Only delivered rows are prunable. PENDING and FAILED are kept."""
+        self.conn.execute(
+            "DELETE FROM telegram_outbox WHERE status='SENT' AND sent_ms < ?",
+            (older_than_ms,))
+
+    # ------------------------------------------------------- broad universe
+    def save_broad_universe(self, source: str, fetched_ms: int, as_of_ms: int,
+                            assets: list[dict], content_hash: str) -> None:
+        """Append-only: every fetch is retained with its provenance."""
+        self.conn.execute(
+            """INSERT OR REPLACE INTO broad_universe_cache
+               (fetched_ms, source, as_of_ms, n_assets, content_hash, payload)
+               VALUES(?,?,?,?,?,?)""",
+            (fetched_ms, source, as_of_ms, len(assets), content_hash,
+             json.dumps(assets, separators=(",", ":"))))
+
+    def latest_broad_universe(self, min_assets: int = 1) -> dict | None:
+        """Most recent cached snapshot that still meets the size floor."""
+        r = self.conn.execute(
+            """SELECT * FROM broad_universe_cache WHERE n_assets >= ?
+               ORDER BY fetched_ms DESC LIMIT 1""", (min_assets,)).fetchone()
+        if r is None:
+            return None
+        d = dict(r)
+        d["assets"] = json.loads(d.pop("payload"))
+        return d
+
+    def prune_broad_universe(self, keep: int = 60) -> None:
+        self.conn.execute(
+            """DELETE FROM broad_universe_cache WHERE fetched_ms NOT IN
+               (SELECT fetched_ms FROM broad_universe_cache
+                ORDER BY fetched_ms DESC LIMIT ?)""", (keep,))
 
     # ------------------------------------------------------------- versions
     def record_strategy_version(self, strategy: str, version: str, cfg: dict) -> None:

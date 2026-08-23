@@ -14,7 +14,24 @@ rate_limit_ms = 250
 ohlcv_limit = 300         # candles fetched per request
 
 [universe]
-top_n = 200               # rank the whole venue by 24h dollar volume, keep top 200
+# "Top 200" means the top ~200 legitimate crypto ASSETS by market capitalisation
+# -- a venue-independent definition -- intersected with what this exchange
+# actually lists. It is NOT the exchange's own highest-volume markets: that list
+# is a snapshot of where speculation is pointed today, changes with fee
+# campaigns and listing promotions, and makes backtests irreproducible.
+# See crypto_edge/data/broad_universe.py.
+broad_source = "coingecko"        # "coingecko" | "static" | "none"
+broad_limit = 200                 # size of the broad asset list
+broad_min_assets = 50             # fewer than this means the provider is broken
+broad_refresh_hours = 12          # market caps move slowly
+broad_max_cache_age_hours = 168   # a week-old cached universe stops being usable
+broad_static_assets = []          # only used when broad_source = "static"
+# With neither a live nor a usable cached broad universe, NEW ENTRIES STOP.
+# Open positions keep being managed regardless -- the ranking provider is never
+# allowed to become a single point of failure for risk already on the books.
+require_broad_universe = true
+
+top_n = 200               # keep the top 200 of the broad asset ranking
 max_tradable = 40         # then hand at most 40 to the strategy each cycle
 refresh_minutes = 360
 min_dollar_volume_24h = 5_000_000.0
@@ -76,6 +93,17 @@ slippage_bps = 6.0        # modelled cost on normal entries/exits
 stop_slippage_bps = 15.0  # stops fill worse; gaps fill at the next open
 use_book_spread = true    # cross the real quoted spread when a quote exists
 max_spread_bps_entry = 25.0
+# NEW ENTRIES FAIL CLOSED on a quote we cannot trust. Missing, invalid, stale,
+# malformed or unavailable -> no entry, reason journalled. Exits are exempt:
+# an open position must stay manageable whether or not a quote is available.
+max_quote_age_s = 90
+max_quote_future_skew_s = 30
+max_quote_deviation_pct = 10.0
+# Position size is computed against the SIMULATED FILL (ask + slippage + tick
+# rounding), never the signal candle's close, and re-checked against the fill
+# before the position is committed. This is the tolerance on that re-check --
+# float noise only, not room for real risk drift.
+risk_overshoot_tolerance_pct = 1.0
 
 [safety]
 # mode and live_trading_enabled are FORCED to PAPER/false in code.
@@ -94,7 +122,14 @@ daily_report_hour_utc = 0
 stop_update_min_pct = 0.75   # suppress trivial trail nudges
 error_cooldown_s = 900       # one failing loop must not spam the chat
 timeout_s = 10
-max_retries = 3
+max_retries = 3              # transport retries inside a single attempt
+# Durable outbox: a deduplicated message is written PENDING before the send and
+# only marked SENT once Telegram confirms it, so a failed delivery stays
+# recoverable across a restart instead of being silently swallowed.
+outbox_lease_s = 120         # how long one in-flight send holds a dedupe key
+outbox_max_attempts = 12     # retries before a message is parked as FAILED
+outbox_flush_limit = 20      # pending messages replayed per cycle
+outbox_retention_days = 30   # how long DELIVERED rows are kept
 
 [engine]
 poll_seconds = 30

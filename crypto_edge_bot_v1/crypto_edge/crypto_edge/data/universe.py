@@ -1,9 +1,28 @@
-"""Dynamic market universe: scan broadly, filter aggressively.
+"""Venue-level universe filtering: intersect, then filter aggressively.
 
-The top-N list is the RESEARCH universe. Only assets that survive every
-liquidity/tradability filter enter the strategy pipeline, and every rejection
-is recorded with its reason so we can later audit whether the filters help or
-merely cost us trades.
+This is stage 1 of the pipeline. What counts as a legitimate asset is decided
+upstream, by `broad_universe.BroadUniverseService` (a market-cap ranking that
+does not depend on our exchange); this module decides which of those assets we
+can actually trade here, and how well.
+
+    BROAD TOP ~200 (upstream)
+        -> intersect with this venue's markets      <-- this module
+        -> static filters: stablecoin/wrapped/staked/leveraged/blacklist
+        -> liquidity + spread filters
+        -> [after OHLCV] history, age and volatility filters
+        -> strategy ranking
+
+Ordering into the strategy pipeline follows the BROAD rank (market cap) when a
+broad universe is supplied, not the venue's volume table. Exchange volume is
+still used as a liquidity FILTER -- it just no longer defines membership,
+because "what is being churned hardest today" is not a definition of an asset.
+
+Passing `broad=None` falls back to pure volume ranking. That path exists for
+unit-testing the filters in isolation; the engine never uses it, because
+without a broad universe it fails closed instead (see `TradingEngine`).
+
+Every rejection is recorded with its reason so we can later audit whether the
+filters help or merely cost us trades.
 """
 from __future__ import annotations
 
@@ -72,21 +91,60 @@ class UniverseBuilder:
             return (ask - bid) / mid * 10_000.0
         return float("nan")
 
+    def rank_by_broad_universe(self, broad, tickers: dict[str, dict],
+                               markets: dict[str, MarketMeta]
+                               ) -> list[tuple[str, float, int | None]]:
+        """Order the venue's markets by their BROAD (market-cap) rank.
+
+        Markets whose base asset is absent from the broad universe get rank
+        None and are rejected downstream -- that is the intersection. Volume is
+        carried along for the liquidity filter and as a tiebreak among assets
+        the broad list does not separate.
+        """
+        rows: list[tuple[str, float, int | None]] = []
+        for sym, qv in self.rank_by_volume(tickers, markets):
+            base = markets[sym].base.upper()
+            rows.append((sym, qv, broad.rank_of(base)))
+        # unranked assets sort last, then by descending volume within a rank
+        rows.sort(key=lambda r: (r[2] is None, r[2] if r[2] is not None else 0, -r[1]))
+        return rows
+
     def build_candidates(self, markets: dict[str, MarketMeta],
-                         tickers: dict[str, dict]) -> tuple[list[str], list[dict]]:
-        """Stage 1: symbol-level and liquidity filters. Returns
-        (candidate symbols, audit rows)."""
+                         tickers: dict[str, dict],
+                         broad=None) -> tuple[list[str], list[dict]]:
+        """Stage 1: intersection, symbol-level and liquidity filters.
+
+        Returns (candidate symbols in pipeline order, audit rows). With `broad`
+        supplied, membership and ordering come from the broad universe; without
+        it, the legacy volume ranking is used (unit tests only -- see module
+        docstring).
+        """
         c = self.cfg
         audit: list[dict] = []
-        ranked = self.rank_by_volume(tickers, markets)
         keep: list[str] = []
 
-        for rank, (sym, qv) in enumerate(ranked, start=1):
+        if broad is not None:
+            ordered = self.rank_by_broad_universe(broad, tickers, markets)
+        else:
+            ordered = [(sym, qv, None) for sym, qv in
+                       self.rank_by_volume(tickers, markets)]
+
+        for position, (sym, qv, broad_rank) in enumerate(ordered, start=1):
             meta = markets[sym]
+            rank = broad_rank if broad_rank is not None else position
             row = {"symbol": sym, "rank": rank, "dollar_volume": qv,
                    "spread_bps": None, "included": False, "reject_reason": ""}
+
+            if broad is not None and broad_rank is None:
+                if sym not in c.always_include:
+                    row["reject_reason"] = "not in the broad top-N asset universe"
+                    audit.append(row)
+                    continue
+                row["rank"] = rank = position
             if rank > c.top_n and sym not in c.always_include:
-                row["reject_reason"] = f"outside top {c.top_n} by volume"
+                row["reject_reason"] = (
+                    f"outside top {c.top_n} by market cap" if broad is not None
+                    else f"outside top {c.top_n} by volume")
                 audit.append(row)
                 continue
             reason = self.static_reject(meta)
@@ -131,11 +189,14 @@ class UniverseBuilder:
                 return f"too volatile (ATR {atr_pct:.2f}% > {c.max_atr_pct}%)"
         return ""
 
-    def log_audit(self, audit: list[dict]) -> None:
+    def log_audit(self, audit: list[dict], broad=None) -> None:
         included = sum(1 for r in audit if r["included"])
+        extra = {"broad_source": broad.source, "broad_assets": len(broad),
+                 "broad_from_cache": broad.from_cache, "broad_stale": broad.stale}\
+            if broad is not None else {}
         log_event("data", "INFO", "universe refreshed",
                   scanned=len(audit), included=included,
-                  top_rejections=_top_reasons(audit))
+                  top_rejections=_top_reasons(audit), **extra)
 
 
 def _top_reasons(audit: list[dict], n: int = 6) -> dict[str, int]:

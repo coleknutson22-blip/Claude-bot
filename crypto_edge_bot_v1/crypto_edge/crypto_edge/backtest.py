@@ -196,8 +196,12 @@ class Backtester:
                     break
                 # FILL ON NEXT BAR'S OPEN — the signal bar's close is gone
                 next_open = float(series_1h[sig.symbol].open[i + 1])
+                # Size against the price the fill will actually land on (open
+                # plus modelled slippage), not the bare open. Same rule as the
+                # live engine, so backtest risk and live risk mean the same thing.
+                est_fill = self.broker.expected_entry_price(next_open, None, meta)
                 sizing = self.broker.size_position(
-                    equity=equity, cash=cash, entry_price=next_open,
+                    equity=equity, cash=cash, entry_price=est_fill,
                     stop_price=sig.stop_price, risk_pct=cfg.risk.risk_per_trade_pct,
                     max_position_pct=cfg.risk.max_position_pct,
                     current_exposure=exposure,

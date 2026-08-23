@@ -38,7 +38,10 @@ def _bootstrap(args, need_feed: bool = True):
                                 enabled=cfg.telegram.enabled,
                                 timeout_s=cfg.telegram.timeout_s,
                                 max_retries=cfg.telegram.max_retries,
-                                error_cooldown_s=cfg.telegram.error_cooldown_s)
+                                error_cooldown_s=cfg.telegram.error_cooldown_s,
+                                outbox_lease_s=cfg.telegram.outbox_lease_s,
+                                outbox_max_attempts=cfg.telegram.outbox_max_attempts,
+                                outbox_flush_limit=cfg.telegram.outbox_flush_limit)
     feed = None
     if need_feed:
         from .data.ccxt_feed import CCXTFeed
@@ -47,12 +50,25 @@ def _bootstrap(args, need_feed: bool = True):
     return cfg, repo, feed, notifier
 
 
+def _broad_service(cfg: Config, repo: Repo):
+    """The broad (market-cap) asset universe service, built from config."""
+    from .data.broad_universe import BroadUniverseService
+    from .engine import _build_broad_provider
+    return BroadUniverseService(
+        repo, _build_broad_provider(cfg), limit=cfg.universe.broad_limit,
+        min_assets=cfg.universe.broad_min_assets,
+        refresh_hours=cfg.universe.broad_refresh_hours,
+        max_cache_age_hours=cfg.universe.broad_max_cache_age_hours)
+
+
 # ------------------------------------------------------------------ commands
 def cmd_selfcheck(args) -> int:
     from .selfcheck import run_selfcheck
     offline = args.offline
     cfg, repo, feed, notifier = _bootstrap(args, need_feed=not offline)
-    rep = run_selfcheck(cfg, repo, feed, notifier, check_network=not offline)
+    broad = _broad_service(cfg, repo) if not offline else None
+    rep = run_selfcheck(cfg, repo, feed, notifier, check_network=not offline,
+                        broad_service=broad)
     print(rep.render())
     return 0 if rep.passed else 1
 
@@ -62,7 +78,8 @@ def cmd_start(args) -> int:
     from .selfcheck import run_selfcheck
     cfg, repo, feed, notifier = _bootstrap(args)
 
-    rep = run_selfcheck(cfg, repo, feed, notifier, check_network=True)
+    rep = run_selfcheck(cfg, repo, feed, notifier, check_network=True,
+                        broad_service=_broad_service(cfg, repo))
     print(rep.render())
     if not rep.passed:
         print("\nRefusing to start. Fix the FAIL items above.", file=sys.stderr)

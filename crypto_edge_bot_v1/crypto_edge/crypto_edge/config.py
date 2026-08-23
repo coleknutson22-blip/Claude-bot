@@ -62,6 +62,19 @@ class UniverseCfg:
         "SAVAX", "STSOL", "MSOL", "JITOSOL"])
     always_include: list[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
     blacklist: list[str] = field(default_factory=list)
+    # --- broad (venue-independent) asset universe ------------------------
+    # "Top 200" means the top ~200 legitimate crypto ASSETS by market cap,
+    # intersected with what this exchange lists -- NOT the exchange's own
+    # highest-volume markets. See data/broad_universe.py.
+    broad_source: str = "coingecko"     # "coingecko" | "static" | "none"
+    broad_limit: int = 200              # how many assets the broad list holds
+    broad_min_assets: int = 50          # fewer than this = provider is broken
+    broad_refresh_hours: int = 12       # market caps move slowly; so do we
+    broad_max_cache_age_hours: int = 168  # a week-old cache stops being usable
+    broad_static_assets: list[str] = field(default_factory=list)
+    # With no live and no usable cached broad universe, NEW ENTRIES stop.
+    # Open positions are managed regardless -- see TradingEngine.fetch_data.
+    require_broad_universe: bool = True
 
 
 @dataclass
@@ -117,6 +130,17 @@ class ExecutionCfg:
     stop_slippage_bps: float = 15.0     # stops fill worse than limit orders
     use_book_spread: bool = True        # cross the spread when a quote exists
     max_spread_bps_entry: float = 25.0  # refuse to trade a blown-out book
+    # --- entry quote validation: NEW ENTRIES FAIL CLOSED ------------------
+    # A new position may only be opened against a live quote we can trust.
+    # Missing, invalid, stale, malformed or unavailable -> no entry. These do
+    # NOT gate exits: an open position must always be manageable, quote or not.
+    max_quote_age_s: int = 90           # older than this is stale -> no entry
+    max_quote_future_skew_s: int = 30   # a quote stamped ahead of us is broken
+    max_quote_deviation_pct: float = 10.0   # quote vs signal reference sanity
+    # Final sizing is done against the SIMULATED FILL, not the signal candle's
+    # close. This is the tolerance on the post-sizing risk revalidation, and
+    # exists only to absorb float/rounding noise -- not real risk drift.
+    risk_overshoot_tolerance_pct: float = 1.0
 
 
 @dataclass
@@ -137,7 +161,12 @@ class TelegramCfg:
     stop_update_min_pct: float = 0.75   # only notify meaningful stop moves
     error_cooldown_s: int = 900         # anti-spam
     timeout_s: int = 10
-    max_retries: int = 3
+    max_retries: int = 3                # transport retries within one attempt
+    # --- durable outbox (see notify/telegram.py) ------------------------
+    outbox_lease_s: int = 120           # how long one in-flight send holds a key
+    outbox_max_attempts: int = 12       # cycles of retry before parking as FAILED
+    outbox_flush_limit: int = 20        # pending messages replayed per cycle
+    outbox_retention_days: int = 30     # how long DELIVERED rows are kept
 
 
 @dataclass
@@ -200,8 +229,24 @@ class Config:
             errs.append("strategy.warmup_bars must exceed ema_trend by a margin")
         if self.universe.max_tradable > self.universe.top_n:
             errs.append("universe.max_tradable cannot exceed top_n")
+        if self.universe.broad_source not in ("coingecko", "static", "none"):
+            errs.append("universe.broad_source must be coingecko, static or none")
+        if self.universe.broad_source == "static" and not self.universe.broad_static_assets:
+            errs.append("universe.broad_source='static' requires broad_static_assets")
+        if self.universe.broad_min_assets < 1:
+            errs.append("universe.broad_min_assets must be >= 1")
+        if (self.universe.require_broad_universe
+                and self.universe.broad_source == "none"):
+            errs.append("universe.require_broad_universe needs a broad_source "
+                        "(set one, or explicitly disable the requirement)")
         if self.execution.taker_fee_bps < 0 or self.execution.slippage_bps < 0:
             errs.append("fees and slippage must be non-negative")
+        if self.execution.max_quote_age_s <= 0:
+            errs.append("execution.max_quote_age_s must be > 0")
+        if self.execution.max_quote_deviation_pct <= 0:
+            errs.append("execution.max_quote_deviation_pct must be > 0")
+        if not (0 <= self.execution.risk_overshoot_tolerance_pct <= 25):
+            errs.append("execution.risk_overshoot_tolerance_pct must be in [0, 25]")
         if self.telegram.enabled and not (self.telegram_token and self.telegram_chat_id):
             errs.append("telegram enabled but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are unset")
         return errs

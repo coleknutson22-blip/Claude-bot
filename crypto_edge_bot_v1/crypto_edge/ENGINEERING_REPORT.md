@@ -98,7 +98,7 @@ message text (defect 2 above), not a wrong severity.
 
 ## TEST RESULTS
 
-**195 tests, all passing.** Run: `python -m crypto_edge.cli test`
+**306 tests, all passing.** Run: `python -m crypto_edge.cli test`
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -106,9 +106,13 @@ message text (defect 2 above), not a wrong severity.
 | `test_account.py` | 17 | Cash reconciliation, atomicity, duplicate guards, full restart persistence |
 | `test_risk_and_stops.py` | 24 | Circuit breakers, entry gates, correlation, stop ratcheting, time stops |
 | `test_lookahead.py` | 25 | Candle closure, indicator causality, determinism, backtest slicing |
-| `test_research_intel.py` | 45 | `observed_at` visibility, classification, blocking, counterfactuals, universe filters |
+| `test_research_intel.py` | 45 | `observed_at` visibility, classification, blocking, counterfactuals, venue universe filters |
 | `test_performance.py` | 22 | Win rate, profit factor, expectancy, drawdown, sample-size honesty |
-| `test_telegram.py` | 17 | Formatter content, retry, dedupe across restart, fail-safe, error cooldown |
+| `test_telegram.py` | 17 | Formatter content, retry, fail-safe, error cooldown |
+| `test_telegram_outbox.py` | 23 | PENDING→SENT outbox, total outage, recovery, restart mid-failure, duplicate suppression, v1→v2 migration |
+| `test_entry_quote_gate.py` | 28 | Missing/invalid/stale/malformed/crossed/wide quotes fail closed; exits unaffected |
+| `test_entry_sizing.py` | 24 | Expected fill == real fill, sizing on the fill, revalidation, slippage/rounding/allocation/fee interaction |
+| `test_broad_universe.py` | 36 | Market-cap universe, intersection, caching + provenance, outage fallback, fail-closed entries |
 | `test_engine.py` | 12 | End-to-end entry, stop exit, stale data, breakers, restart mid-position |
 | `test_selfcheck.py` | 12 | Fail-closed behaviour, critical vs warning, log severity |
 
@@ -276,10 +280,18 @@ ability to reason about ordering, but it means latency shows up as missed bars
 rather than as queued work.
 
 **6. News and derivatives are architecture, not data.** Both ship disabled
-because no provider is wired. The storage, look-ahead guard and blocking logic
-are built and tested; the feeds are not written.
+because no provider is wired. The storage, look-ahead guard, classification and
+blocking logic are built and tested; the feeds are not. Stated precisely, since
+this is easy to overstate: no provider is constructed anywhere in the running
+system (`NewsEngine(repo, [])`, `DerivativesEngine(repo, [])`), and
+`NewsEngine.poll()` / `DerivativesEngine.poll()` are never called by the engine
+cycle, so `intel.news_poll_minutes` and `intel.derivatives_poll_minutes`
+currently drive nothing. The read paths (`context_for`, `blocking_event`) are
+live but query tables no production code writes to. **A news event cannot
+currently stop a trade, and no funding or open-interest data is being
+recorded.** See the status table in the README.
 
-**7. Synthetic test data is a limited proxy.** 195 passing tests prove the
+**7. Synthetic test data is a limited proxy.** 306 passing tests prove the
 system is internally consistent and behaves correctly against data I generated.
 They cannot prove it behaves correctly against data reality generates.
 

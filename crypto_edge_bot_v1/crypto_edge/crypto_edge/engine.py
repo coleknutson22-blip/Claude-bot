@@ -25,6 +25,9 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .config import Config
+from .data.broad_universe import (BroadUniverseService,
+                                  CoinGeckoUniverseProvider,
+                                  StaticBroadUniverseProvider)
 from .data.feed import DataUnavailable
 from .data.universe import UniverseBuilder
 from .execution.paper_broker import PaperBroker
@@ -63,6 +66,11 @@ class EngineStatus:
     last_universe_refresh_ms: int = 0
     last_snapshot_ms: int = 0
     universe: list[str] = field(default_factory=list)
+    broad_universe_ok: bool = False
+    broad_universe_reason: str = "not refreshed yet"
+    broad_universe_source: str = ""
+    broad_universe_n: int = 0
+    broad_universe_stale: bool = False
     btc_regime: str = UNKNOWN
     btc_regime_score: float = 50.0
     breadth: float = 50.0
@@ -73,7 +81,8 @@ class EngineStatus:
 
 
 class TradingEngine:
-    def __init__(self, cfg: Config, repo: Repo, feed, notifier: TelegramNotifier) -> None:
+    def __init__(self, cfg: Config, repo: Repo, feed, notifier: TelegramNotifier,
+                 broad_provider=None) -> None:
         self.cfg = cfg
         self.repo = repo
         self.feed = feed
@@ -88,6 +97,12 @@ class TradingEngine:
         self.journal = ResearchJournal(repo)
         self.perf = PerformanceCalculator(repo)
         self.universe_builder = UniverseBuilder(cfg.universe)
+        self.broad_universe = BroadUniverseService(
+            repo, broad_provider or _build_broad_provider(cfg),
+            limit=cfg.universe.broad_limit,
+            min_assets=cfg.universe.broad_min_assets,
+            refresh_hours=cfg.universe.broad_refresh_hours,
+            max_cache_age_hours=cfg.universe.broad_max_cache_age_hours)
         self.news = NewsEngine(repo, [], cfg.intel.news_block_severity,
                                cfg.intel.news_block_hours)
         self.derivatives = DerivativesEngine(repo, [])
@@ -119,6 +134,15 @@ class TradingEngine:
 
     # ============================================================== universe
     def refresh_universe(self, force: bool = False) -> list[str]:
+        """Rebuild the tradable universe:
+
+            broad top-N assets (market cap)  ->  intersect with this venue
+            ->  static/liquidity/spread filters  ->  cap at max_tradable
+
+        A failure here suppresses NEW ENTRIES only. Open positions are always
+        managed (see `fetch_data`), so a third-party ranking API can never
+        strand risk we already hold.
+        """
         due = (force or self.status.last_universe_refresh_ms == 0 or
                now_ms() - self.status.last_universe_refresh_ms >=
                self.cfg.universe.refresh_minutes * 60_000)
@@ -132,20 +156,70 @@ class TradingEngine:
             self.notifier.send_error("universe refresh", str(e))
             return self.status.universe
 
+        broad = self.broad_universe.get(force=force)
+        if broad is None:
+            # No live ranking and no usable cache: we cannot say what is a
+            # legitimate asset, so we do not open anything new. FAIL CLOSED.
+            self.status.broad_universe_ok = False
+            self.status.broad_universe_reason = (
+                self.broad_universe.last_error
+                or "no current or cached broad universe available")
+            self.status.broad_universe_source = ""
+            self.status.broad_universe_n = 0
+            self.status.broad_universe_stale = False
+            self.status.universe = []
+            self.status.last_universe_refresh_ms = now_ms()
+            log_event("data", "ERROR",
+                      "broad universe unavailable -- new entries suspended",
+                      reason=self.status.broad_universe_reason)
+            self.notifier.send_error("broad universe",
+                                     self.status.broad_universe_reason)
+            return self.status.universe
+
+        self.status.broad_universe_ok = True
+        self.status.broad_universe_reason = ""
+        self.status.broad_universe_source = broad.source
+        self.status.broad_universe_n = len(broad)
+        self.status.broad_universe_stale = bool(broad.stale)
+        if broad.stale:
+            # A fresh cache hit is the normal steady state (we refresh every few
+            # hours and cycle every few seconds) and is not worth a warning.
+            # A STALE one means the provider is failing -- that is.
+            log_event("data", "WARNING",
+                      "broad universe is stale; provider may be down",
+                      **broad.provenance())
+
         candidates, audit = self.universe_builder.build_candidates(
-            self._markets, self._tickers)
+            self._markets, self._tickers, broad)
         self.repo.add_universe_snapshot(now_ms(), audit)
-        self.universe_builder.log_audit(audit)
+        self.universe_builder.log_audit(audit, broad)
         # cap the pipeline: the top-N list is for scanning, not for trading
         self.status.universe = candidates[:self.cfg.universe.max_tradable]
         self.status.last_universe_refresh_ms = now_ms()
         return self.status.universe
 
+    def entries_allowed(self) -> tuple[bool, str]:
+        """New entries require a universe we can justify. Open positions do not."""
+        if not self.cfg.universe.require_broad_universe:
+            return True, ""
+        if not self.status.broad_universe_ok:
+            return False, ("no valid broad asset universe: "
+                           + (self.status.broad_universe_reason or "unavailable"))
+        return True, ""
+
     # =========================================================== market data
     def fetch_data(self, symbols: list[str]) -> None:
-        """Fetch and immediately discard any unfinished candle."""
+        """Fetch and immediately discard any unfinished candle.
+
+        Open-position symbols are ALWAYS included, regardless of whether they
+        are still in the scanning universe. Without this, a universe provider
+        outage (or an asset simply dropping out of the top-N) would leave a
+        live position with no candles, hence no stop evaluation -- turning a
+        research-data problem into an unmanaged-risk problem.
+        """
         c = self.cfg
-        needed = list(dict.fromkeys(symbols + [c.strategy.btc_symbol]))
+        held = [p.symbol for p in self.account.positions()]
+        needed = list(dict.fromkeys(held + list(symbols) + [c.strategy.btc_symbol]))
         now = now_ms()
         ok = 0
         for sym in needed:
@@ -250,7 +324,17 @@ class TradingEngine:
             # --- 2. strategy exits ------------------------------------------
             reason = self.strategy.should_exit(pos, s, ctx)
             if reason:
+                # An exit is never blocked for want of a quote -- but a
+                # STRUCTURALLY broken one must not price the fill either.
+                # Dropping it falls the broker back to the reference price,
+                # which is the safe behaviour; refusing to exit is not.
                 quote = self._safe_quote(pos.symbol)
+                bad = self.broker.quote_structure_error(quote)
+                if quote is not None and bad:
+                    log_event("data", "WARNING",
+                              "ignoring unusable quote for exit; using reference price",
+                              symbol=pos.symbol, reason=bad)
+                    quote = None
                 exit_fill = self.broker.sell(pos.symbol, pos.qty, price, quote, meta,
                                              ts_ms=now_ms(), reason=reason)
                 self._close(pos, exit_fill, reason)
@@ -411,16 +495,31 @@ class TradingEngine:
             self.journal.record(sig, REJECTED_RISK, "exchange metadata unavailable", rank)
             return False
 
+        # ---- 1. the quote gate: NEW ENTRIES FAIL CLOSED --------------------
+        # A missing, invalid, stale, malformed or unavailable quote means we
+        # cannot price the trade honestly, so we do not take it. Exits are
+        # deliberately exempt (see manage_positions).
         quote = self._safe_quote(sig.symbol)
-        ok_spread, spread = self.broker.spread_acceptable(quote)
-        if not ok_spread:
-            reason = f"spread {spread:.1f}bps exceeds entry limit"
-            self.risk.log_rejection(sig.symbol, reason)
+        qc = self.broker.validate_entry_quote(
+            quote, ref_price=sig.ref_price,
+            max_age_s=c.execution.max_quote_age_s,
+            max_future_skew_s=c.execution.max_quote_future_skew_s,
+            max_deviation_pct=c.execution.max_quote_deviation_pct)
+        if not qc.ok:
+            reason = f"entry blocked: {qc.reason}"
+            self.risk.log_rejection(sig.symbol, reason, rank=rank)
             self.journal.record(sig, REJECTED_RISK, reason, rank)
             return False
+        spread = qc.spread_bps
 
+        # ---- 2. size against the price we will ACTUALLY fill at ------------
+        # The signal's reference price is a closed candle's close. By the time
+        # we act, the ask has moved; sizing on the stale reference while filling
+        # at the live ask is exactly how a position ends up risking more than
+        # the configured budget.
+        est_fill = self.broker.expected_entry_price(sig.ref_price, quote, meta)
         sizing = self.broker.size_position(
-            equity=equity, cash=self.account.cash(), entry_price=sig.ref_price,
+            equity=equity, cash=self.account.cash(), entry_price=est_fill,
             stop_price=sig.stop_price, risk_pct=c.risk.risk_per_trade_pct,
             max_position_pct=c.risk.max_position_pct, current_exposure=exposure,
             max_exposure_pct=c.risk.max_portfolio_exposure_pct, meta=meta,
@@ -432,11 +531,31 @@ class TradingEngine:
 
         fill = self.broker.buy(sig.symbol, sizing.qty, sig.ref_price, quote, meta,
                                ts_ms=now_ms())
+
+        # ---- 3. revalidate against the realised simulated fill -------------
+        # Belt and braces: recompute risk from the fill itself, so no future
+        # change to the fill model can quietly reintroduce over-sizing.
+        ok_risk, risk_reason, actual_risk = self.broker.revalidate_risk(
+            qty=sizing.qty, fill_price=fill.fill_price, stop_price=sig.stop_price,
+            equity=equity, risk_pct=c.risk.risk_per_trade_pct,
+            tolerance_pct=c.execution.risk_overshoot_tolerance_pct)
+        if not ok_risk:
+            self.risk.log_rejection(sig.symbol, risk_reason, rank=rank)
+            self.journal.record(sig, REJECTED_RISK, risk_reason, rank)
+            return False
+
         journal = self.journal.entry_journal(sig, {
             "account_equity": equity, "position_value": fill.notional,
-            "risk_amount": sizing.risk_amount, "rank": rank,
+            "risk_amount": actual_risk, "rank": rank,
             "environment": self.status.environment,
             "spread_bps": spread,
+            "quote_age_s": qc.age_s,
+            "entry_ref_price": sig.ref_price,
+            "expected_fill_price": est_fill,
+            "entry_fill_price": fill.fill_price,
+            "risk_budget": sizing.risk_budget,
+            "risk_at_fill": actual_risk,
+            "est_cost_at_stop": sizing.est_cost_at_stop,
             "config_fingerprint_version": self.strategy.version,
             "derivatives": ctx.derivatives_by_symbol.get(sig.symbol),
             "news": ctx.news_by_symbol.get(sig.symbol),
@@ -445,7 +564,7 @@ class TradingEngine:
         pos = self.account.open_position(
             symbol=sig.symbol, strategy=sig.strategy, strategy_version=sig.version,
             qty=sizing.qty, ref_price=sig.ref_price, fill=fill,
-            initial_stop=sig.stop_price, risk_amount=sizing.risk_amount,
+            initial_stop=sig.stop_price, risk_amount=actual_risk,
             candle_id=sig.candle_id, signal_score=sig.score, journal=journal)
         if pos is None:
             self.journal.record(sig, REJECTED_RISK, "duplicate or insufficient cash", rank)
@@ -459,8 +578,8 @@ class TradingEngine:
             fmt.entry(symbol=sig.symbol, side="long", entry_price=fill.fill_price,
                       qty=sizing.qty, position_value=fill.notional,
                       pct_of_account=fill.notional / equity * 100.0 if equity else 0.0,
-                      stop=sig.stop_price, dollar_risk=sizing.risk_amount,
-                      pct_risk=sizing.risk_amount / equity * 100.0 if equity else 0.0,
+                      stop=sig.stop_price, dollar_risk=actual_risk,
+                      pct_risk=actual_risk / equity * 100.0 if equity else 0.0,
                       score=sig.score, htf_regime=sig.features.get("htf_regime", "?"),
                       btc_regime=ctx.btc_regime, breadth=ctx.breadth_pct,
                       reasons=reasons, equity=new_equity),
@@ -534,6 +653,10 @@ class TradingEngine:
             log_event("app", "WARNING", "counterfactual evaluation failed", error=str(e))
 
         self.repo.prune_processed_candles(now - 30 * DAY_MS)
+        # Only DELIVERED rows are prunable; PENDING and FAILED are kept so an
+        # undelivered critical message can never be silently discarded.
+        self.repo.prune_telegram_outbox(
+            now - c.telegram.outbox_retention_days * DAY_MS)
 
     def _heartbeat(self, equity: float) -> None:
         acct = self.account.state
@@ -575,6 +698,9 @@ class TradingEngine:
     # ================================================================== cycle
     def cycle(self) -> None:
         self.status.cycles += 1
+        # Replay anything the notifier wrote but never delivered -- including
+        # messages left PENDING by a process that died mid-send.
+        self.notifier.flush_pending()
         universe = self.refresh_universe()
         self.fetch_data(universe)
 
@@ -594,12 +720,28 @@ class TradingEngine:
         ctx = self.build_context()
         self.manage_positions(ctx)          # ALWAYS before entries
 
-        if self.check_safety():
-            signals = self.evaluate_signals(ctx)
-            self.rank_and_enter(signals, ctx)
-        else:
+        # Circuit breakers are evaluated FIRST and unconditionally: a drawdown
+        # halt must still trip and persist even on a cycle where we already
+        # know no entries are possible for some other reason.
+        safe = self.check_safety()
+        universe_ok, universe_why = self.entries_allowed()
+
+        if not safe:
             log_event("strategy", "WARNING", "entries suppressed",
                       reason=self.status.halt_reason)
+        elif not universe_ok:
+            log_event("strategy", "ERROR", "entries suspended", reason=universe_why)
+            self.notifier.send(
+                fmt.circuit_breaker(
+                    kind="UNIVERSE UNAVAILABLE", reason=universe_why,
+                    equity=self.account.equity(self.marks()),
+                    action="No new entries; open positions still managed"),
+                dedupe_key=f"universe:{utc_date(now_ms())}:"
+                           f"{int(now_ms() / 3_600_000)}",
+                kind="circuit_breaker")
+        else:
+            signals = self.evaluate_signals(ctx)
+            self.rank_and_enter(signals, ctx)
         self.bookkeeping()
 
     def run(self, max_cycles: int | None = None, sleep=time.sleep) -> None:
@@ -633,6 +775,20 @@ class TradingEngine:
                           universe_size=len(self.status.universe),
                           telegram_ok=self.notifier.enabled),
             kind="bot_start")
+
+
+def _build_broad_provider(cfg: Config):
+    """Construct the configured broad-universe provider, or None.
+
+    `CoinGeckoUniverseProvider` imports `requests` inside `fetch()`, so
+    constructing it here costs nothing and needs no HTTP dependency present.
+    """
+    src = cfg.universe.broad_source
+    if src == "coingecko":
+        return CoinGeckoUniverseProvider()
+    if src == "static":
+        return StaticBroadUniverseProvider(cfg.universe.broad_static_assets)
+    return None
 
 
 def _entry_reasons(sig) -> list[str]:

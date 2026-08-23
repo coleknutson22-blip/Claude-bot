@@ -1,0 +1,19 @@
+# Secrets — never commit these. The README says .env is ignored; this is what
+# actually makes that true.
+.env
+.env.*
+!.env.example
+
+# Runtime state
+data/
+logs/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

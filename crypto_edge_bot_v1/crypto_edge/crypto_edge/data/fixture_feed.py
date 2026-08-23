@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..models import MarketMeta, Quote, Series
-from ..timeutils import tf_ms
+from ..timeutils import now_ms, tf_ms
 
 
 class FixtureFeed:
@@ -78,7 +78,11 @@ class FixtureFeed:
                         return None
                     last = float(sub.close[-1])
                 half = self.spread_bps / 2e4
-                ts = self.clock_ms if self.clock_ms is not None else int(s.open_ms[-1])
+                # A real ticker is stamped when the exchange published it, i.e.
+                # ~now -- NOT with the open time of the last candle, which would
+                # look an entire timeframe stale to the entry quote gate.
+                # `clock_ms` is the simulated now when a test pins the clock.
+                ts = self.clock_ms if self.clock_ms is not None else now_ms()
                 return Quote(symbol, last * (1 - half), last * (1 + half), last, ts)
         return None
 

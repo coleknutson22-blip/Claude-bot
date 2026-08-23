@@ -47,7 +47,8 @@ class SelfCheckReport:
 
 
 def run_selfcheck(cfg: Config, repo: Repo | None, feed, notifier,
-                  check_network: bool = True) -> SelfCheckReport:
+                  check_network: bool = True,
+                  broad_service=None) -> SelfCheckReport:
     rep = SelfCheckReport()
 
     # ---- configuration ---------------------------------------------------
@@ -91,6 +92,43 @@ def run_selfcheck(cfg: Config, repo: Repo | None, feed, notifier,
         rep.add("open positions restored", True, CRITICAL, detail)
     except Exception as e:
         rep.add("open positions restored", False, CRITICAL, str(e))
+
+    # ---- undelivered notifications --------------------------------------
+    # WARNING, not CRITICAL: a stuck outbox means someone is not being told
+    # something, which is serious, but stopping the trader over it would be worse.
+    try:
+        counts = repo.telegram_outbox_counts()
+        pending, failed = counts.get("PENDING", 0), counts.get("FAILED", 0)
+        rep.add("notification outbox", failed == 0, WARNING,
+                f"{pending} pending, {failed} abandoned"
+                + (" -- messages were never delivered" if failed else ""))
+    except Exception as e:
+        rep.add("notification outbox", False, WARNING, str(e))
+
+    # ---- broad asset universe -------------------------------------------
+    # CRITICAL only when entries actually depend on it. Without a universe the
+    # bot still runs and still manages open positions, but it opens nothing new.
+    if broad_service is None:
+        rep.add("broad asset universe", True, WARNING, "not checked")
+    else:
+        try:
+            broad = broad_service.get()
+            if broad is None:
+                rep.add("broad asset universe",
+                        not cfg.universe.require_broad_universe, CRITICAL,
+                        "no current or cached universe -- NEW ENTRIES WILL BE "
+                        "SUSPENDED (" + (broad_service.last_error or "unavailable") + ")")
+            else:
+                p = broad.provenance()
+                rep.add("broad asset universe", True,
+                        WARNING if broad.stale else CRITICAL,
+                        f"{p['n_assets']} assets from {p['source']}, "
+                        f"{'CACHED ' if p['from_cache'] else ''}"
+                        f"{'STALE ' if p['stale'] else ''}"
+                        f"age {p['age_s'] / 3600.0:.1f}h, hash {p['content_hash'][:12]}")
+        except Exception as e:
+            rep.add("broad asset universe",
+                    not cfg.universe.require_broad_universe, CRITICAL, str(e))
 
     # ---- market data (NETWORK) -------------------------------------------
     if not check_network:

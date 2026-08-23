@@ -9,13 +9,21 @@ Design notes:
     derivatives look-ahead structurally impossible rather than merely discouraged.
   * `processed_candles` is the durable duplicate-entry guard: a (symbol,
     timeframe, candle) tuple can only ever be acted on once, across restarts.
+  * `telegram_outbox` is a real outbox, not a "have we seen this key" set. A
+    row is written PENDING *before* the send and only flipped to SENT once the
+    transport confirms delivery, so a failed send stays recoverable across a
+    restart while a delivered one stays deduplicated forever.
+  * `broad_universe_cache` is append-only. Every fetch of the broad
+    (market-cap) asset ranking is kept with its source, its provider timestamp
+    and a content hash, so a universe decision made on any past day can be
+    reproduced exactly and an outage can fall back to the last valid snapshot.
 """
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -215,11 +223,32 @@ CREATE TABLE IF NOT EXISTS no_trade_list (
     expires_ms INTEGER NOT NULL
 );
 
+-- Durable notification outbox. status: PENDING -> SENT (or -> FAILED once
+-- the attempt budget is exhausted). `text` is stored so a message that was
+-- never delivered can be retried after a restart.
 CREATE TABLE IF NOT EXISTS telegram_outbox (
     dedupe_key TEXT PRIMARY KEY,
-    sent_ms INTEGER NOT NULL,
-    kind TEXT NOT NULL DEFAULT ''
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    kind TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL DEFAULT '',
+    created_ms INTEGER NOT NULL DEFAULT 0,
+    claimed_ms INTEGER NOT NULL DEFAULT 0,
+    sent_ms INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS idx_outbox_status ON telegram_outbox(status, claimed_ms);
+
+-- Append-only history of the broad (market-cap) universe snapshots.
+CREATE TABLE IF NOT EXISTS broad_universe_cache (
+    fetched_ms INTEGER PRIMARY KEY,
+    source TEXT NOT NULL,
+    as_of_ms INTEGER NOT NULL,
+    n_assets INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_broad_universe ON broad_universe_cache(fetched_ms DESC);
 
 CREATE TABLE IF NOT EXISTS strategy_versions (
     strategy TEXT NOT NULL,
@@ -244,16 +273,57 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """v1 had a bare `telegram_outbox(dedupe_key, sent_ms, kind)` whose rows
+    meant "this key was claimed", not "this message was delivered". We cannot
+    retroactively tell the two apart, so every pre-existing row is migrated as
+    SENT: suppressing a possibly-delivered old notification is safe, re-sending
+    a batch of stale alerts on upgrade is not."""
+    cols = _columns(conn, "telegram_outbox")
+    if not cols or "status" in cols:
+        return
+    conn.executescript("""
+        ALTER TABLE telegram_outbox ADD COLUMN status TEXT NOT NULL DEFAULT 'SENT';
+        ALTER TABLE telegram_outbox ADD COLUMN text TEXT NOT NULL DEFAULT '';
+        ALTER TABLE telegram_outbox ADD COLUMN created_ms INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE telegram_outbox ADD COLUMN claimed_ms INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE telegram_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE telegram_outbox ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
+        UPDATE telegram_outbox SET status='SENT', created_ms=sent_ms
+         WHERE status IS NULL OR status='';
+    """)
+
+
+MIGRATIONS = {1: _migrate_v1_to_v2}
+
+
 def init_db(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='schema_version'").fetchone() \
+        if _columns(conn, "meta") else None
+    version = int(row["value"]) if row else None
+
+    if version is not None and version != SCHEMA_VERSION:
+        while version in MIGRATIONS:
+            MIGRATIONS[version](conn)
+            version += 1
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema version {row['value']} != expected "
+                f"{SCHEMA_VERSION} and no migration path exists")
+
     conn.executescript(SCHEMA)
-    cur = conn.execute("SELECT value FROM meta WHERE key='schema_version'")
-    row = cur.fetchone()
-    if row is None:
-        conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?)",
+    if version is None:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+            (str(SCHEMA_VERSION),))
+    elif version != int(row["value"]):
+        conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
                      (str(SCHEMA_VERSION),))
-    elif int(row["value"]) != SCHEMA_VERSION:
-        raise RuntimeError(
-            f"database schema version {row['value']} != expected {SCHEMA_VERSION}")
 
 
 def integrity_ok(conn: sqlite3.Connection) -> tuple[bool, str]:

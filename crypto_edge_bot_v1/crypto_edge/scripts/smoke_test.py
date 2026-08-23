@@ -93,6 +93,12 @@ def make_config(db_path: str) -> Config:
     cfg.universe.min_market_age_days = 5
     cfg.universe.min_atr_pct = 0.05
     cfg.universe.refresh_minutes = 0
+    # The broad (market-cap) asset universe is normally fetched from a network
+    # provider. Offline we substitute a fixed list -- the FAIL-CLOSED behaviour
+    # when no universe is available is exercised separately in step [8].
+    cfg.universe.broad_source = "static"
+    cfg.universe.broad_static_assets = ["BTC", "ETH", "SOL"]
+    cfg.universe.broad_min_assets = 1
     return cfg
 
 
@@ -210,10 +216,90 @@ def main() -> int:
 
     print(f"\n[7] notifications formatted (transport faked): {len(transport.sent)}")
 
+    print("\n[8] broad universe provider outage -- expect CACHE FALLBACK")
+    cfg_outage = make_config(db_path)
+    cfg_outage.universe.broad_source = "none"       # provider unreachable
+    engine3 = TradingEngine(cfg_outage, repo2, feed2, notifier2,
+                            broad_provider=None)
+    universe3 = engine3.refresh_universe(force=True)
+    allowed3, why3 = engine3.entries_allowed()
+    print(f"    universe from cache: {universe3}")
+    print(f"    source={engine3.status.broad_universe_source} "
+          f"assets={engine3.status.broad_universe_n} entries_allowed={allowed3}")
+    assert universe3, "an outage with a valid cache must fall back, not fail"
+    assert allowed3, "cache fallback must keep entries available"
+
+    print("\n[9] no provider AND no cache -- expect NEW ENTRIES to fail closed")
+    fresh_db = str(workdir / "no_universe.db")
+    conn4 = db.connect(fresh_db)
+    db.init_db(conn4)
+    repo4 = Repo(conn4)
+    cfg_closed = make_config(fresh_db)
+    cfg_closed.universe.broad_source = "none"
+    notifier4a = TelegramNotifier("smoke-token", "smoke-chat", repo4, enabled=True,
+                                  transport=transport, sleep=lambda _: None)
+    engine4 = TradingEngine(cfg_closed, repo4, feed2, notifier4a,
+                            broad_provider=None)
+    universe4 = engine4.refresh_universe(force=True)
+    allowed4, why4 = engine4.entries_allowed()
+    print(f"    tradable universe: {universe4}")
+    print(f"    entries allowed:   {allowed4}  ({why4})")
+    assert universe4 == [], "no broad universe must mean no scanning universe"
+    assert not allowed4, "no broad universe must suspend NEW entries"
+
+    print("\n[10] an OPEN POSITION is still managed during that outage")
+    # The universe provider must never become a single point of failure for
+    # risk already on the books. Put a position on engine4's books, then run a
+    # full cycle with an EMPTY universe and confirm its candles are still
+    # fetched -- without them, its stop could not be evaluated at all.
+    held_fill = engine4.broker.buy("SOL/USDT", 1.0, float(new_sol[-1]), None,
+                                   feed2.load_markets()["SOL/USDT"], ts_ms=now_ms())
+    engine4.account.open_position(
+        symbol="SOL/USDT", strategy="smoke", strategy_version="0",
+        qty=1.0, ref_price=float(new_sol[-1]), fill=held_fill,
+        initial_stop=float(new_sol[-1]) * 0.5, risk_amount=1.0,
+        candle_id="smoke-outage-candle", signal_score=0.0, journal={})
+
+    engine4.cycle()          # must not raise, universe is still empty
+    assert engine4.status.universe == [], "precondition: universe stayed empty"
+    held = [p.symbol for p in engine4.account.positions()]
+    print(f"    universe={engine4.status.universe} held={held}")
+    print(f"    candles fetched for: {sorted(engine4._series_1h)}")
+    assert held, "the smoke position should still be open"
+    for sym in held:
+        assert sym in engine4._series_1h, (
+            f"{sym} lost its candles during the outage -- its stop could not "
+            f"be evaluated")
+    print("    stop evaluation data present for every open position  OK")
+
+    print("\n[11] telegram outbox -- a failed send stays recoverable")
+    class DeadTransport:
+        def send(self, token, chat_id, text, timeout):
+            return False, "simulated telegram outage"
+
+    notifier3 = TelegramNotifier("smoke-token", "smoke-chat", repo2, enabled=True,
+                                 transport=DeadTransport(), sleep=lambda _: None,
+                                 outbox_lease_s=0)
+    notifier3.send("critical alert", dedupe_key="smoke:recovery", kind="entry")
+    row = repo2.telegram_status("smoke:recovery")
+    print(f"    after outage: status={row['status']} attempts={row['attempts']}")
+    assert row["status"] == "PENDING", "a failed send must not be marked SENT"
+
+    notifier4 = TelegramNotifier("smoke-token", "smoke-chat", repo2, enabled=True,
+                                 transport=transport, sleep=lambda _: None,
+                                 outbox_lease_s=0)
+    recovered = notifier4.flush_pending()
+    row = repo2.telegram_status("smoke:recovery")
+    print(f"    after recovery: delivered={recovered} status={row['status']}")
+    assert recovered == 1 and row["status"] == "SENT", "message was not recovered"
+    assert notifier4.flush_pending() == 0, "a recovered message must not repeat"
+
     print("\n" + "=" * 68)
     print("SMOKE TEST PASSED -- entry, persistence, restart, stop exit,")
-    print("P&L identity and equity reconciliation all verified offline.")
-    print("NOT verified here: live exchange data, real Telegram delivery.")
+    print("P&L identity, equity reconciliation, universe fail-closed and")
+    print("notification recovery all verified offline.")
+    print("NOT verified here: live exchange data, real Telegram delivery,")
+    print("live market-cap universe provider.")
     print("=" * 68)
     shutil.rmtree(workdir, ignore_errors=True)
     return 0

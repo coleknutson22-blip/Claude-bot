@@ -46,6 +46,20 @@ def default_meta(symbol: str = "SOL/USDT") -> MarketMeta:
                       min_amount=0.0001, min_cost=10.0)
 
 
+# The broad (market-cap) asset universe the offline tests run against. Standing
+# in for the live provider, not weakening it: the fail-closed behaviour when no
+# universe is available is asserted explicitly in test_broad_universe.py.
+FIXTURE_BROAD_ASSETS = ["BTC", "ETH", "SOL", "XRP", "ADA", "AVAX", "LINK",
+                        "DOT", "MATIC", "ATOM"]
+
+
+def broad_provider(symbols: list[str] | None = None):
+    """A deterministic stand-in for the market-cap ranking provider."""
+    from crypto_edge.data.broad_universe import StaticBroadUniverseProvider
+    return StaticBroadUniverseProvider(symbols or FIXTURE_BROAD_ASSETS,
+                                       name="fixture_market_cap")
+
+
 def test_config(**overrides) -> Config:
     cfg = Config()
     cfg.telegram.enabled = False
@@ -53,6 +67,10 @@ def test_config(**overrides) -> Config:
     cfg.execution.use_book_spread = False
     cfg.engine.poll_seconds = 0
     cfg.safety.candle_close_buffer_s = 0
+    # Offline tests must never reach for a network ranking provider.
+    cfg.universe.broad_source = "static"
+    cfg.universe.broad_static_assets = list(FIXTURE_BROAD_ASSETS)
+    cfg.universe.broad_min_assets = 1
     for path, val in overrides.items():
         section, _, key = path.partition(".")
         setattr(getattr(cfg, section), key, val)

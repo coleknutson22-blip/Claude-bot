@@ -150,11 +150,51 @@ flagged `hypothetical=1`, and can never create a position or touch account
 performance. Reported per rejection reason, and suppressed below 20 samples so
 you do not read signal into noise.
 
+## News, token events and derivatives — exact status
+
+Nothing in this section is collecting data. Read the table before assuming any
+of it is doing anything for you.
+
+| Piece | Architectural only | Implemented | Tested | Wired to a provider | Actively collecting |
+|---|---|---|---|---|---|
+| News storage (`news_events`, `event_time`/`observed_at`) | | yes | yes | n/a | **no** |
+| News classification (`classify`, severity, source tiers) | | yes | yes | n/a | **no** |
+| News look-ahead guard (`news_visible_at`) | | yes | yes | n/a | **no** |
+| News → symbol blocking (`ingest` → `no_trade_list`) | | yes | yes | **no** | **no** |
+| `NewsProvider` protocol | yes | interface only | — | **no** | **no** |
+| `StubNewsProvider` (returns `[]`) | | yes | yes | n/a | **no** |
+| Token-event calendar storage + `blocking_event` | | yes | yes | **no** | **no** |
+| Derivatives storage (`derivatives` table) | | yes | yes | n/a | **no** |
+| Derivatives look-ahead guard (`latest_derivatives`) | | yes | yes | n/a | **no** |
+| `DerivativesProvider` protocol | yes | interface only | — | **no** | **no** |
+| `CCXTDerivativesProvider` | | written, **never executed** | **no** | **no** | **no** |
+| Derivatives → entry decisions | yes | **not implemented** (deliberate) | — | — | — |
+
+Specifically, and to be unambiguous:
+
+- **No provider is constructed anywhere in the running system.** `TradingEngine`
+  builds `NewsEngine(repo, [])` and `DerivativesEngine(repo, [])` with empty
+  provider lists.
+- **No polling loop exists.** `NewsEngine.poll()` and
+  `DerivativesEngine.poll()` are implemented and unit-tested but are **never
+  called** by the engine cycle. `intel.news_poll_minutes` and
+  `intel.derivatives_poll_minutes` are currently read by nothing.
+- **The read paths are live but always empty.** `build_context()` calls
+  `news.context_for()` / `derivatives.context_for()` (gated on the `*_enabled`
+  flags, both `false`), and `evaluate_signals()` calls
+  `calendar.blocking_event()` unconditionally. They query real tables that no
+  code path ever writes to outside the tests, so they return nothing.
+- `CCXTDerivativesProvider` has never made a network call in any environment.
+
+What that means in practice: **a news event cannot currently stop a trade**, and
+no funding/OI data is being recorded for later research. The plumbing to change
+that is in place and tested; the providers are not.
+
 ## Wiring a news provider
 
-News storage, classification, look-ahead guarding and symbol blocking are built
-and tested, but no provider ships wired (`news_enabled = false`). To add one,
-implement `fetch(since_ms) -> list[NewsItem]` and pass it to `NewsEngine`:
+To add one, implement `fetch(since_ms) -> list[NewsItem]` and pass it to
+`NewsEngine` — note that you must also arrange for `poll()` to be called, which
+the engine does not currently do:
 
 ```python
 class MyProvider:
@@ -174,7 +214,7 @@ social media is logged and never acted on.
 
 Read this section before trusting anything.
 
-### VERIFIED OFFLINE — 195 automated tests, all passing
+### VERIFIED OFFLINE — 306 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -187,7 +227,16 @@ Exercised against deterministic synthetic data with no network:
 - Stop ratcheting, breakeven engagement, time stops
 - Look-ahead protection, indicator causality, determinism
 - Universe filtering and rejection auditing
-- News/event visibility, classification, blocking and expiry
+- News/event visibility, classification, blocking and expiry (the LOGIC only —
+  no provider is wired; see the status table above)
+- The Telegram outbox state machine: a failed send stays PENDING and
+  recoverable, survives a restart, and a delivered one is never repeated
+- Entry quote validation failing closed on missing/invalid/stale/malformed
+  quotes, while open positions stay manageable without a quote
+- Position sizing against the simulated fill, revalidated post-fill against the
+  configured risk budget
+- The broad market-cap asset universe: intersection, caching with source and
+  timestamp, outage fallback, and fail-closed behaviour for new entries
 - Research journal, counterfactual isolation, performance metrics and
   small-sample honesty flags
 - Telegram message *formatting*, retry, dedupe and fail-safe logic
@@ -205,6 +254,12 @@ network**, so `ccxt` could not even be installed:
 - **Real Telegram delivery.** The transport that makes the actual HTTP call has
   never sent a message. Everything around it is tested.
 - **A live smoke test.** No cycle has ever run against real prices.
+- **The broad market-cap universe provider.**
+  `crypto_edge/data/broad_universe.py::CoinGeckoUniverseProvider` is written
+  against the public CoinGecko markets endpoint but has never been executed.
+  Until it succeeds once, `require_broad_universe = true` means **no new
+  entries will be opened** — that is the intended fail-closed behaviour, not a
+  bug. `selfcheck` reports it explicitly.
 
 Run `python -m crypto_edge.cli selfcheck` first — it checks exactly these three
 things, and will tell you which one is broken if any are.
@@ -217,7 +272,8 @@ crypto_edge/
   selfcheck.py       startup gate
   cli.py             commands
   backtest.py        same strategy object, bar-sliced history
-  data/              feed protocol, ccxt feed, fixture feed, universe builder
+  data/              feed protocol, ccxt feed, fixture feed, broad (market-cap)
+                     asset universe, venue universe builder
   strategy/          regime, scoring, trend_breakout
   execution/         paper broker: sizing, fills, fees, slippage, stops
   portfolio/         account, risk manager, stop logic
@@ -227,7 +283,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               195 tests
+tests/               306 tests
 ```
 
 ## Safety notes
@@ -237,4 +293,7 @@ tests/               195 tests
 - No exchange API keys are read, stored, or constructed anywhere.
 - `.env` is gitignored. Do not commit it.
 - The bot fails closed: missing BTC reference data, stale candles, corrupt
-  series or an unreachable feed all suspend trading rather than guessing.
+  series, an unreachable feed, a quote it cannot trust, or no valid broad asset
+  universe all suspend NEW ENTRIES rather than guessing. Open positions
+  continue to be managed in every one of those cases — losing a data source
+  must never strand risk already on the books.
