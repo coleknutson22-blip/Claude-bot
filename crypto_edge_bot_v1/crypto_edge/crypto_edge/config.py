@@ -1,0 +1,247 @@
+"""Configuration: TOML for parameters, .env for secrets. Nothing sensitive is
+ever read from the TOML file, and no credential is ever hard-coded."""
+from __future__ import annotations
+
+import os
+import tomllib
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any
+
+
+class ConfigError(Exception):
+    pass
+
+
+def load_dotenv(path: str | Path = ".env") -> None:
+    """Minimal .env loader so we take no third-party dependency for secrets.
+    Existing environment variables always win."""
+    p = Path(path)
+    if not p.exists():
+        return
+    for raw in p.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        os.environ.setdefault(key, val)
+
+
+@dataclass
+class ExchangeCfg:
+    name: str = "binance"
+    quote: str = "USDT"
+    # Public market-data endpoints only. No API key is required for paper mode
+    # and none is read here -- see safety.live_trading_enabled.
+    rate_limit_ms: int = 250
+    ohlcv_limit: int = 300
+
+
+@dataclass
+class UniverseCfg:
+    top_n: int = 200                    # research/scan universe size
+    max_tradable: int = 40              # how many survive filtering into the pipeline
+    refresh_minutes: int = 360
+    min_dollar_volume_24h: float = 5_000_000.0
+    max_spread_bps: float = 15.0
+    min_candles_1h: int = 400           # history requirement
+    min_market_age_days: int = 45
+    min_atr_pct: float = 0.8            # too quiet to pay costs
+    max_atr_pct: float = 25.0           # untradeable chaos
+    exclude_stablecoins: bool = True
+    exclude_leveraged: bool = True
+    exclude_wrapped: bool = True
+    stablecoin_symbols: list[str] = field(default_factory=lambda: [
+        "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP", "USDD", "PYUSD",
+        "EURT", "EURS", "GUSD", "LUSD", "SUSD", "USTC", "FRAX", "USDE", "RLUSD"])
+    leveraged_markers: list[str] = field(default_factory=lambda: [
+        "UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S", "2L", "2S"])
+    wrapped_markers: list[str] = field(default_factory=lambda: [
+        "WBTC", "WETH", "WBETH", "STETH", "WSTETH", "CBETH", "RETH", "BETH",
+        "SAVAX", "STSOL", "MSOL", "JITOSOL"])
+    always_include: list[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
+    blacklist: list[str] = field(default_factory=list)
+
+
+@dataclass
+class StrategyCfg:
+    name: str = "trend_breakout"
+    version: str = "1.0.0"
+    entry_timeframe: str = "1h"
+    regime_timeframe: str = "4h"
+    donchian_lookback: int = 48
+    ema_fast: int = 20
+    ema_slow: int = 50
+    ema_trend: int = 200
+    atr_period: int = 14
+    adx_period: int = 14
+    rsi_period: int = 14
+    min_adx: float = 20.0
+    max_rsi: float = 78.0               # exhaustion filter
+    min_rel_volume: float = 1.2
+    momentum_periods: list[int] = field(default_factory=lambda: [24, 72, 168])
+    max_extension_atr: float = 3.5      # refuse entries far above the breakout level
+    min_score: float = 55.0             # 0-100 opportunity score threshold
+    stop_atr_mult: float = 2.2
+    trail_atr_mult: float = 3.0         # chandelier
+    breakeven_at_r: float = 1.0
+    breakeven_offset_r: float = 0.1
+    time_stop_bars: int = 96
+    time_stop_min_r: float = 0.5        # exit if we haven't made this much by then
+    regime_ema: int = 50
+    btc_symbol: str = "BTC/USDT"
+    warmup_bars: int = 250
+
+
+@dataclass
+class RiskCfg:
+    risk_per_trade_pct: float = 0.5
+    max_position_pct: float = 15.0      # max allocation to one position
+    max_portfolio_exposure_pct: float = 60.0
+    max_open_positions: int = 6
+    max_new_entries_per_cycle: int = 2
+    daily_loss_limit_pct: float = 3.0
+    max_drawdown_pct: float = 20.0      # kill switch
+    max_correlation: float = 0.85
+    correlation_lookback: int = 168     # hours
+    min_stop_distance_pct: float = 0.3  # reject absurdly tight stops
+
+
+@dataclass
+class ExecutionCfg:
+    starting_equity: float = 10_000.0
+    taker_fee_bps: float = 7.5          # 0.075%
+    maker_fee_bps: float = 7.5
+    slippage_bps: float = 6.0           # market-order slippage assumption
+    stop_slippage_bps: float = 15.0     # stops fill worse than limit orders
+    use_book_spread: bool = True        # cross the spread when a quote exists
+    max_spread_bps_entry: float = 25.0  # refuse to trade a blown-out book
+
+
+@dataclass
+class SafetyCfg:
+    mode: str = "PAPER"                 # PAPER only; see validate()
+    live_trading_enabled: bool = False  # hard-wired off, see validate()
+    max_data_staleness_s: int = 900
+    candle_close_buffer_s: int = 20     # clock-skew guard before trusting a close
+    max_clock_skew_s: int = 60
+    require_btc_data: bool = True
+
+
+@dataclass
+class TelegramCfg:
+    enabled: bool = True
+    heartbeat_minutes: int = 60
+    daily_report_hour_utc: int = 0
+    stop_update_min_pct: float = 0.75   # only notify meaningful stop moves
+    error_cooldown_s: int = 900         # anti-spam
+    timeout_s: int = 10
+    max_retries: int = 3
+
+
+@dataclass
+class EngineCfg:
+    poll_seconds: int = 30
+    db_path: str = "data/crypto_edge.db"
+    log_dir: str = "logs"
+    equity_snapshot_minutes: int = 15
+    counterfactual_horizons_h: list[int] = field(default_factory=lambda: [1, 4, 12, 24, 48, 168])
+
+
+@dataclass
+class IntelCfg:
+    """News / token-event / derivatives collection. Providers are pluggable and
+    default to disabled so Phase One never blocks on a third-party feed."""
+    news_enabled: bool = False
+    news_poll_minutes: int = 15
+    news_block_severity: int = 4        # >= this severity blocks new entries
+    news_block_hours: int = 24
+    derivatives_enabled: bool = False
+    derivatives_poll_minutes: int = 30
+    token_event_block_hours: int = 12   # avoid new entries near an unlock
+
+
+@dataclass
+class Config:
+    exchange: ExchangeCfg = field(default_factory=ExchangeCfg)
+    universe: UniverseCfg = field(default_factory=UniverseCfg)
+    strategy: StrategyCfg = field(default_factory=StrategyCfg)
+    risk: RiskCfg = field(default_factory=RiskCfg)
+    execution: ExecutionCfg = field(default_factory=ExecutionCfg)
+    safety: SafetyCfg = field(default_factory=SafetyCfg)
+    telegram: TelegramCfg = field(default_factory=TelegramCfg)
+    engine: EngineCfg = field(default_factory=EngineCfg)
+    intel: IntelCfg = field(default_factory=IntelCfg)
+
+    # --- secrets, populated from the environment only -------------------
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
+
+    def validate(self) -> list[str]:
+        errs: list[str] = []
+        if self.safety.mode.upper() != "PAPER":
+            errs.append("safety.mode must be PAPER -- live trading is not implemented")
+        if self.safety.live_trading_enabled:
+            errs.append("safety.live_trading_enabled must be false")
+        if self.execution.starting_equity <= 0:
+            errs.append("execution.starting_equity must be > 0")
+        if not (0 < self.risk.risk_per_trade_pct <= 5):
+            errs.append("risk.risk_per_trade_pct must be in (0, 5]")
+        if self.risk.max_position_pct > self.risk.max_portfolio_exposure_pct:
+            errs.append("max_position_pct cannot exceed max_portfolio_exposure_pct")
+        if self.risk.max_open_positions < 1:
+            errs.append("risk.max_open_positions must be >= 1")
+        if not (0 < self.risk.max_drawdown_pct < 100):
+            errs.append("risk.max_drawdown_pct must be in (0, 100)")
+        if self.strategy.ema_fast >= self.strategy.ema_slow:
+            errs.append("strategy.ema_fast must be < ema_slow")
+        if self.strategy.warmup_bars < self.strategy.ema_trend + 10:
+            errs.append("strategy.warmup_bars must exceed ema_trend by a margin")
+        if self.universe.max_tradable > self.universe.top_n:
+            errs.append("universe.max_tradable cannot exceed top_n")
+        if self.execution.taker_fee_bps < 0 or self.execution.slippage_bps < 0:
+            errs.append("fees and slippage must be non-negative")
+        if self.telegram.enabled and not (self.telegram_token and self.telegram_chat_id):
+            errs.append("telegram enabled but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are unset")
+        return errs
+
+    def strategy_fingerprint(self) -> dict[str, Any]:
+        """Recorded against every trade so historical results stay bound to the
+        settings that produced them (spec section 15)."""
+        return {
+            "strategy": asdict(self.strategy),
+            "risk": asdict(self.risk),
+            "execution": asdict(self.execution),
+        }
+
+
+def _apply(section: Any, data: dict) -> None:
+    for k, v in data.items():
+        if not hasattr(section, k):
+            raise ConfigError(f"unknown config key: {k}")
+        cur = getattr(section, k)
+        if isinstance(cur, bool) and not isinstance(v, bool):
+            raise ConfigError(f"config key {k} must be a boolean")
+        setattr(section, k, v)
+
+
+def load_config(path: str | Path = "config/config.toml",
+                env_path: str | Path = ".env") -> Config:
+    load_dotenv(env_path)
+    cfg = Config()
+    p = Path(path)
+    if p.exists():
+        raw = tomllib.loads(p.read_text())
+        for name, data in raw.items():
+            if not hasattr(cfg, name):
+                raise ConfigError(f"unknown config section: [{name}]")
+            _apply(getattr(cfg, name), data)
+    cfg.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    cfg.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if os.environ.get("TELEGRAM_ENABLED", "").lower() in ("0", "false", "no"):
+        cfg.telegram.enabled = False
+    # Belt and braces: the environment can never switch on live trading.
+    cfg.safety.mode = "PAPER"
+    cfg.safety.live_trading_enabled = False
+    return cfg

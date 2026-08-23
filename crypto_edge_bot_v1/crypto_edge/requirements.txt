@@ -1,0 +1,12 @@
+# crypto_edge_bot_v1 runtime dependencies
+#
+# NOTE: these could NOT be installed or exercised in the build environment
+# (no outbound network). Version floors below are the minimum APIs the code
+# uses. Install and run `python -m crypto_edge.cli selfcheck` on your machine.
+
+ccxt>=4.2.0        # public market data only; no API keys are ever constructed
+requests>=2.31.0   # Telegram transport
+numpy>=1.24.0      # all indicator maths
+
+# Standard library used elsewhere: sqlite3, tomllib (3.11+), dataclasses.
+# Python 3.11 or newer is required (tomllib).

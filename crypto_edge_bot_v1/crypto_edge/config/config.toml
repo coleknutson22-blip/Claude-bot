@@ -1,0 +1,116 @@
+# crypto_edge_bot_v1 -- parameters
+#
+# Secrets do NOT belong here. Put TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in
+# .env (see .env.example). This file is safe to commit; .env is not.
+#
+# Every value below is the default the code ships with. Changing a strategy
+# parameter changes the strategy fingerprint, so trades taken before and after
+# the change stay separable in the research database.
+
+[exchange]
+name = "binance"          # any ccxt-supported venue; public endpoints only
+quote = "USDT"
+rate_limit_ms = 250
+ohlcv_limit = 300         # candles fetched per request
+
+[universe]
+top_n = 200               # rank the whole venue by 24h dollar volume, keep top 200
+max_tradable = 40         # then hand at most 40 to the strategy each cycle
+refresh_minutes = 360
+min_dollar_volume_24h = 5_000_000.0
+max_spread_bps = 15.0     # a wide book eats the edge before the trade starts
+min_candles_1h = 400      # need history for a 200-EMA plus warm-up
+min_market_age_days = 45  # brand-new listings behave nothing like mature markets
+min_atr_pct = 0.8         # too quiet: no move to capture
+max_atr_pct = 25.0        # too wild: stop distance makes position size meaningless
+exclude_stablecoins = true
+exclude_leveraged = true  # 3L/3S/UP/DOWN tokens decay; they are not the asset
+exclude_wrapped = true    # WBTC/stETH duplicate exposure you may already hold
+always_include = ["BTC/USDT", "ETH/USDT"]
+blacklist = []
+
+[strategy]
+name = "trend_breakout"
+version = "1.0.0"
+entry_timeframe = "1h"
+regime_timeframe = "4h"
+donchian_lookback = 48    # breakout reference EXCLUDES the current bar
+ema_fast = 20
+ema_slow = 50
+ema_trend = 200
+atr_period = 14
+adx_period = 14
+rsi_period = 14
+min_adx = 20.0            # below this the "trend" is chop
+max_rsi = 78.0            # do not buy a blow-off
+min_rel_volume = 1.2      # a breakout on no volume is noise
+max_extension_atr = 3.5   # too far above the EMA = chasing
+min_score = 55.0
+stop_atr_mult = 2.2
+trail_atr_mult = 3.0
+breakeven_at_r = 1.0
+breakeven_offset_r = 0.1
+time_stop_bars = 96       # 4 days on 1h: if it has not worked, release the capital
+time_stop_min_r = 0.5
+regime_ema = 50
+btc_symbol = "BTC/USDT"
+warmup_bars = 250
+
+[risk]
+risk_per_trade_pct = 0.5        # of equity, per trade, at the initial stop
+max_position_pct = 15.0
+max_portfolio_exposure_pct = 60.0
+max_open_positions = 6
+max_new_entries_per_cycle = 2   # avoid piling into one correlated impulse
+daily_loss_limit_pct = 3.0      # halts NEW entries; resets at UTC midnight
+max_drawdown_pct = 20.0         # kill switch; does NOT auto-reset
+max_correlation = 0.85
+correlation_lookback = 168
+min_stop_distance_pct = 0.3     # a stop this tight is noise, not a stop
+
+[execution]
+starting_equity = 10_000.0
+taker_fee_bps = 7.5
+maker_fee_bps = 7.5
+slippage_bps = 6.0        # modelled cost on normal entries/exits
+stop_slippage_bps = 15.0  # stops fill worse; gaps fill at the next open
+use_book_spread = true    # cross the real quoted spread when a quote exists
+max_spread_bps_entry = 25.0
+
+[safety]
+# mode and live_trading_enabled are FORCED to PAPER/false in code.
+# Editing them here has no effect -- that is deliberate.
+mode = "PAPER"
+live_trading_enabled = false
+max_data_staleness_s = 900
+candle_close_buffer_s = 20   # wait past the close before trusting a candle
+max_clock_skew_s = 60
+require_btc_data = true      # no BTC reference -> no trading. Fail closed.
+
+[telegram]
+enabled = true
+heartbeat_minutes = 60
+daily_report_hour_utc = 0
+stop_update_min_pct = 0.75   # suppress trivial trail nudges
+error_cooldown_s = 900       # one failing loop must not spam the chat
+timeout_s = 10
+max_retries = 3
+
+[engine]
+poll_seconds = 30
+db_path = "data/crypto_edge.db"
+log_dir = "logs"
+equity_snapshot_minutes = 15
+counterfactual_horizons_h = [1, 4, 12, 24, 48, 168]
+
+[intel]
+# News and derivatives ship DISABLED because no provider is wired by default.
+# The storage, look-ahead guard and blocking logic are built and tested; you
+# supply a provider. See README "Wiring a news provider".
+news_enabled = false
+news_poll_minutes = 15
+news_block_severity = 4
+news_block_hours = 24
+derivatives_enabled = false
+derivatives_poll_minutes = 30
+token_event_block_hours = 12

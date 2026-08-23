@@ -1,0 +1,240 @@
+# crypto_edge_bot_v1
+
+A paper-trading crypto system: dynamic Top-200 universe scanning, a trend
+breakout strategy, ATR-based risk sizing, persistent SQLite state, Telegram
+notifications, and a research database that records every decision — including
+the trades it *declined* to take.
+
+**This bot cannot place a real order.** There is no order-placement code path,
+no API-key handling, and no exchange credentials anywhere in the project. It
+reads public market data and simulates fills against it.
+
+---
+
+## Requirements
+
+- Python **3.11 or newer** (the config loader uses `tomllib`)
+- Outbound internet access to your chosen exchange's public API
+- A Telegram bot token, if you want notifications
+
+## Setup
+
+```bash
+cd crypto_edge
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env
+# edit .env and fill in TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+```
+
+Getting Telegram credentials: message `@BotFather` on Telegram to create a bot
+and get the token. Then message your new bot once, and visit
+`https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` to find your chat id.
+
+If you do not want Telegram, set `enabled = false` under `[telegram]` in
+`config/config.toml` and leave `.env` empty.
+
+## First run
+
+```bash
+python -m crypto_edge.cli selfcheck    # verify everything before trading
+python -m crypto_edge.cli start        # begin paper trading
+```
+
+`selfcheck` exits non-zero if any critical check fails, so it is safe to use in
+a supervisor or a script. `start` runs the self-check itself and refuses to
+start if it fails.
+
+To verify the install without touching the network at all:
+
+```bash
+python -m crypto_edge.cli selfcheck --offline
+python scripts/smoke_test.py           # full lifecycle on synthetic data
+python -m crypto_edge.cli test         # the automated suite
+```
+
+## Operating it
+
+| Command | What it does |
+|---|---|
+| `python -m crypto_edge.cli start` | Run the trader in the foreground. Ctrl-C stops it safely. |
+| `python -m crypto_edge.cli status` | Account snapshot: equity, cash, exposure, P&L. |
+| `python -m crypto_edge.cli positions` | Open positions with stops and unrealized P&L. |
+| `python -m crypto_edge.cli performance` | Full metrics report. `--json` for machine output, `--categories` for breakdowns. |
+| `python -m crypto_edge.cli research` | Decision database summary, including counterfactuals. |
+| `python -m crypto_edge.cli export --out trades.csv` | Export the closed-trade ledger. |
+| `python -m crypto_edge.cli resume --yes` | Clear a circuit-breaker halt (deliberate, manual). |
+| `python -m crypto_edge.cli test` | Run the automated test suite. |
+
+Background operation:
+
+```bash
+scripts/start.sh      # self-check, then run detached with a pid file
+scripts/status.sh     # process state + account snapshot
+scripts/stop.sh       # SIGTERM; finishes the current cycle, then exits
+```
+
+State is committed to SQLite every cycle, so a hard kill loses at most the
+cycle in flight. Restarting resumes from exactly where it stopped — open
+positions, stops, equity, peak equity and halt state all persist.
+
+---
+
+## How it decides
+
+Each cycle runs in a fixed order, and **stops are processed before entries** so
+a position can never be opened on the same tick that another should have been
+closed:
+
+```
+safety gates → universe refresh → fetch data (discard unclosed candles)
+→ build market context → manage open positions → check circuit breakers
+→ evaluate signals → rank → risk gate → enter → bookkeeping
+```
+
+**Universe.** Rank the venue by 24h dollar volume, keep the top 200, then
+aggressively filter: stablecoins, leveraged tokens (`3L`/`3S`/`UP`/`DOWN`),
+wrapped and staked duplicates, thin volume, wide spreads, insufficient history,
+markets younger than 45 days, and markets outside a sane volatility band. At
+most 40 survive to the strategy. Every rejection is written to
+`universe_snapshots` with its reason.
+
+**Entry.** Hard filters run first and in order — history, data sanity, no-trade
+list, BTC regime, higher-timeframe regime, EMA alignment, Donchian breakout,
+ADX, RSI exhaustion, relative volume, extension from the mean. Only what
+survives gets scored, across nine weighted components, and only scores ≥ 55
+are eligible. The strategy is a pure function; the portfolio manager decides
+what actually gets bought.
+
+**Sizing.** Risk budget first (0.5% of equity at the initial stop), then capped
+by max position size, remaining exposure room, and affordable cash including
+fees — then rounded *down* to the exchange's precision and checked against
+minimum notional.
+
+**Exits.** Chandelier trailing stop that only ever ratchets up, breakeven at
+1R, trend invalidation, and a time stop at 96 bars. Gaps through the stop fill
+at the next candle's open, not at the stop price — because that is what
+actually happens.
+
+**Circuit breakers.** A 3% daily loss halts new entries and clears at UTC
+midnight. A 20% drawdown is a kill switch that does **not** auto-reset; you
+clear it deliberately with `resume --yes`.
+
+## The look-ahead guard
+
+Every piece of external information carries two timestamps:
+
+- `event_time` — when the thing happened in the world
+- `observed_at` — when *this system* learned about it
+
+All visibility queries filter on `observed_at`, never `event_time`. A news
+event that occurred an hour ago but that you only receive six hours from now is
+invisible to the bot until then. This applies to news, token events, funding,
+open interest and liquidations. It exists so that when you later backtest
+against this database, you cannot accidentally trade on information you did not
+have. There are 25 tests dedicated to this in `tests/test_lookahead.py` and
+`tests/test_research_intel.py`.
+
+Candle handling follows the same principle: unfinished candles are discarded
+the moment they arrive, the Donchian channel excludes the current bar, and
+relative volume uses prior bars only.
+
+## Research database
+
+Every evaluation is recorded — entered, rejected by the strategy, rejected by
+risk, or ranked out — with the full feature snapshot and the specific reason.
+Rejected signals are then tracked as **counterfactuals**: what *would* have
+happened at 1, 4, 12, 24, 48 and 168 hours. These are stored separately, always
+flagged `hypothetical=1`, and can never create a position or touch account
+performance. Reported per rejection reason, and suppressed below 20 samples so
+you do not read signal into noise.
+
+## Wiring a news provider
+
+News storage, classification, look-ahead guarding and symbol blocking are built
+and tested, but no provider ships wired (`news_enabled = false`). To add one,
+implement `fetch(since_ms) -> list[NewsItem]` and pass it to `NewsEngine`:
+
+```python
+class MyProvider:
+    name = "my_source"
+    def fetch(self, since_ms: int) -> list[NewsItem]:
+        ...
+```
+
+Set `observed_at` to the moment **your system received the item** — never the
+article's publication timestamp. That distinction is the whole point of the
+guard. Only severity ≥ 4 from a tier ≤ 2 source will block trading; a rumour on
+social media is logged and never acted on.
+
+---
+
+## Verification status
+
+Read this section before trusting anything.
+
+### VERIFIED OFFLINE — 195 automated tests, all passing
+
+Exercised against deterministic synthetic data with no network:
+
+- Position sizing, fee and slippage arithmetic, the full P&L identity
+  (`net ≡ gross − fees − slippage`), stop fills including gap-through-at-open
+- Account persistence: round-trip cash change equals net P&L exactly; open
+  positions, stops, equity and peak equity survive a restart; duplicate-entry
+  guards survive a restart
+- Risk gates, correlation blocking, both circuit breakers and their priority
+- Stop ratcheting, breakeven engagement, time stops
+- Look-ahead protection, indicator causality, determinism
+- Universe filtering and rejection auditing
+- News/event visibility, classification, blocking and expiry
+- Research journal, counterfactual isolation, performance metrics and
+  small-sample honesty flags
+- Telegram message *formatting*, retry, dedupe and fail-safe logic
+- The startup self-check gate
+- Full end-to-end lifecycle via `scripts/smoke_test.py`
+
+### REQUIRES VERIFICATION ON YOUR MACHINE
+
+These could not be executed here — the build environment had **no outbound
+network**, so `ccxt` could not even be installed:
+
+- **Live market data.** `crypto_edge/data/ccxt_feed.py` is written against the
+  ccxt public API but has never been run. Symbol formats, ticker field names
+  and rate-limit behaviour vary by exchange.
+- **Real Telegram delivery.** The transport that makes the actual HTTP call has
+  never sent a message. Everything around it is tested.
+- **A live smoke test.** No cycle has ever run against real prices.
+
+Run `python -m crypto_edge.cli selfcheck` first — it checks exactly these three
+things, and will tell you which one is broken if any are.
+
+## Layout
+
+```
+crypto_edge/
+  engine.py          cycle orchestration
+  selfcheck.py       startup gate
+  cli.py             commands
+  backtest.py        same strategy object, bar-sliced history
+  data/              feed protocol, ccxt feed, fixture feed, universe builder
+  strategy/          regime, scoring, trend_breakout
+  execution/         paper broker: sizing, fills, fees, slippage, stops
+  portfolio/         account, risk manager, stop logic
+  storage/           schema and repository
+  intel/             news, token events, derivatives
+  research/          decision journal, counterfactuals
+  notify/            formatters, Telegram notifier
+config/config.toml   all parameters, commented
+scripts/             start/stop/status wrappers, offline smoke test
+tests/               195 tests
+```
+
+## Safety notes
+
+- `load_config()` forces `mode = "PAPER"` and `live_trading_enabled = False`
+  regardless of what the TOML says. Editing those values does nothing.
+- No exchange API keys are read, stored, or constructed anywhere.
+- `.env` is gitignored. Do not commit it.
+- The bot fails closed: missing BTC reference data, stale candles, corrupt
+  series or an unreachable feed all suspend trading rather than guessing.

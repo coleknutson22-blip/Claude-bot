@@ -1,0 +1,652 @@
+"""The trading engine.
+
+Cycle order is deliberate and must not be rearranged casually:
+
+    1. safety gates (clock, staleness, DB integrity, circuit breakers)
+    2. universe refresh (scheduled)
+    3. market data fetch -- unclosed candles discarded immediately
+    4. market context (BTC regime, breadth, news, blocks)
+    5. POSITION MANAGEMENT (stops and exits) -- always before entries, so a
+       stop is never skipped because the entry logic consumed the cycle
+    6. signal evaluation across the universe
+    7. ranking, then risk gate, then entries
+    8. bookkeeping: snapshots, daily roll, heartbeat, counterfactuals
+
+The engine is single-threaded by design. Concurrency between stop processing
+and entry processing is the classic source of double-fills, so we simply do
+not have it; ordering is enforced by this function, and duplicate protection
+is additionally enforced in the database.
+"""
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from .config import Config
+from .data.feed import DataUnavailable
+from .data.universe import UniverseBuilder
+from .execution.paper_broker import PaperBroker
+from .indicators import atr, last_valid, log_returns, roc
+from .intel.derivatives import DerivativesEngine
+from .intel.events import TokenEventCalendar
+from .intel.news import NewsEngine
+from .logging_setup import log_event
+from .models import Series
+from .notify import formatters as fmt
+from .notify.telegram import TelegramNotifier
+from .performance import PerformanceCalculator
+from .portfolio.account import PaperAccount
+from .portfolio.risk import RiskManager
+from .portfolio.stops import update_stop
+from .research.counterfactual import CounterfactualTracker
+from .research.journal import (ENTERED, RANKED_OUT, REJECTED_RISK,
+                               REJECTED_STRATEGY, ResearchJournal)
+from .storage.repo import Repo
+from .strategy.base import MarketContext
+from .strategy.regime import UNKNOWN, btc_regime, classify_environment, market_breadth
+from .strategy.trend_breakout import TrendBreakoutStrategy
+from .timeutils import (DAY_MS, candle_id, iso, now_ms, tf_ms, utc_date)
+
+
+@dataclass
+class EngineStatus:
+    started_ms: int = 0
+    cycles: int = 0
+    signals_evaluated: int = 0
+    entries: int = 0
+    exits: int = 0
+    last_data_ms: int = 0
+    last_heartbeat_ms: int = 0
+    last_daily_report_date: str = ""
+    last_universe_refresh_ms: int = 0
+    last_snapshot_ms: int = 0
+    universe: list[str] = field(default_factory=list)
+    btc_regime: str = UNKNOWN
+    btc_regime_score: float = 50.0
+    breadth: float = 50.0
+    environment: str = "unknown"
+    halted: bool = False
+    halt_reason: str = ""
+    data_errors: int = 0
+
+
+class TradingEngine:
+    def __init__(self, cfg: Config, repo: Repo, feed, notifier: TelegramNotifier) -> None:
+        self.cfg = cfg
+        self.repo = repo
+        self.feed = feed
+        self.notifier = notifier
+        self.broker = PaperBroker(
+            cfg.execution.taker_fee_bps, cfg.execution.slippage_bps,
+            cfg.execution.stop_slippage_bps, cfg.execution.use_book_spread,
+            cfg.execution.max_spread_bps_entry)
+        self.account = PaperAccount(repo, self.broker, cfg.execution.starting_equity)
+        self.risk = RiskManager(cfg.risk)
+        self.strategy = TrendBreakoutStrategy(cfg.strategy)
+        self.journal = ResearchJournal(repo)
+        self.perf = PerformanceCalculator(repo)
+        self.universe_builder = UniverseBuilder(cfg.universe)
+        self.news = NewsEngine(repo, [], cfg.intel.news_block_severity,
+                               cfg.intel.news_block_hours)
+        self.derivatives = DerivativesEngine(repo, [])
+        self.calendar = TokenEventCalendar(repo, cfg.intel.token_event_block_hours)
+        self.counterfactual = CounterfactualTracker(
+            repo, cfg.engine.counterfactual_horizons_h)
+        self.status = EngineStatus(started_ms=now_ms())
+        self._markets: dict = {}
+        self._series_1h: dict[str, Series] = {}
+        self._series_htf: dict[str, Series] = {}
+        self._tickers: dict[str, dict] = {}
+        self._running = False
+        repo.record_strategy_version(self.strategy.name, self.strategy.version,
+                                     cfg.strategy_fingerprint())
+
+    # ================================================================ helpers
+    @property
+    def buffer_ms(self) -> int:
+        return self.cfg.safety.candle_close_buffer_s * 1000
+
+    def marks(self) -> dict[str, float]:
+        """Current mark price per open position, from the freshest closed candle."""
+        out = {}
+        for p in self.account.positions():
+            s = self._series_1h.get(p.symbol)
+            if s is not None and len(s):
+                out[p.symbol] = float(s.close[-1])
+        return out
+
+    # ============================================================== universe
+    def refresh_universe(self, force: bool = False) -> list[str]:
+        due = (force or self.status.last_universe_refresh_ms == 0 or
+               now_ms() - self.status.last_universe_refresh_ms >=
+               self.cfg.universe.refresh_minutes * 60_000)
+        if not due:
+            return self.status.universe
+        try:
+            self._markets = self.feed.load_markets()
+            self._tickers = self.feed.fetch_tickers()
+        except DataUnavailable as e:
+            log_event("data", "ERROR", "universe refresh failed", error=str(e))
+            self.notifier.send_error("universe refresh", str(e))
+            return self.status.universe
+
+        candidates, audit = self.universe_builder.build_candidates(
+            self._markets, self._tickers)
+        self.repo.add_universe_snapshot(now_ms(), audit)
+        self.universe_builder.log_audit(audit)
+        # cap the pipeline: the top-N list is for scanning, not for trading
+        self.status.universe = candidates[:self.cfg.universe.max_tradable]
+        self.status.last_universe_refresh_ms = now_ms()
+        return self.status.universe
+
+    # =========================================================== market data
+    def fetch_data(self, symbols: list[str]) -> None:
+        """Fetch and immediately discard any unfinished candle."""
+        c = self.cfg
+        needed = list(dict.fromkeys(symbols + [c.strategy.btc_symbol]))
+        now = now_ms()
+        ok = 0
+        for sym in needed:
+            for tf, store in ((c.strategy.entry_timeframe, self._series_1h),
+                              (c.strategy.regime_timeframe, self._series_htf)):
+                try:
+                    s = self.feed.fetch_ohlcv(sym, tf, c.exchange.ohlcv_limit)
+                except DataUnavailable as e:
+                    self.status.data_errors += 1
+                    log_event("data", "WARNING", "ohlcv fetch failed",
+                              symbol=sym, timeframe=tf, error=str(e))
+                    store.pop(sym, None)
+                    continue
+                closed = s.drop_unclosed(now, self.buffer_ms)
+                if len(closed) == 0:
+                    store.pop(sym, None)
+                    continue
+                store[sym] = closed
+                ok += 1
+        if ok:
+            self.status.last_data_ms = now
+
+    def data_is_stale(self) -> tuple[bool, str]:
+        """Refuse to trade on old data. Fail closed."""
+        if self.status.last_data_ms == 0:
+            return True, "no market data received yet"
+        age_s = (now_ms() - self.status.last_data_ms) / 1000.0
+        if age_s > self.cfg.safety.max_data_staleness_s:
+            return True, f"market data stale by {age_s:.0f}s"
+        btc = self._series_1h.get(self.cfg.strategy.btc_symbol)
+        if self.cfg.safety.require_btc_data and (btc is None or len(btc) == 0):
+            return True, "BTC reference data unavailable"
+        if btc is not None and len(btc):
+            tf = tf_ms(self.cfg.strategy.entry_timeframe)
+            bar_age_s = (now_ms() - (int(btc.open_ms[-1]) + tf)) / 1000.0
+            # The most recent CLOSED candle is legitimately up to one full
+            # timeframe old, so this tolerance must scale with the timeframe --
+            # NOT with max_data_staleness_s, which governs fetch freshness.
+            tolerance_s = 2.0 * tf / 1000.0
+            if bar_age_s > tolerance_s:
+                return True, (f"latest closed {self.cfg.strategy.entry_timeframe} "
+                              f"BTC candle is {bar_age_s / 60:.1f} min old "
+                              f"(tolerance {tolerance_s / 60:.0f} min)")
+        return False, ""
+
+    # ================================================================ context
+    def build_context(self) -> MarketContext:
+        c = self.cfg
+        btc_htf = self._series_htf.get(c.strategy.btc_symbol)
+        label, score = btc_regime(btc_htf, c.strategy.regime_ema)
+        eligible = {s: self._series_1h[s] for s in self.status.universe
+                    if s in self._series_1h}
+        breadth = market_breadth(eligible, c.strategy.ema_slow)
+        now = now_ms()
+        blocked = self.repo.blocked_symbols(now)
+        news_ctx = self.news.context_for(list(eligible), now) if c.intel.news_enabled else {}
+        deriv_ctx = (self.derivatives.context_for(list(eligible), now)
+                     if c.intel.derivatives_enabled else {})
+
+        btc_1h = self._series_1h.get(c.strategy.btc_symbol)
+        btc_atr_pct = float("nan")
+        if btc_1h is not None and len(btc_1h) > c.strategy.atr_period + 2:
+            a = last_valid(atr(btc_1h.high, btc_1h.low, btc_1h.close, c.strategy.atr_period))
+            px = float(btc_1h.close[-1])
+            if np.isfinite(a) and px > 0:
+                btc_atr_pct = a / px * 100.0
+
+        self.status.btc_regime = label
+        self.status.btc_regime_score = score
+        self.status.breadth = breadth
+        self.status.environment = classify_environment(label, breadth, btc_atr_pct)
+
+        return MarketContext(ts_ms=now, btc_regime=label, btc_regime_score=score,
+                             breadth_pct=breadth, n_candidates=len(eligible),
+                             news_by_symbol=news_ctx, derivatives_by_symbol=deriv_ctx,
+                             blocked_symbols=blocked)
+
+    # ==================================================== position management
+    def manage_positions(self, ctx: MarketContext) -> None:
+        """Stops first, then strategy exits. Runs before any entry logic."""
+        c = self.cfg
+        for pos in self.account.positions():
+            s = self._series_1h.get(pos.symbol)
+            if s is None or len(s) == 0 or not s.is_sane():
+                log_event("strategy", "WARNING", "no usable data for open position",
+                          symbol=pos.symbol)
+                continue
+
+            candle = s.last_candle()
+            meta = self._markets.get(pos.symbol)
+
+            # --- 1. stop resolution against the completed candle -------------
+            fill = self.broker.stop_exit(pos.symbol, pos.qty, pos.current_stop,
+                                         candle, meta,
+                                         ts_ms=int(s.open_ms[-1]) + tf_ms(c.strategy.entry_timeframe))
+            if fill is not None:
+                self._close(pos, fill, "stop_loss" if fill.reason == "stop" else "stop_gap")
+                continue
+
+            price = float(s.close[-1])
+
+            # --- 2. strategy exits ------------------------------------------
+            reason = self.strategy.should_exit(pos, s, ctx)
+            if reason:
+                quote = self._safe_quote(pos.symbol)
+                exit_fill = self.broker.sell(pos.symbol, pos.qty, price, quote, meta,
+                                             ts_ms=now_ms(), reason=reason)
+                self._close(pos, exit_fill, reason)
+                continue
+
+            # --- 3. trail the stop ------------------------------------------
+            a = last_valid(atr(s.high, s.low, s.close, c.strategy.atr_period))
+            upd = update_stop(pos, price, a if np.isfinite(a) else 0.0, c.strategy)
+            if upd.changed:
+                prev = pos.current_stop
+                self.account.set_stop(pos, upd.new_stop)
+                log_event("trades", "INFO", "stop updated", symbol=pos.symbol,
+                          previous=prev, new=upd.new_stop, kind=upd.kind)
+                if upd.pct_move >= self.cfg.telegram.stop_update_min_pct:
+                    self.notifier.send(
+                        fmt.stop_update(symbol=pos.symbol, prev_stop=prev,
+                                        new_stop=upd.new_stop, price=price,
+                                        entry_price=pos.entry_fill_price,
+                                        qty=pos.qty, kind=upd.kind),
+                        dedupe_key=f"stop:{pos.id}:{round(upd.new_stop, 10)}",
+                        kind="stop_update")
+        self.account.update_marks(self.marks())
+
+    def _close(self, pos, fill, reason: str) -> None:
+        marks = self.marks()
+        trade = self.account.close_position(pos, fill, reason, marks)
+        if trade is None:
+            return
+        self.status.exits += 1
+        acct = self.account.state
+        equity = self.account.equity(self.marks())
+        self.notifier.send(
+            fmt.exit_trade(
+                symbol=trade.symbol, entry_price=trade.entry_fill_price,
+                exit_price=trade.exit_fill_price,
+                position_value=trade.qty * trade.entry_fill_price,
+                held_s=trade.duration_s, gross=trade.gross_pnl, fees=trade.fees,
+                slippage=trade.slippage_cost, net=trade.net_pnl,
+                return_pct=trade.return_pct,
+                account_return_pct=trade.account_return_pct,
+                exit_reason=trade.exit_reason, equity=equity,
+                total_pnl=float(acct["realized_pnl"])),
+            dedupe_key=f"exit:{trade.id}", kind="exit")
+
+    def _safe_quote(self, symbol: str):
+        try:
+            return self.feed.fetch_quote(symbol)
+        except Exception as e:
+            log_event("data", "WARNING", "quote fetch failed", symbol=symbol, error=str(e))
+            return None
+
+    # ========================================================= signal + entry
+    def evaluate_signals(self, ctx: MarketContext) -> list:
+        """Evaluate every eligible symbol on its latest CLOSED candle."""
+        c = self.cfg
+        signals = []
+        open_symbols = {p.symbol for p in self.account.positions()}
+
+        btc_1h = self._series_1h.get(c.strategy.btc_symbol)
+        btc_roc = float("nan")
+        if btc_1h is not None and len(btc_1h) > c.strategy.momentum_periods[-1] + 1:
+            btc_roc = last_valid(roc(btc_1h.close, c.strategy.momentum_periods[-1]))
+
+        for sym in self.status.universe:
+            s = self._series_1h.get(sym)
+            if s is None or len(s) == 0:
+                continue
+            cid = candle_id(sym, c.strategy.entry_timeframe, int(s.open_ms[-1]))
+            if self.repo.is_candle_processed(cid):
+                continue          # already acted on this bar, even across restarts
+
+            htf = self._series_htf.get(sym)
+            ticker = self._tickers.get(sym, {})
+            spread = self.universe_builder.spread_bps(ticker)
+            meta_extra = {
+                "btc_roc": btc_roc,
+                "dollar_volume": float(ticker.get("quoteVolume") or 0.0),
+                "spread_bps": 0.0 if not np.isfinite(spread) else spread,
+                "min_dollar_volume": c.universe.min_dollar_volume_24h,
+            }
+            # stage-2 universe filter needs candles, so it runs here
+            a = last_valid(atr(s.high, s.low, s.close, c.strategy.atr_period))
+            px = float(s.close[-1])
+            atr_pct = (a / px * 100.0) if (np.isfinite(a) and px > 0) else None
+            hist_reject = self.universe_builder.filter_by_history(sym, s, atr_pct)
+
+            sig = self.strategy.evaluate(s, htf, ctx, meta_extra)
+            self.status.signals_evaluated += 1
+
+            if hist_reject:
+                sig.passed = False
+                sig.reject_reason = hist_reject
+
+            if sym in open_symbols:
+                sig.passed = False
+                sig.reject_reason = sig.reject_reason or "position already open"
+
+            cal_ev = self.calendar.blocking_event(sym, ctx.ts_ms)
+            if cal_ev and sig.passed:
+                sig.passed = False
+                sig.reject_reason = f"scheduled {cal_ev['kind']} event within window"
+
+            if not sig.passed:
+                self.risk.log_rejection(sym, sig.reject_reason, score=sig.score)
+                self.journal.record(sig, REJECTED_STRATEGY)
+            signals.append(sig)
+        return signals
+
+    def rank_and_enter(self, signals: list, ctx: MarketContext) -> int:
+        """Rank all qualifying setups, then spend capital on the best first."""
+        c = self.cfg
+        qualified = sorted([s for s in signals if s.passed],
+                           key=lambda x: x.score, reverse=True)
+        entries = 0
+        for rank, sig in enumerate(qualified, start=1):
+            marks = self.marks()
+            equity = self.account.equity(marks)
+            exposure = self.account.exposure(marks)
+            positions = self.account.positions()
+            open_returns = {}
+            for p in positions:
+                ps = self._series_1h.get(p.symbol)
+                if ps is not None and len(ps) > 30:
+                    r = log_returns(ps.close)
+                    open_returns[p.symbol] = r[-min(len(r), c.risk.correlation_lookback):]
+
+            cand_returns = None
+            if sig.returns is not None and len(sig.returns):
+                cand_returns = sig.returns[-c.risk.correlation_lookback:]
+
+            decision = self.risk.check_entry(
+                symbol=sig.symbol, equity=equity, exposure=exposure,
+                n_open=len(positions), open_symbols=[p.symbol for p in positions],
+                candidate_returns=cand_returns, open_returns=open_returns,
+                entries_this_cycle=entries)
+            if not decision.allowed:
+                self.risk.log_rejection(sig.symbol, decision.reason,
+                                        score=sig.score, rank=rank)
+                self.journal.record(sig, REJECTED_RISK, decision.reason, rank)
+                continue
+
+            if self._enter(sig, ctx, rank, equity, exposure):
+                entries += 1
+            if entries >= c.risk.max_new_entries_per_cycle:
+                # remaining qualified setups are recorded as ranked out
+                for r2, rest in enumerate(qualified[rank:], start=rank + 1):
+                    self.journal.record(rest, RANKED_OUT,
+                                        "capital allocated to higher-ranked setups", r2)
+                break
+        return entries
+
+    def _enter(self, sig, ctx: MarketContext, rank: int, equity: float,
+               exposure: float) -> bool:
+        c = self.cfg
+        meta = self._markets.get(sig.symbol)
+        if meta is None:
+            self.risk.log_rejection(sig.symbol, "exchange metadata unavailable")
+            self.journal.record(sig, REJECTED_RISK, "exchange metadata unavailable", rank)
+            return False
+
+        quote = self._safe_quote(sig.symbol)
+        ok_spread, spread = self.broker.spread_acceptable(quote)
+        if not ok_spread:
+            reason = f"spread {spread:.1f}bps exceeds entry limit"
+            self.risk.log_rejection(sig.symbol, reason)
+            self.journal.record(sig, REJECTED_RISK, reason, rank)
+            return False
+
+        sizing = self.broker.size_position(
+            equity=equity, cash=self.account.cash(), entry_price=sig.ref_price,
+            stop_price=sig.stop_price, risk_pct=c.risk.risk_per_trade_pct,
+            max_position_pct=c.risk.max_position_pct, current_exposure=exposure,
+            max_exposure_pct=c.risk.max_portfolio_exposure_pct, meta=meta,
+            min_stop_distance_pct=c.risk.min_stop_distance_pct)
+        if not sizing.ok:
+            self.risk.log_rejection(sig.symbol, sizing.reason)
+            self.journal.record(sig, REJECTED_RISK, sizing.reason, rank)
+            return False
+
+        fill = self.broker.buy(sig.symbol, sizing.qty, sig.ref_price, quote, meta,
+                               ts_ms=now_ms())
+        journal = self.journal.entry_journal(sig, {
+            "account_equity": equity, "position_value": fill.notional,
+            "risk_amount": sizing.risk_amount, "rank": rank,
+            "environment": self.status.environment,
+            "spread_bps": spread,
+            "config_fingerprint_version": self.strategy.version,
+            "derivatives": ctx.derivatives_by_symbol.get(sig.symbol),
+            "news": ctx.news_by_symbol.get(sig.symbol),
+        })
+
+        pos = self.account.open_position(
+            symbol=sig.symbol, strategy=sig.strategy, strategy_version=sig.version,
+            qty=sizing.qty, ref_price=sig.ref_price, fill=fill,
+            initial_stop=sig.stop_price, risk_amount=sizing.risk_amount,
+            candle_id=sig.candle_id, signal_score=sig.score, journal=journal)
+        if pos is None:
+            self.journal.record(sig, REJECTED_RISK, "duplicate or insufficient cash", rank)
+            return False
+
+        self.status.entries += 1
+        self.journal.record(sig, ENTERED, "", rank)
+        new_equity = self.account.equity(self.marks())
+        reasons = _entry_reasons(sig)
+        self.notifier.send(
+            fmt.entry(symbol=sig.symbol, side="long", entry_price=fill.fill_price,
+                      qty=sizing.qty, position_value=fill.notional,
+                      pct_of_account=fill.notional / equity * 100.0 if equity else 0.0,
+                      stop=sig.stop_price, dollar_risk=sizing.risk_amount,
+                      pct_risk=sizing.risk_amount / equity * 100.0 if equity else 0.0,
+                      score=sig.score, htf_regime=sig.features.get("htf_regime", "?"),
+                      btc_regime=ctx.btc_regime, breadth=ctx.breadth_pct,
+                      reasons=reasons, equity=new_equity),
+            dedupe_key=f"entry:{sig.candle_id}", kind="entry")
+        return True
+
+    # =============================================================== breakers
+    def check_safety(self) -> bool:
+        """Returns True if trading may proceed. Fails closed on every doubt."""
+        acct = self.account.state
+        if int(acct["halted"]):
+            self.status.halted = True
+            self.status.halt_reason = acct["halt_reason"]
+            return False
+
+        marks = self.marks()
+        equity = self.account.equity(marks)
+        cs = self.risk.check_circuit_breakers(
+            equity, float(acct["peak_equity"]), float(acct["daily_start_equity"]))
+        if cs.halted:
+            self.repo.set_halt(True, cs.reason)
+            self.status.halted = True
+            self.status.halt_reason = cs.reason
+            kind = ("MAX DRAWDOWN" if "DRAWDOWN" in cs.reason.upper() else "DAILY LOSS")
+            log_event("performance", "ERROR", "circuit breaker tripped", reason=cs.reason)
+            self.notifier.send(
+                fmt.circuit_breaker(kind=kind, reason=cs.reason, equity=equity,
+                                    action="New entries stopped; open positions still managed"),
+                dedupe_key=f"cb:{kind}:{utc_date(now_ms())}", kind="circuit_breaker")
+            return False
+        return True
+
+    # ============================================================ bookkeeping
+    def bookkeeping(self) -> None:
+        c, now = self.cfg, now_ms()
+        marks = self.marks()
+        equity = self.account.equity(marks)
+
+        if self.account.roll_daily(now, marks):
+            # a new day clears the DAILY loss halt, but never the drawdown halt
+            acct = self.account.state
+            if int(acct["halted"]) and "DAILY LOSS" in acct["halt_reason"].upper():
+                self.repo.set_halt(False, "")
+                self.status.halted = False
+                self.status.halt_reason = ""
+                log_event("performance", "INFO", "daily loss halt cleared by rollover")
+
+        if now - self.status.last_snapshot_ms >= c.engine.equity_snapshot_minutes * 60_000:
+            self.repo.add_equity_snapshot(
+                now, equity, self.account.cash(), self.account.unrealized(marks),
+                len(self.account.positions()), self.account.drawdown_pct(marks))
+            self.status.last_snapshot_ms = now
+
+        if now - self.status.last_heartbeat_ms >= c.telegram.heartbeat_minutes * 60_000:
+            self._heartbeat(equity)
+            self.status.last_heartbeat_ms = now
+
+        today = utc_date(now)
+        from .timeutils import to_dt
+        if (self.status.last_daily_report_date != today
+                and to_dt(now).hour >= c.telegram.daily_report_hour_utc
+                and self.status.last_daily_report_date != ""):
+            self._daily_report(today)
+            self.status.last_daily_report_date = today
+        elif self.status.last_daily_report_date == "":
+            self.status.last_daily_report_date = today
+
+        try:
+            self.counterfactual.evaluate_pending(lambda sym: self._series_1h.get(sym))
+        except Exception as e:
+            log_event("app", "WARNING", "counterfactual evaluation failed", error=str(e))
+
+        self.repo.prune_processed_candles(now - 30 * DAY_MS)
+
+    def _heartbeat(self, equity: float) -> None:
+        acct = self.account.state
+        day = self.repo.get_daily(utc_date(now_ms()))
+        today_pnl = equity - float(acct["daily_start_equity"])
+        self.notifier.send(
+            fmt.heartbeat(
+                uptime_s=(now_ms() - self.status.started_ms) / 1000.0, equity=equity,
+                today_pnl=today_pnl, total_pnl=equity - float(acct["starting_equity"]),
+                open_positions=len(self.account.positions()),
+                btc_regime=self.status.btc_regime, breadth=self.status.breadth,
+                signals_evaluated=self.status.signals_evaluated,
+                last_data_ms=self.status.last_data_ms or now_ms(),
+                halted=self.status.halted),
+            kind="heartbeat")
+
+    def _daily_report(self, date: str) -> None:
+        marks = self.marks()
+        rep = self.perf.report(marks).as_dict()
+        acct = self.account.state
+        top = [{"symbol": o["symbol"], "score": o["score"]}
+               for o in sorted(self.repo.get_observations(since_ms=now_ms() - DAY_MS),
+                               key=lambda r: (r["score"] or 0), reverse=True)[:5]]
+        events = []
+        for sym, reason in self.repo.blocked_symbols(now_ms()).items():
+            events.append(f"WARNING — {sym} entries blocked: {reason[:80]}")
+        self.notifier.send(
+            fmt.daily_report(
+                date=date, uptime_s=(now_ms() - self.status.started_ms) / 1000.0,
+                rep=rep, top_setups=top, btc_regime=self.status.btc_regime,
+                breadth=self.status.breadth,
+                strategy_status="HALTED: " + self.status.halt_reason
+                if self.status.halted else "ACTIVE",
+                daily_loss_remaining=self.risk.daily_loss_remaining(
+                    self.account.equity(marks), float(acct["daily_start_equity"])),
+                events=events),
+            dedupe_key=f"daily:{date}", kind="daily_report")
+
+    # ================================================================== cycle
+    def cycle(self) -> None:
+        self.status.cycles += 1
+        universe = self.refresh_universe()
+        self.fetch_data(universe)
+
+        stale, why = self.data_is_stale()
+        if stale:
+            log_event("data", "ERROR", "trading suspended: data not trustworthy",
+                      reason=why)
+            self.notifier.send(
+                fmt.circuit_breaker(kind="STALE DATA", reason=why,
+                                    equity=self.account.equity(self.marks()),
+                                    action="No signals evaluated this cycle"),
+                dedupe_key=f"stale:{utc_date(now_ms())}:{int(now_ms() / 3_600_000)}",
+                kind="circuit_breaker")
+            self.bookkeeping()
+            return
+
+        ctx = self.build_context()
+        self.manage_positions(ctx)          # ALWAYS before entries
+
+        if self.check_safety():
+            signals = self.evaluate_signals(ctx)
+            self.rank_and_enter(signals, ctx)
+        else:
+            log_event("strategy", "WARNING", "entries suppressed",
+                      reason=self.status.halt_reason)
+        self.bookkeeping()
+
+    def run(self, max_cycles: int | None = None, sleep=time.sleep) -> None:
+        self._running = True
+        n = 0
+        while self._running:
+            start = time.time()
+            try:
+                self.cycle()
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                log_event("app", "ERROR", "cycle failed", error=str(e))
+                self.notifier.send_error("engine cycle", str(e))
+            n += 1
+            if max_cycles is not None and n >= max_cycles:
+                break
+            elapsed = time.time() - start
+            sleep(max(0.0, self.cfg.engine.poll_seconds - elapsed))
+
+    def stop(self) -> None:
+        self._running = False
+
+    def announce_start(self) -> None:
+        marks = self.marks()
+        self.notifier.send(
+            fmt.bot_start(mode=self.cfg.safety.mode, exchange=self.feed.name,
+                          equity=self.account.equity(marks), cash=self.account.cash(),
+                          open_positions=len(self.account.positions()),
+                          strategy=self.strategy.name, version=self.strategy.version,
+                          universe_size=len(self.status.universe),
+                          telegram_ok=self.notifier.enabled),
+            kind="bot_start")
+
+
+def _entry_reasons(sig) -> list[str]:
+    f, out = sig.features, []
+    if f.get("donchian_high"):
+        out.append(f"broke {f['donchian_high']:.6g} Donchian high")
+    if f.get("adx"):
+        out.append(f"ADX {f['adx']:.0f}")
+    if f.get("rel_volume"):
+        out.append(f"rel vol {f['rel_volume']:.1f}x")
+    mom = f.get("momentum") or {}
+    if mom:
+        k = max(mom)
+        v = mom[k]
+        if v is not None and np.isfinite(v):
+            out.append(f"{k}h momentum {v:+.1f}%")
+    return out
