@@ -26,6 +26,17 @@ broad_min_assets = 50             # fewer than this means the provider is broken
 broad_refresh_hours = 12          # market caps move slowly
 broad_max_cache_age_hours = 168   # a week-old cached universe stops being usable
 broad_static_assets = []          # only used when broad_source = "static"
+# Ticker symbols are NOT globally unique -- unrelated projects reuse them. We
+# scan further down the ranking than we trade so a ticker shared with a
+# lower-ranked asset is visible as a collision; a colliding ticker is REFUSED
+# rather than guessed at, and is reported by `cli verify-live`.
+broad_collision_scan_limit = 1000
+# Deterministic disambiguation: exchange base symbol -> provider asset id.
+# Consulted before anything else, so it also rescues a ticker that would
+# otherwise be refused. Example:
+#   [universe.broad_symbol_overrides]
+#   GRT = "the-graph"
+broad_symbol_overrides = {}
 # With neither a live nor a usable cached broad universe, NEW ENTRIES STOP.
 # Open positions keep being managed regardless -- the ranking provider is never
 # allowed to become a single point of failure for risk already on the books.
@@ -99,6 +110,15 @@ max_spread_bps_entry = 25.0
 max_quote_age_s = 90
 max_quote_future_skew_s = 30
 max_quote_deviation_pct = 10.0
+# TIMESTAMP POLICY. Some venues do not stamp their ticker at all; CCXT reports
+# that as None. The adapter then stamps it locally and LABELS it, and the entry
+# gate SKIPS the age check rather than letting a quote of unknown vintage score
+# a meaningless "0 seconds old" -- the price-deviation check above is what
+# guards those venues. Run `cli verify-live` to see which case yours is in.
+#   require_venue_quote_timestamp = true  -> refuse quotes with no venue stamp
+#   quote_ts_fallback = "reject"          -> adapter discards them outright
+require_venue_quote_timestamp = false
+quote_ts_fallback = "local"
 # Position size is computed against the SIMULATED FILL (ask + slippage + tick
 # rounding), never the signal candle's close, and re-checked against the fill
 # before the position is committed. This is the tolerance on that re-check --

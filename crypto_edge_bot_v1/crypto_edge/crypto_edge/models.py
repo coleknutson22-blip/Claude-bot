@@ -99,7 +99,20 @@ class Series:
 @dataclass
 class MarketMeta:
     """Exchange metadata for one market. Without this we cannot size an order
-    correctly, so its absence is a hard block on trading that symbol."""
+    correctly, so its absence is a hard block on trading that symbol.
+
+    Granularity is carried two ways because exchanges express it two ways:
+
+      * `amount_precision` / `price_precision` -- decimal places, which is what
+        CCXT's DECIMAL_PLACES mode reports
+      * `amount_step` / `price_step` -- an absolute tick size, which is what
+        CCXT's TICK_SIZE mode reports and what every major venue actually uses
+
+    A step is strictly more expressive: 0.05 and 0.5 are legal ticks and cannot
+    be written as a number of decimal places. When a step is present it wins;
+    the decimal fields remain as a fallback for venues that only give those.
+    `0.0` means "not specified".
+    """
     symbol: str
     base: str
     quote: str
@@ -108,6 +121,16 @@ class MarketMeta:
     price_precision: int = 8
     min_amount: float = 0.0
     min_cost: float = 0.0          # minimum notional in quote currency
+    amount_step: float = 0.0       # absolute tick for quantity (0 = unspecified)
+    price_step: float = 0.0        # absolute tick for price   (0 = unspecified)
+
+
+# Where a quote's timestamp came from. This matters: if the venue did not
+# supply one and we substituted our own receive time, then "quote age" measures
+# our own clock, not the venue's freshness -- an age check against a local
+# stamp is close to vacuous and must not be mistaken for a real staleness test.
+TS_VENUE = "venue"     # the exchange stamped it; age is meaningful
+TS_LOCAL = "local"     # we stamped it on receipt; age is ~0 by construction
 
 
 @dataclass
@@ -117,6 +140,11 @@ class Quote:
     ask: float
     last: float
     ts_ms: int
+    ts_source: str = TS_VENUE
+
+    @property
+    def venue_timestamped(self) -> bool:
+        return self.ts_source == TS_VENUE
 
     @property
     def mid(self) -> float:

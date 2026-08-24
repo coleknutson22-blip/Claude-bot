@@ -101,10 +101,10 @@ class UniverseBuilder:
         carried along for the liquidity filter and as a tiebreak among assets
         the broad list does not separate.
         """
-        rows: list[tuple[str, float, int | None]] = []
+        rows: list[tuple[str, float, int | None, str]] = []
         for sym, qv in self.rank_by_volume(tickers, markets):
-            base = markets[sym].base.upper()
-            rows.append((sym, qv, broad.rank_of(base)))
+            res = broad.resolve(markets[sym].base)
+            rows.append((sym, qv, res.rank, res.reason))
         # unranked assets sort last, then by descending volume within a rank
         rows.sort(key=lambda r: (r[2] is None, r[2] if r[2] is not None else 0, -r[1]))
         return rows
@@ -126,10 +126,10 @@ class UniverseBuilder:
         if broad is not None:
             ordered = self.rank_by_broad_universe(broad, tickers, markets)
         else:
-            ordered = [(sym, qv, None) for sym, qv in
+            ordered = [(sym, qv, None, "") for sym, qv in
                        self.rank_by_volume(tickers, markets)]
 
-        for position, (sym, qv, broad_rank) in enumerate(ordered, start=1):
+        for position, (sym, qv, broad_rank, why) in enumerate(ordered, start=1):
             meta = markets[sym]
             rank = broad_rank if broad_rank is not None else position
             row = {"symbol": sym, "rank": rank, "dollar_volume": qv,
@@ -137,7 +137,10 @@ class UniverseBuilder:
 
             if broad is not None and broad_rank is None:
                 if sym not in c.always_include:
-                    row["reject_reason"] = "not in the broad top-N asset universe"
+                    # `why` distinguishes "this asset is not in the top-N" from
+                    # "this TICKER is claimed by several assets and we refuse to
+                    # guess which one this venue means" -- very different facts.
+                    row["reject_reason"] = why or "not in the broad top-N asset universe"
                     audit.append(row)
                     continue
                 row["rank"] = rank = position

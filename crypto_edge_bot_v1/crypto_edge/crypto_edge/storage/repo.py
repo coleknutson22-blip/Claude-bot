@@ -414,14 +414,23 @@ class Repo:
 
     # ------------------------------------------------------- broad universe
     def save_broad_universe(self, source: str, fetched_ms: int, as_of_ms: int,
-                            assets: list[dict], content_hash: str) -> None:
-        """Append-only: every fetch is retained with its provenance."""
+                            assets: list[dict], content_hash: str,
+                            ambiguous: dict | None = None,
+                            scanned: int | None = None) -> None:
+        """Append-only: every fetch is retained with its provenance.
+
+        The payload is an object rather than a bare list so the ticker-ambiguity
+        map travels with the ranking -- a cached universe used during a provider
+        outage must be exactly as careful about asset identity as a live one.
+        """
+        payload = {"assets": assets, "ambiguous": ambiguous or {},
+                   "scanned": scanned if scanned is not None else len(assets)}
         self.conn.execute(
             """INSERT OR REPLACE INTO broad_universe_cache
                (fetched_ms, source, as_of_ms, n_assets, content_hash, payload)
                VALUES(?,?,?,?,?,?)""",
             (fetched_ms, source, as_of_ms, len(assets), content_hash,
-             json.dumps(assets, separators=(",", ":"))))
+             json.dumps(payload, separators=(",", ":"))))
 
     def latest_broad_universe(self, min_assets: int = 1) -> dict | None:
         """Most recent cached snapshot that still meets the size floor."""
@@ -431,7 +440,13 @@ class Repo:
         if r is None:
             return None
         d = dict(r)
-        d["assets"] = json.loads(d.pop("payload"))
+        payload = json.loads(d.pop("payload"))
+        if isinstance(payload, list):        # snapshot written before ambiguity
+            d["assets"], d["ambiguous"], d["scanned"] = payload, {}, len(payload)
+        else:
+            d["assets"] = payload.get("assets", [])
+            d["ambiguous"] = payload.get("ambiguous", {})
+            d["scanned"] = payload.get("scanned", len(d["assets"]))
         return d
 
     def prune_broad_universe(self, keep: int = 60) -> None:

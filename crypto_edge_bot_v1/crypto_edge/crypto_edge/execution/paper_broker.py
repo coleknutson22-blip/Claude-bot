@@ -29,26 +29,61 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ..models import Candle, Fill, MarketMeta, Quote
+from ..models import TS_LOCAL, TS_VENUE, Candle, Fill, MarketMeta, Quote
 from ..timeutils import now_ms
 
 BPS = 1e-4
 
 
-def round_amount(qty: float, precision: int) -> float:
+def round_amount(qty: float, precision: int, step: float = 0.0) -> float:
     """Always round DOWN. Rounding up could exceed available cash or the
-    intended risk budget."""
+    intended risk budget.
+
+    `step` is an absolute tick size and takes priority when supplied, because
+    it is what exchanges actually enforce and it can express ticks that no
+    number of decimal places can (0.05, 0.5, 25). `precision` remains the
+    fallback for venues that only report decimal places.
+    """
+    if step and step > 0 and math.isfinite(step):
+        # floor to a whole number of ticks, then snap off float dust
+        n = math.floor(round(qty / step, 9))
+        return _clean_float(n * step, step)
     if precision < 0:
         return qty
     factor = 10 ** precision
     return math.floor(qty * factor) / factor
 
 
-def round_price(price: float, precision: int) -> float:
+def round_price(price: float, precision: int, step: float = 0.0) -> float:
+    """Round to the nearest tick. Prices are a quote, not a budget, so nearest
+    is correct here -- unlike quantities, which must always round down."""
+    if step and step > 0 and math.isfinite(step):
+        n = math.floor(round(price / step, 9) + 0.5)
+        return _clean_float(n * step, step)
     if precision < 0:
         return price
     factor = 10 ** precision
     return math.floor(price * factor + 0.5) / factor
+
+
+def _clean_float(value: float, step: float) -> float:
+    """Remove binary-float dust introduced by multiplying by a decimal tick.
+
+    0.1 + 0.2 problems are cosmetic in most code and corrosive in a ledger, so
+    the result is re-rounded to the tick's own decimal resolution.
+    """
+    decimals = decimals_for_step(step)
+    return round(value, decimals) if decimals is not None else value
+
+
+def decimals_for_step(step: float) -> int | None:
+    """Decimal places needed to write `step` exactly, or None if impractical."""
+    if not step or step <= 0 or not math.isfinite(step):
+        return None
+    text = f"{step:.12f}".rstrip("0")
+    if "." not in text:
+        return 0
+    return min(12, len(text.split(".", 1)[1]))
 
 
 @dataclass
@@ -72,6 +107,8 @@ class QuoteCheck:
     reason: str = ""
     spread_bps: float = 0.0
     age_s: float = 0.0
+    ts_source: str = TS_VENUE
+    age_verified: bool = True     # False when the venue supplied no timestamp
 
 
 class PaperBroker:
@@ -105,7 +142,7 @@ class PaperBroker:
             base = max(quote.ask, 0.0)
         fill_price = base * (1.0 + self.slippage_bps * BPS)
         if meta:
-            fill_price = round_price(fill_price, meta.price_precision)
+            fill_price = round_price(fill_price, meta.price_precision, meta.price_step)
         return fill_price
 
     # ----------------------------------------------------------- sizing
@@ -148,7 +185,7 @@ class PaperBroker:
         affordable = cash / (entry_price * (1.0 + self.taker_fee_bps * BPS))
         qty = min(qty, affordable)
 
-        qty = round_amount(qty, meta.amount_precision)
+        qty = round_amount(qty, meta.amount_precision, meta.amount_step)
         if qty <= 0:
             return SizingResult(0, 0, 0, stop_dist, False, "size rounds to zero")
         if meta.min_amount and qty < meta.min_amount:
@@ -210,7 +247,7 @@ class PaperBroker:
             base = max(quote.ask, 0.0)
         fill_price = base * (1.0 + self.slippage_bps * BPS)
         if meta:
-            fill_price = round_price(fill_price, meta.price_precision)
+            fill_price = round_price(fill_price, meta.price_precision, meta.price_step)
         notional = qty * fill_price
         fee = self.fee(notional)
         slip = (fill_price - ref_price) * qty
@@ -228,7 +265,7 @@ class PaperBroker:
         slip_bps = self.slippage_bps if slippage_bps is None else slippage_bps
         fill_price = base * (1.0 - slip_bps * BPS)
         if meta:
-            fill_price = round_price(fill_price, meta.price_precision)
+            fill_price = round_price(fill_price, meta.price_precision, meta.price_step)
         notional = qty * fill_price
         fee = self.fee(notional)
         slip = (ref_price - fill_price) * qty
@@ -257,7 +294,7 @@ class PaperBroker:
             reason = "stop"
         fill_price = base * (1.0 - self.stop_slippage_bps * BPS)
         if meta:
-            fill_price = round_price(fill_price, meta.price_precision)
+            fill_price = round_price(fill_price, meta.price_precision, meta.price_step)
         notional = qty * fill_price
         fee = self.fee(notional)
         slip = (stop_price - fill_price) * qty
@@ -306,7 +343,8 @@ class PaperBroker:
     def validate_entry_quote(self, quote: Quote | None, *, ref_price: float = 0.0,
                              now: int | None = None, max_age_s: float = 90.0,
                              max_future_skew_s: float = 30.0,
-                             max_deviation_pct: float = 10.0) -> QuoteCheck:
+                             max_deviation_pct: float = 10.0,
+                             require_venue_timestamp: bool = False) -> QuoteCheck:
         """Gate a NEW ENTRY on a live quote. Fails closed on every doubt.
 
         A new position is discretionary: if we cannot see a book we trust, the
@@ -325,32 +363,55 @@ class PaperBroker:
 
         ts = int(quote.ts_ms)
         age_s = (now - ts) / 1000.0
-        if age_s > max_age_s:
-            return QuoteCheck(False, f"quote stale by {age_s:.0f}s (limit {max_age_s:.0f}s)",
-                              age_s=age_s)
-        if age_s < -max_future_skew_s:
-            return QuoteCheck(False,
-                              f"quote timestamped {-age_s:.0f}s in the future",
-                              age_s=age_s)
+        source = getattr(quote, "ts_source", TS_VENUE)
+        verified = source == TS_VENUE
+
+        if not verified:
+            # The venue did not stamp this ticker, so the timestamp is our own
+            # receive time and the age is ~0 by construction. Running the
+            # staleness test on it would return "fresh" for a quote of entirely
+            # unknown vintage, which is worse than not running it: it launders
+            # an unknown into a pass. We therefore skip it, record that
+            # freshness was NOT verified, and rely on the price-deviation check
+            # below -- which is independent of any clock -- to catch a venue
+            # serving stale cached data. Operators on a venue with trustworthy
+            # stamps can demand them with require_venue_timestamp.
+            if require_venue_timestamp:
+                return QuoteCheck(False,
+                                  "venue supplied no quote timestamp and policy "
+                                  "requires one", ts_source=source,
+                                  age_verified=False)
+            age_s = 0.0
+        else:
+            if age_s > max_age_s:
+                return QuoteCheck(False,
+                                  f"quote stale by {age_s:.0f}s (limit {max_age_s:.0f}s)",
+                                  age_s=age_s, ts_source=source)
+            if age_s < -max_future_skew_s:
+                return QuoteCheck(False,
+                                  f"quote timestamped {-age_s:.0f}s in the future",
+                                  age_s=age_s, ts_source=source)
+
+        def _fail(reason, **kw):
+            return QuoteCheck(False, reason, age_s=age_s, ts_source=source,
+                              age_verified=verified, **kw)
 
         spread = quote.spread_bps
         if not math.isfinite(spread):
-            return QuoteCheck(False, "quote invalid (unmeasurable spread)", age_s=age_s)
+            return _fail("quote invalid (unmeasurable spread)")
         if spread > self.max_spread_bps_entry:
-            return QuoteCheck(False,
-                              f"spread {spread:.1f}bps exceeds entry limit "
-                              f"({self.max_spread_bps_entry:.1f}bps)",
-                              spread_bps=spread, age_s=age_s)
+            return _fail(f"spread {spread:.1f}bps exceeds entry limit "
+                         f"({self.max_spread_bps_entry:.1f}bps)", spread_bps=spread)
 
         if ref_price > 0 and math.isfinite(ref_price) and max_deviation_pct > 0:
             dev = abs(quote.mid - ref_price) / ref_price * 100.0
             if dev > max_deviation_pct:
-                return QuoteCheck(False,
-                                  f"quote deviates {dev:.1f}% from the signal "
-                                  f"reference (limit {max_deviation_pct:.1f}%)",
-                                  spread_bps=spread, age_s=age_s)
+                return _fail(f"quote deviates {dev:.1f}% from the signal "
+                             f"reference (limit {max_deviation_pct:.1f}%)",
+                             spread_bps=spread)
 
-        return QuoteCheck(True, "", spread_bps=spread, age_s=age_s)
+        return QuoteCheck(True, "", spread_bps=spread, age_s=age_s,
+                          ts_source=source, age_verified=verified)
 
 
 def realise_pnl(entry_ref: float, entry_fill: float, exit_ref: float,

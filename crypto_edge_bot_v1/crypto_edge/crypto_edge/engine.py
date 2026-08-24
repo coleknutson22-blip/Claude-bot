@@ -102,7 +102,9 @@ class TradingEngine:
             limit=cfg.universe.broad_limit,
             min_assets=cfg.universe.broad_min_assets,
             refresh_hours=cfg.universe.broad_refresh_hours,
-            max_cache_age_hours=cfg.universe.broad_max_cache_age_hours)
+            max_cache_age_hours=cfg.universe.broad_max_cache_age_hours,
+            collision_scan_limit=cfg.universe.broad_collision_scan_limit,
+            symbol_overrides=cfg.universe.broad_symbol_overrides)
         self.news = NewsEngine(repo, [], cfg.intel.news_block_severity,
                                cfg.intel.news_block_hours)
         self.derivatives = DerivativesEngine(repo, [])
@@ -504,7 +506,8 @@ class TradingEngine:
             quote, ref_price=sig.ref_price,
             max_age_s=c.execution.max_quote_age_s,
             max_future_skew_s=c.execution.max_quote_future_skew_s,
-            max_deviation_pct=c.execution.max_quote_deviation_pct)
+            max_deviation_pct=c.execution.max_quote_deviation_pct,
+            require_venue_timestamp=c.execution.require_venue_quote_timestamp)
         if not qc.ok:
             reason = f"entry blocked: {qc.reason}"
             self.risk.log_rejection(sig.symbol, reason, rank=rank)
@@ -550,6 +553,8 @@ class TradingEngine:
             "environment": self.status.environment,
             "spread_bps": spread,
             "quote_age_s": qc.age_s,
+            "quote_ts_source": qc.ts_source,
+            "quote_age_verified": qc.age_verified,
             "entry_ref_price": sig.ref_price,
             "expected_fill_price": est_fill,
             "entry_fill_price": fill.fill_price,

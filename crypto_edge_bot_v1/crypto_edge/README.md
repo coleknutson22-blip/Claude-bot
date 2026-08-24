@@ -66,6 +66,8 @@ python -m crypto_edge.cli test         # the automated suite
 | `python -m crypto_edge.cli export --out trades.csv` | Export the closed-trade ledger. |
 | `python -m crypto_edge.cli resume --yes` | Clear a circuit-breaker halt (deliberate, manual). |
 | `python -m crypto_edge.cli test` | Run the automated test suite. |
+| `python -m crypto_edge.cli verify-live --cycle` | Verify exchange, universe and Telegram against the real network. |
+| `python -m crypto_edge.cli verify-restart` | Prove persisted state survives a restart. |
 
 Background operation:
 
@@ -214,7 +216,31 @@ social media is logged and never acted on.
 
 Read this section before trusting anything.
 
-### VERIFIED OFFLINE — 306 automated tests, all passing
+### HOW TO COMPLETE LIVE VERIFICATION
+
+Three things cannot be verified without outbound network access: the exchange
+adapter, the market-cap universe provider, and Telegram delivery. One command
+exercises all three and prints a report:
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # then put your real token/chat id in it
+python -m crypto_edge.cli verify-live --cycle
+python -m crypto_edge.cli verify-restart
+```
+
+`verify-live` opens no positions and contains no order code. It reports the
+exchange's precision/tick metadata, both candle timeframes, whether unfinished
+candles were discarded, quote spreads, **measured quote-age statistics**, the
+broad universe (count, cache, provenance hash, ticker collisions, exchange
+intersection, survivors after filtering), real Telegram delivery through the
+durable outbox, and — with `--cycle` — one complete engine cycle. Zero entries
+is a passing result. Credentials are masked in all output.
+
+If a check fails, fix it before running continuously; the summary block ends
+with an explicit verdict.
+
+### VERIFIED OFFLINE — 403 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -260,6 +286,14 @@ network**, so `ccxt` could not even be installed:
   Until it succeeds once, `require_broad_universe = true` means **no new
   entries will be opened** — that is the intended fail-closed behaviour, not a
   bug. `selfcheck` reports it explicitly.
+- **Real ticker-timestamp behaviour.** `max_quote_age_s = 90` is a defensible
+  default, not a measurement. `verify-live` samples real tickers and tells you
+  the median and maximum observed age on your venue, and whether that venue
+  stamps its tickers at all. Do not raise the limit to make something pass —
+  read the finding first.
+- **Real ticker collisions.** The collision machinery is tested offline against
+  a constructed clash. Which tickers actually collide in CoinGecko's top ~1000
+  is a live fact; `verify-live` lists them so you can pin any you want traded.
 
 Run `python -m crypto_edge.cli selfcheck` first — it checks exactly these three
 things, and will tell you which one is broken if any are.
@@ -274,6 +308,7 @@ crypto_edge/
   backtest.py        same strategy object, bar-sliced history
   data/              feed protocol, ccxt feed, fixture feed, broad (market-cap)
                      asset universe, venue universe builder
+  verify_live.py     live-network verification harness (cli verify-live)
   strategy/          regime, scoring, trend_breakout
   execution/         paper broker: sizing, fills, fees, slippage, stops
   portfolio/         account, risk manager, stop logic
@@ -283,7 +318,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               306 tests
+tests/               403 tests
 ```
 
 ## Safety notes

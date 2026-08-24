@@ -98,7 +98,7 @@ message text (defect 2 above), not a wrong severity.
 
 ## TEST RESULTS
 
-**306 tests, all passing.** Run: `python -m crypto_edge.cli test`
+**403 tests, all passing.** Run: `python -m crypto_edge.cli test`
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -115,6 +115,9 @@ message text (defect 2 above), not a wrong severity.
 | `test_broad_universe.py` | 36 | Market-cap universe, intersection, caching + provenance, outage fallback, fail-closed entries |
 | `test_engine.py` | 12 | End-to-end entry, stop exit, stale data, breakers, restart mid-position |
 | `test_selfcheck.py` | 12 | Fail-closed behaviour, critical vs warning, log severity |
+| `test_live_adapter.py` | 45 | CCXT precision modes and tick rounding, quote-timestamp provenance, OHLCV parsing |
+| `test_symbol_collisions.py` | 26 | Ticker collisions, identity-based resolution, overrides, cached ambiguity |
+| `test_verify_live.py` | 26 | The live-verification harness itself, including credential masking |
 
 The tests worth singling out, because they are the ones that would catch a real
 loss of money:
@@ -291,9 +294,44 @@ live but query tables no production code writes to. **A news event cannot
 currently stop a trade, and no funding or open-interest data is being
 recorded.** See the status table in the README.
 
-**7. Synthetic test data is a limited proxy.** 306 passing tests prove the
+**7. Synthetic test data is a limited proxy.** 403 passing tests prove the
 system is internally consistent and behaves correctly against data I generated.
 They cannot prove it behaves correctly against data reality generates.
+
+---
+
+## LIVE-READINESS PASS (adapter correctness)
+
+Two defects were found by auditing the CCXT adapter against the installed
+library rather than by reading it:
+
+**A. Precision was wrong on every major venue.** CCXT reports market
+granularity in three modes. `TICK_SIZE` — used by binance, kraken, coinbase,
+kucoin, okx, bybit and bitstamp in current CCXT — expresses it as an absolute
+tick *float* (`0.00001`). The adapter tested `isinstance(raw, int)`, which is
+False for a float, and fell back to 8 decimal places. Quantities were therefore
+sized three decimal places finer than the venue permits, and ticks that are not
+powers of ten (`0.05`, `0.5`) could not be represented at all. `MarketMeta` now
+carries real tick sizes, the broker rounds to them (down for quantity, nearest
+for price), and all three precision modes are handled.
+
+**B. A missing ticker timestamp was silently replaced with local time.** CCXT
+normalises an absent venue timestamp to `None`; substituting `now_ms()` without
+recording that made a quote of unknown vintage read as 0 seconds old to the
+entry staleness check — laundering an unknown into a pass. Quotes now carry
+`ts_source`, and the entry gate *skips* the age check on a locally-stamped
+quote (recording `age_verified = False`) rather than scoring it, leaving the
+clock-independent price-deviation check to guard those venues.
+
+**C. Ticker symbols are not globally unique.** The universe mapped market-cap
+assets to exchange markets by ticker alone, and de-duplicated by ticker —
+silently keeping whichever ranked higher and destroying the evidence that the
+ticker was ambiguous. Assets now carry the provider's stable id, the collision
+scan reaches to rank ~1000 while trading stops at 200 (so a clash below the
+cut-off is still visible), an ambiguous ticker is refused rather than guessed,
+and `universe.broad_symbol_overrides` pins one deterministically. The ambiguity
+map is cached with the ranking, so an outage fallback is as careful as a live
+fetch.
 
 ---
 

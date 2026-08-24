@@ -72,6 +72,14 @@ class UniverseCfg:
     broad_refresh_hours: int = 12       # market caps move slowly; so do we
     broad_max_cache_age_hours: int = 168  # a week-old cache stops being usable
     broad_static_assets: list[str] = field(default_factory=list)
+    # Ticker symbols are NOT globally unique. We scan further down the ranking
+    # than we trade so that a ticker shared with a lower-ranked asset is
+    # visible as a collision; a colliding ticker is REFUSED rather than guessed.
+    broad_collision_scan_limit: int = 1000
+    # Deterministic disambiguation: {exchange base symbol: provider asset id},
+    # e.g. {"GRT" = "the-graph"}. Consulted before anything else, so it also
+    # rescues a ticker that would otherwise be refused as ambiguous.
+    broad_symbol_overrides: dict = field(default_factory=dict)
     # With no live and no usable cached broad universe, NEW ENTRIES stop.
     # Open positions are managed regardless -- see TradingEngine.fetch_data.
     require_broad_universe: bool = True
@@ -136,6 +144,16 @@ class ExecutionCfg:
     # NOT gate exits: an open position must always be manageable, quote or not.
     max_quote_age_s: int = 90           # older than this is stale -> no entry
     max_quote_future_skew_s: int = 30   # a quote stamped ahead of us is broken
+    # Timestamp policy. Some venues do not stamp their ticker at all; CCXT
+    # reports that as None and the adapter substitutes local receive time,
+    # flagging it. An age check against a local stamp is vacuous, so it is
+    # SKIPPED rather than allowed to return a meaningless "fresh" -- see
+    # PaperBroker.validate_entry_quote. Set this true on a venue whose stamps
+    # you have verified, to refuse quotes that lack one.
+    require_venue_quote_timestamp: bool = False
+    # What the CCXT adapter does when a ticker has no venue timestamp:
+    # "local" (stamp on receipt, flag it) or "reject" (discard the quote).
+    quote_ts_fallback: str = "local"
     max_quote_deviation_pct: float = 10.0   # quote vs signal reference sanity
     # Final sizing is done against the SIMULATED FILL, not the signal candle's
     # close. This is the tolerance on the post-sizing risk revalidation, and
@@ -235,6 +253,15 @@ class Config:
             errs.append("universe.broad_source='static' requires broad_static_assets")
         if self.universe.broad_min_assets < 1:
             errs.append("universe.broad_min_assets must be >= 1")
+        if self.universe.broad_collision_scan_limit < self.universe.broad_limit:
+            errs.append("universe.broad_collision_scan_limit must be >= broad_limit")
+        if not isinstance(self.universe.broad_symbol_overrides, dict):
+            errs.append("universe.broad_symbol_overrides must be a table")
+        else:
+            for k, v in self.universe.broad_symbol_overrides.items():
+                if not isinstance(v, str) or not v.strip():
+                    errs.append(f"broad_symbol_overrides['{k}'] must be a "
+                                f"non-empty provider asset id")
         if (self.universe.require_broad_universe
                 and self.universe.broad_source == "none"):
             errs.append("universe.require_broad_universe needs a broad_source "
@@ -243,6 +270,8 @@ class Config:
             errs.append("fees and slippage must be non-negative")
         if self.execution.max_quote_age_s <= 0:
             errs.append("execution.max_quote_age_s must be > 0")
+        if self.execution.quote_ts_fallback not in ("local", "reject"):
+            errs.append("execution.quote_ts_fallback must be 'local' or 'reject'")
         if self.execution.max_quote_deviation_pct <= 0:
             errs.append("execution.max_quote_deviation_pct must be > 0")
         if not (0 <= self.execution.risk_overshoot_tolerance_pct <= 25):

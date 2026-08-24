@@ -9,6 +9,8 @@
     python -m crypto_edge.cli research
     python -m crypto_edge.cli resume
     python -m crypto_edge.cli test
+    python -m crypto_edge.cli verify-live --cycle
+    python -m crypto_edge.cli verify-restart
 """
 from __future__ import annotations
 
@@ -46,7 +48,8 @@ def _bootstrap(args, need_feed: bool = True):
     if need_feed:
         from .data.ccxt_feed import CCXTFeed
         feed = CCXTFeed(cfg.exchange.name, cfg.exchange.quote,
-                        cfg.exchange.rate_limit_ms)
+                        cfg.exchange.rate_limit_ms,
+                        quote_ts_fallback=cfg.execution.quote_ts_fallback)
     return cfg, repo, feed, notifier
 
 
@@ -58,7 +61,9 @@ def _broad_service(cfg: Config, repo: Repo):
         repo, _build_broad_provider(cfg), limit=cfg.universe.broad_limit,
         min_assets=cfg.universe.broad_min_assets,
         refresh_hours=cfg.universe.broad_refresh_hours,
-        max_cache_age_hours=cfg.universe.broad_max_cache_age_hours)
+        max_cache_age_hours=cfg.universe.broad_max_cache_age_hours,
+        collision_scan_limit=cfg.universe.broad_collision_scan_limit,
+        symbol_overrides=cfg.universe.broad_symbol_overrides)
 
 
 # ------------------------------------------------------------------ commands
@@ -245,6 +250,110 @@ def cmd_resume(args) -> int:
     return 0
 
 
+def cmd_verify_live(args) -> int:
+    """Exercise everything that cannot be verified offline. See verify_live.py."""
+    from .execution.paper_broker import PaperBroker
+    from .verify_live import (VerifyReport, verify_cycle, verify_exchange,
+                              verify_pending_first, verify_quotes,
+                              verify_telegram, verify_universe)
+
+    cfg, repo, feed, notifier = _bootstrap(args, need_feed=True)
+    rep = VerifyReport()
+    print("=" * 72)
+    print("CRYPTO EDGE -- LIVE NETWORK VERIFICATION")
+    print("=" * 72)
+    print("Read-only with respect to trading. No orders exist in this codebase.")
+
+    ex = verify_exchange(cfg, feed, rep)
+
+    broker = PaperBroker(cfg.execution.taker_fee_bps, cfg.execution.slippage_bps,
+                         cfg.execution.stop_slippage_bps,
+                         cfg.execution.use_book_spread,
+                         cfg.execution.max_spread_bps_entry)
+    verify_quotes(cfg, feed, broker, args.quote_samples, args.quote_interval, rep)
+
+    if not args.skip_universe:
+        verify_universe(cfg, repo, _broad_service(cfg, repo),
+                        ex.get("markets", {}), ex.get("tickers", {}), rep)
+
+    if not args.skip_telegram:
+        verify_telegram(cfg, repo, notifier, rep)
+        verify_pending_first(notifier, repo, rep)
+
+    if args.cycle:
+        verify_cycle(cfg, repo, feed, notifier, rep)
+
+    print(rep.render_summary())
+    return 0 if rep.passed else 1
+
+
+def cmd_verify_restart(args) -> int:
+    """Prove that stopping and restarting loses nothing.
+
+    Reads the persisted state twice through two independent connections, which
+    is what a real restart does, and diffs what matters.
+    """
+    import sqlite3
+
+    cfg, repo, _, _ = _bootstrap(args, need_feed=False)
+    acct = repo.get_account()
+    positions = repo.get_positions()
+    broad = repo.latest_broad_universe()
+    outbox = repo.telegram_outbox_counts()
+    candles = repo.conn.execute(
+        "SELECT COUNT(*) AS n FROM processed_candles").fetchone()["n"]
+    obs = repo.conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()["n"]
+    repo.conn.close()
+
+    conn2 = db.connect(cfg.engine.db_path)
+    db.init_db(conn2)
+    repo2 = Repo(conn2)
+    acct2 = repo2.get_account()
+    positions2 = repo2.get_positions()
+    broad2 = repo2.latest_broad_universe()
+    outbox2 = repo2.telegram_outbox_counts()
+    candles2 = repo2.conn.execute(
+        "SELECT COUNT(*) AS n FROM processed_candles").fetchone()["n"]
+    obs2 = repo2.conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()["n"]
+
+    checks = [
+        ("account row restored", acct2["starting_equity"] == acct["starting_equity"]
+         and abs(float(acct2["cash"]) - float(acct["cash"])) < 1e-9,
+         f"cash ${float(acct2['cash']):,.2f} start ${float(acct2['starting_equity']):,.2f}"),
+        ("peak equity restored",
+         abs(float(acct2["peak_equity"]) - float(acct["peak_equity"])) < 1e-9,
+         f"${float(acct2['peak_equity']):,.2f}"),
+        ("halt state restored", int(acct2["halted"]) == int(acct["halted"]),
+         f"halted={bool(int(acct2['halted']))} {acct2['halt_reason']}"),
+        ("daily anchor restored", acct2["daily_date"] == acct["daily_date"],
+         f"{acct2['daily_date']} start ${float(acct2['daily_start_equity']):,.2f}"),
+        ("open positions restored", len(positions2) == len(positions),
+         f"{len(positions2)} position(s)"
+         + ("" if positions2 else " (none open -- restore path exercised by tests)")),
+        ("universe cache survives", (broad2 is not None) == (broad is not None)
+         and (broad is None or broad2["content_hash"] == broad["content_hash"]),
+         f"{broad2['n_assets']} assets, hash {broad2['content_hash'][:12]}, "
+         f"source {broad2['source']}" if broad2 else "no cache present"),
+        ("telegram outbox survives", outbox2 == outbox, f"{outbox2 or 'empty'}"),
+        ("processed candles survive", candles2 == candles,
+         f"{candles2} candle(s) claimed -- these prevent duplicate entries"),
+        ("observations survive", obs2 == obs, f"{obs2} journal rows"),
+    ]
+    print("=" * 72)
+    print("RESTART VERIFICATION -- state re-read through a fresh connection")
+    print("=" * 72)
+    ok_all = True
+    for name, ok, detail in checks:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name:32} {detail}")
+        ok_all &= ok
+    for p in positions2:
+        print(f"         {p.symbol} qty={p.qty:g} stop=${p.current_stop:,.6g} "
+              f"risk=${p.risk_amount:,.2f}")
+    print("=" * 72)
+    print("RESTART RESULT: " + ("ALL STATE RESTORED" if ok_all else "MISMATCH ABOVE"))
+    return 0 if ok_all else 1
+
+
 def cmd_test(args) -> int:
     import subprocess
     root = Path(__file__).resolve().parent.parent
@@ -287,6 +396,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_resume)
 
     sub.add_parser("test", help="run the automated test suite").set_defaults(func=cmd_test)
+
+    s = sub.add_parser("verify-live",
+                       help="exercise exchange, universe and Telegram against "
+                            "the real network")
+    s.add_argument("--quote-samples", type=int, default=10,
+                   help="ticker samples for quote-age calibration (default 10)")
+    s.add_argument("--quote-interval", type=float, default=2.0,
+                   help="seconds between quote samples (default 2)")
+    s.add_argument("--cycle", action="store_true",
+                   help="also run one complete engine cycle on live data")
+    s.add_argument("--skip-telegram", action="store_true")
+    s.add_argument("--skip-universe", action="store_true")
+    s.set_defaults(func=cmd_verify_live)
+
+    sub.add_parser("verify-restart",
+                   help="prove persisted state survives a restart"
+                   ).set_defaults(func=cmd_verify_restart)
     return p
 
 
