@@ -235,6 +235,12 @@ class Config:
     telegram_token: str = ""
     telegram_chat_id: str = ""
 
+    # Where the effective exchange came from. Recorded so every surface can say
+    # not just WHICH venue is in use but WHY -- the failure this guards against
+    # is running verification against one venue and the trader against another,
+    # which is silent and easy when the venue is a per-invocation flag.
+    exchange_source: str = "config file"
+
     def validate(self) -> list[str]:
         errs: list[str] = []
         if self.safety.mode.upper() != "PAPER":
@@ -290,6 +296,10 @@ class Config:
             errs.append("telegram enabled but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are unset")
         return errs
 
+    def exchange_label(self) -> str:
+        """The single string every surface should show for "which venue"."""
+        return f"{self.exchange.name}/{self.exchange.quote}"
+
     def strategy_fingerprint(self) -> dict[str, Any]:
         """Recorded against every trade so historical results stay bound to the
         settings that produced them (spec section 15)."""
@@ -327,9 +337,12 @@ def load_config(path: str | Path = "config/config.toml",
     exchange = os.environ.get("CRYPTO_EDGE_EXCHANGE", "").strip()
     if exchange:
         cfg.exchange.name = exchange
+        cfg.exchange_source = "--exchange / CRYPTO_EDGE_EXCHANGE override"
     quote_ccy = os.environ.get("CRYPTO_EDGE_QUOTE", "").strip()
     if quote_ccy:
         cfg.exchange.quote = quote_ccy
+        if not exchange:
+            cfg.exchange_source = "--quote / CRYPTO_EDGE_QUOTE override"
 
     cfg.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     cfg.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")

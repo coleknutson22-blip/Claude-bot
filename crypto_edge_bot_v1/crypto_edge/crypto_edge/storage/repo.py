@@ -24,6 +24,28 @@ class Repo:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
 
+    # ---------------------------------------------------------------- meta
+    def get_meta(self, key: str) -> str | None:
+        r = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (key, str(value)))
+
+    def record_exchange(self, label: str) -> tuple[bool, str]:
+        """Remember which venue this database belongs to.
+
+        Returns (changed, previous). A database carries positions, processed
+        candles and a research journal that are all venue-specific: silently
+        continuing one venue's state against another's prices would corrupt the
+        record. Switching is allowed -- it is sometimes necessary -- but it must
+        never happen without being said out loud.
+        """
+        previous = self.get_meta("exchange")
+        self.set_meta("exchange", label)
+        return (previous is not None and previous != label), (previous or "")
+
     # ------------------------------------------------------------------ tx
     @contextmanager
     def tx(self):

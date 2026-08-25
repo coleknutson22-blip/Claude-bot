@@ -93,6 +93,27 @@ def run_selfcheck(cfg: Config, repo: Repo | None, feed, notifier,
     except Exception as e:
         rep.add("open positions restored", False, CRITICAL, str(e))
 
+    # ---- which venue is this, and did it just change? --------------------
+    # The override is a per-invocation flag, so forgetting it silently moves the
+    # bot to a different exchange. The database carries venue-specific state
+    # (positions, processed candles, the research journal), so a change is
+    # reported prominently rather than discovered later in the numbers.
+    rep.add("effective exchange", True, CRITICAL,
+            f"{cfg.exchange_label()}  (from {cfg.exchange_source})")
+    try:
+        changed, previous = repo.record_exchange(cfg.exchange_label())
+        if changed:
+            rep.add("exchange unchanged since last run", False, WARNING,
+                    f"THIS DATABASE WAS LAST USED WITH {previous} AND IS NOW "
+                    f"{cfg.exchange_label()} -- positions, processed candles and "
+                    f"journal rows in it came from {previous}. Use a separate "
+                    f"engine.db_path per venue unless this is deliberate.")
+        else:
+            rep.add("exchange unchanged since last run", True, WARNING,
+                    f"database belongs to {cfg.exchange_label()}")
+    except Exception as e:
+        rep.add("exchange unchanged since last run", False, WARNING, str(e))
+
     # ---- undelivered notifications --------------------------------------
     # WARNING, not CRITICAL: a stuck outbox means someone is not being told
     # something, which is serious, but stopping the trader over it would be worse.
@@ -137,6 +158,14 @@ def run_selfcheck(cfg: Config, repo: Repo | None, feed, notifier,
         rep.add("clock synchronisation", True, WARNING, "skipped (offline mode)")
         rep.add("latest candle freshness", True, WARNING, "skipped (offline mode)")
     else:
+        feed_name = getattr(feed, "name", "")
+        if feed_name and feed_name != "fixture":
+            rep.add("feed matches configured exchange",
+                    feed_name == cfg.exchange.name, CRITICAL,
+                    f"feed is '{feed_name}', config says '{cfg.exchange.name}'"
+                    if feed_name != cfg.exchange.name
+                    else f"both are '{feed_name}'")
+
         markets = {}
         try:
             markets = feed.load_markets()

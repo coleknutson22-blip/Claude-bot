@@ -121,6 +121,24 @@ class TradingEngine:
                                      cfg.strategy_fingerprint())
 
     # ================================================================ helpers
+    def check_feed_matches_config(self) -> bool:
+        """The feed we are actually pulling prices from must be the venue the
+        configuration says. Returns False and logs loudly if they disagree.
+
+        Offline feeds (the fixture feed used by tests and the smoke test) name
+        themselves and are exempt -- they are not a venue.
+        """
+        feed_name = getattr(self.feed, "name", "")
+        if not feed_name or feed_name == "fixture":
+            return True
+        if feed_name != self.cfg.exchange.name:
+            log_event("app", "ERROR",
+                      "feed/config exchange mismatch -- prices and reports would "
+                      "describe different venues",
+                      feed=feed_name, config=self.cfg.exchange.name)
+            return False
+        return True
+
     @property
     def buffer_ms(self) -> int:
         return self.cfg.safety.candle_close_buffer_s * 1000
@@ -771,9 +789,15 @@ class TradingEngine:
         self._running = False
 
     def announce_start(self) -> None:
+        self.check_feed_matches_config()
         marks = self.marks()
         self.notifier.send(
-            fmt.bot_start(mode=self.cfg.safety.mode, exchange=self.feed.name,
+            # cfg.exchange_label(), not feed.name: the configuration is the
+            # single source of truth for which venue we are on, and every other
+            # surface (selfcheck, status, verify-live) reports the same string.
+            # A feed whose own name disagrees is a wiring bug, reported below.
+            fmt.bot_start(mode=self.cfg.safety.mode,
+                          exchange=self.cfg.exchange_label(),
                           equity=self.account.equity(marks), cash=self.account.cash(),
                           open_positions=len(self.account.positions()),
                           strategy=self.strategy.name, version=self.strategy.version,

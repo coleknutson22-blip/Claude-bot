@@ -54,6 +54,18 @@ def _bootstrap(args, need_feed: bool = True):
     return cfg, repo, feed, notifier
 
 
+def _warn_if_venue_changed(cfg: Config, repo: Repo) -> None:
+    """Say so, loudly, if this database was last used with a different venue."""
+    try:
+        changed, previous = repo.record_exchange(cfg.exchange_label())
+    except Exception:
+        return
+    if changed:
+        print(f"  !! THIS DATABASE WAS LAST USED WITH {previous}, NOW "
+              f"{cfg.exchange_label()}")
+        print(f"  !! Its positions and history came from {previous}.")
+
+
 def _broad_service(cfg: Config, repo: Repo):
     """The broad (market-cap) asset universe service, built from config."""
     from .data.broad_universe import BroadUniverseService
@@ -112,12 +124,18 @@ def cmd_start(args) -> int:
 
 def cmd_status(args) -> int:
     cfg, repo, _, _ = _bootstrap(args, need_feed=False)
+    # A database that has never run the engine has no account row yet; reporting
+    # a clean starting balance is far more useful to an operator than a
+    # traceback about missing state.
+    repo.ensure_account(cfg.execution.starting_equity)
     perf = PerformanceCalculator(repo)
     rep = perf.report().as_dict()
     a, r, t = rep["account"], rep["risk"], rep["trading"]
     acct = repo.get_account()
     print("=" * 62)
-    print(f"  CRYPTO EDGE — {cfg.safety.mode} MODE ({cfg.exchange.name})")
+    print(f"  CRYPTO EDGE — {cfg.safety.mode} MODE ({cfg.exchange_label()})")
+    print(f"  Exchange from: {cfg.exchange_source}")
+    _warn_if_venue_changed(cfg, repo)
     print("=" * 62)
     print(f"  Equity            ${a['current_equity']:>14,.2f}")
     print(f"  Cash              ${a['cash']:>14,.2f}")
@@ -150,7 +168,8 @@ def cmd_status(args) -> int:
 
 
 def cmd_positions(args) -> int:
-    _, repo, _, _ = _bootstrap(args, need_feed=False)
+    cfg, repo, _, _ = _bootstrap(args, need_feed=False)
+    print(f"# exchange: {cfg.exchange_label()} (from {cfg.exchange_source})")
     positions = repo.get_positions()
     if not positions:
         print("No open positions.")

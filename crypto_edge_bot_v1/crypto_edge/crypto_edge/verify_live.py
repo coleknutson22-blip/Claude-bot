@@ -87,9 +87,16 @@ class VerifyReport:
 # ---------------------------------------------------------------- exchange
 def verify_exchange(cfg: Config, feed, rep: VerifyReport) -> dict:
     """Markets, metadata, candles, unclosed-candle discard, clock."""
-    print(f"\n[1] EXCHANGE ADAPTER -- {cfg.exchange.name} ({cfg.exchange.quote})")
+    print(f"\n[1] EXCHANGE ADAPTER -- {cfg.exchange_label()} "
+          f"(from {cfg.exchange_source})")
+    feed_name = getattr(feed, "name", "")
+    if feed_name and feed_name != "fixture":
+        rep.add("feed matches configured exchange",
+                feed_name == cfg.exchange.name,
+                f"feed is '{feed_name}', config says '{cfg.exchange.name}'"
+                if feed_name != cfg.exchange.name else f"both are '{feed_name}'")
     out: dict = {}
-    rep.facts["exchange"] = f"{cfg.exchange.name} / {cfg.exchange.quote}"
+    rep.facts["exchange"] = f"{cfg.exchange_label()} (from {cfg.exchange_source})"
 
     try:
         markets = feed.load_markets()
@@ -409,7 +416,7 @@ def verify_telegram(cfg: Config, repo, notifier, rep: VerifyReport) -> None:
 
     from .notify import formatters as fmt
     started = notifier.send(
-        fmt.bot_start(mode=cfg.safety.mode, exchange=cfg.exchange.name,
+        fmt.bot_start(mode=cfg.safety.mode, exchange=cfg.exchange_label(),
                       equity=cfg.execution.starting_equity,
                       cash=cfg.execution.starting_equity, open_positions=0,
                       strategy=cfg.strategy.name, version=cfg.strategy.version,
