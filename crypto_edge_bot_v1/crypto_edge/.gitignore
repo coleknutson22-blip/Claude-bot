@@ -4,9 +4,13 @@
 .env.*
 !.env.example
 
-# Runtime state
-data/
-logs/
+# Runtime state.
+# LEADING SLASH IS LOAD-BEARING: an unanchored "data/" matches a directory
+# named data at ANY depth, which silently swallowed the crypto_edge/data/
+# Python package and shipped a branch whose own tests could not import.
+# These rules must only ever match the runtime folders at the project root.
+/data/
+/logs/
 *.db
 *.db-wal
 *.db-shm
