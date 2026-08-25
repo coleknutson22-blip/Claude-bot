@@ -229,6 +229,13 @@ python -m crypto_edge.cli verify-live --cycle
 python -m crypto_edge.cli verify-restart
 ```
 
+Switching venue never requires editing a file — pass `--exchange` (or set
+`CRYPTO_EDGE_EXCHANGE`):
+
+```bash
+python -m crypto_edge.cli --exchange kraken verify-live --cycle
+```
+
 `verify-live` opens no positions and contains no order code. It reports the
 exchange's precision/tick metadata, both candle timeframes, whether unfinished
 candles were discarded, quote spreads, **measured quote-age statistics**, the
@@ -240,7 +247,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 403 automated tests, all passing
+### VERIFIED OFFLINE — 423 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -318,7 +325,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               403 tests
+tests/               423 tests
 ```
 
 ## Safety notes

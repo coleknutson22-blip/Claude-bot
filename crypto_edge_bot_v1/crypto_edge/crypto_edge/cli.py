@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import signal
 import sys
 from pathlib import Path
@@ -366,6 +367,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default="config/config.toml")
     p.add_argument("--env", default=".env")
     p.add_argument("--log-level", default="INFO")
+    p.add_argument("--exchange", default=None,
+                   help="override the exchange for this run (e.g. kraken, "
+                        "coinbase, kucoin, okx) without editing any file")
+    p.add_argument("--quote", default=None,
+                   help="override the quote currency (e.g. USD instead of USDT)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("selfcheck", help="run startup checks and exit")
@@ -416,8 +422,30 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _force_utf8_output() -> None:
+    """Make stdout/stderr survive non-ASCII on Windows.
+
+    Python uses the Unicode console API when writing to a real terminal, but
+    falls back to the system code page (cp1252) the moment output is redirected
+    to a file or piped. A single emoji in a status line then raises
+    UnicodeEncodeError and takes the process down -- which would happen to
+    anyone capturing output to send to support. Reconfiguring with a
+    replacement error handler makes that impossible.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass          # very old Python or an unusual stream; not fatal
+
+
 def main(argv=None) -> int:
+    _force_utf8_output()
     args = build_parser().parse_args(argv)
+    if getattr(args, "exchange", None):
+        os.environ["CRYPTO_EDGE_EXCHANGE"] = args.exchange
+    if getattr(args, "quote", None):
+        os.environ["CRYPTO_EDGE_QUOTE"] = args.quote
     return args.func(args)
 
 

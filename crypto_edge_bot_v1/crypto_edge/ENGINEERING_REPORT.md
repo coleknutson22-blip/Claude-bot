@@ -98,7 +98,7 @@ message text (defect 2 above), not a wrong severity.
 
 ## TEST RESULTS
 
-**403 tests, all passing.** Run: `python -m crypto_edge.cli test`
+**423 tests, all passing.** Run: `python -m crypto_edge.cli test`
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -118,6 +118,7 @@ message text (defect 2 above), not a wrong severity.
 | `test_live_adapter.py` | 45 | CCXT precision modes and tick rounding, quote-timestamp provenance, OHLCV parsing |
 | `test_symbol_collisions.py` | 26 | Ticker collisions, identity-based resolution, overrides, cached ambiguity |
 | `test_verify_live.py` | 26 | The live-verification harness itself, including credential masking |
+| `test_windows_operability.py` | 20 | UTF-8 BOM in `.env`, redirected output encoding, exchange override |
 
 The tests worth singling out, because they are the ones that would catch a real
 loss of money:
@@ -294,7 +295,7 @@ live but query tables no production code writes to. **A news event cannot
 currently stop a trade, and no funding or open-interest data is being
 recorded.** See the status table in the README.
 
-**7. Synthetic test data is a limited proxy.** 403 passing tests prove the
+**7. Synthetic test data is a limited proxy.** 423 passing tests prove the
 system is internally consistent and behaves correctly against data I generated.
 They cannot prove it behaves correctly against data reality generates.
 
@@ -332,6 +333,31 @@ cut-off is still visible), an ambiguous ticker is refused rather than guessed,
 and `universe.broad_symbol_overrides` pins one deterministically. The ambiguity
 map is cached with the ranking, so an outage fallback is as careful as a live
 fetch.
+
+---
+
+## OPERABILITY PASS (Windows)
+
+Three issues that would have bitten a non-developer following the setup steps:
+
+**A. A Notepad-saved `.env` silently disabled Telegram.** Windows Notepad
+writes a UTF-8 byte order mark. Read as plain UTF-8 the BOM becomes a `\ufeff`
+character glued to the first key, so `TELEGRAM_BOT_TOKEN` was stored as
+`\ufeffTELEGRAM_BOT_TOKEN`, never found, and the bot ran with notifications
+quietly off — no error anywhere. Reproduced, then fixed by reading `.env` and
+`config.toml` as `utf-8-sig`.
+
+**B. Non-ASCII output crashed when redirected.** Python writes to a Windows
+console through the Unicode API but falls back to the system code page when
+output is piped or redirected — so a single emoji in a status line raised
+`UnicodeEncodeError` exactly when someone was capturing output to send to
+support. The CLI entrypoint now reconfigures stdout/stderr to UTF-8 with a
+replacement error handler.
+
+**C. Changing exchange required editing TOML.** Venue switching is the most
+common operational change (geo-blocks, outages), and a mistyped TOML line is a
+worse failure than a wrong venue. Added `--exchange` / `--quote` flags and the
+`CRYPTO_EDGE_EXCHANGE` / `CRYPTO_EDGE_QUOTE` environment overrides.
 
 ---
 

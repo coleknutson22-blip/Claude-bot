@@ -13,18 +13,28 @@ class ConfigError(Exception):
     pass
 
 
+# utf-8-sig, not utf-8: Windows Notepad writes a UTF-8 BYTE ORDER MARK at the
+# start of the file. Read as plain utf-8 that BOM becomes a \ufeff character
+# glued to the first key, so TELEGRAM_BOT_TOKEN silently becomes
+# "\ufeffTELEGRAM_BOT_TOKEN", is never found, and Telegram quietly disables
+# itself with no error anywhere. utf-8-sig strips it and is a no-op otherwise.
+TEXT_ENCODING = "utf-8-sig"
+
+
 def load_dotenv(path: str | Path = ".env") -> None:
     """Minimal .env loader so we take no third-party dependency for secrets.
     Existing environment variables always win."""
     p = Path(path)
     if not p.exists():
         return
-    for raw in p.read_text().splitlines():
-        line = raw.strip()
+    for raw in p.read_text(encoding=TEXT_ENCODING).splitlines():
+        line = raw.strip().lstrip("\ufeff")
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
         key, val = key.strip(), val.strip().strip('"').strip("'")
+        if not key:
+            continue
         os.environ.setdefault(key, val)
 
 
@@ -306,11 +316,21 @@ def load_config(path: str | Path = "config/config.toml",
     cfg = Config()
     p = Path(path)
     if p.exists():
-        raw = tomllib.loads(p.read_text())
+        raw = tomllib.loads(p.read_text(encoding=TEXT_ENCODING))
         for name, data in raw.items():
             if not hasattr(cfg, name):
                 raise ConfigError(f"unknown config section: [{name}]")
             _apply(getattr(cfg, name), data)
+    # Operational overrides. Switching venue is the single most common thing an
+    # operator needs to do (geo-blocks, outages), so it must not require editing
+    # a config file -- a mistyped TOML line is a worse failure than a wrong venue.
+    exchange = os.environ.get("CRYPTO_EDGE_EXCHANGE", "").strip()
+    if exchange:
+        cfg.exchange.name = exchange
+    quote_ccy = os.environ.get("CRYPTO_EDGE_QUOTE", "").strip()
+    if quote_ccy:
+        cfg.exchange.quote = quote_ccy
+
     cfg.telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     cfg.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if os.environ.get("TELEGRAM_ENABLED", "").lower() in ("0", "false", "no"):
