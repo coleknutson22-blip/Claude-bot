@@ -98,7 +98,7 @@ message text (defect 2 above), not a wrong severity.
 
 ## TEST RESULTS
 
-**456 tests, all passing.** Run: `python -m crypto_edge.cli test`
+**481 tests, all passing.** Run: `python -m crypto_edge.cli test`
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -121,6 +121,7 @@ message text (defect 2 above), not a wrong severity.
 | `test_windows_operability.py` | 20 | UTF-8 BOM in `.env`, redirected output encoding, exchange override |
 | `test_repository_integrity.py` | 8 | Every module is committed and importable; no source file is gitignored |
 | `test_exchange_consistency.py` | 25 | One effective venue across config, feed, selfcheck, status, report and Telegram |
+| `test_history_acquisition.py` | 25 | Paged OHLCV depth, venue caps, truncation vs young market, unsatisfiable-config validation |
 
 The tests worth singling out, because they are the ones that would catch a real
 loss of money:
@@ -297,7 +298,7 @@ live but query tables no production code writes to. **A news event cannot
 currently stop a trade, and no funding or open-interest data is being
 recorded.** See the status table in the README.
 
-**7. Synthetic test data is a limited proxy.** 456 passing tests prove the
+**7. Synthetic test data is a limited proxy.** 481 passing tests prove the
 system is internally consistent and behaves correctly against data I generated.
 They cannot prove it behaves correctly against data reality generates.
 

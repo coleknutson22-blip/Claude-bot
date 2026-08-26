@@ -68,6 +68,7 @@ python -m crypto_edge.cli test         # the automated suite
 | `python -m crypto_edge.cli test` | Run the automated test suite. |
 | `python -m crypto_edge.cli verify-live --cycle` | Verify exchange, universe and Telegram against the real network. |
 | `python -m crypto_edge.cli verify-restart` | Prove persisted state survives a restart. |
+| `python -m crypto_edge.cli diagnose` | Explain, per venue market, why it is or is not in the tradable universe. |
 
 Background operation:
 
@@ -247,7 +248,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 456 automated tests, all passing
+### VERIFIED OFFLINE — 481 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -325,7 +326,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               456 tests
+tests/               481 tests
 ```
 
 ## Safety notes

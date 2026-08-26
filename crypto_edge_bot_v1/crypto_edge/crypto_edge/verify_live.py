@@ -27,6 +27,7 @@ from .models import TS_LOCAL, TS_VENUE
 from .timeutils import candle_close_ms, iso, now_ms, tf_ms
 
 CRITICAL, INFO = "CRITICAL", "INFO"
+NEWLINE = chr(10)
 
 
 def _mask(secret: str) -> str:
@@ -476,6 +477,184 @@ def verify_pending_first(notifier, repo, rep: VerifyReport) -> None:
             recovered >= 1 and row and row["status"] == "SENT",
             f"flush delivered {recovered}, status={row['status'] if row else '-'}")
     notifier.outbox_lease_ms = lease
+
+
+# ------------------------------------------------------------- diagnostics
+def diagnose_universe(cfg: Config, repo, broad_service, feed,
+                      limit: int | None = None) -> dict:
+    """Account for EVERY venue market: where it was dropped, and why.
+
+    Written because "the engine is only evaluating two symbols" is not a
+    debuggable statement. Every market the venue lists is followed through the
+    whole pipeline and lands in exactly one bucket, and the buckets sum to the
+    total -- so nothing can go missing without showing up here.
+
+    Stage 2 costs one OHLCV fetch per surviving symbol, so it is opt-in via
+    `limit` when the survivor list is long.
+    """
+    from .data.universe import UniverseBuilder
+
+    print("=" * 72)
+    print(f"UNIVERSE DIAGNOSTIC -- {cfg.exchange_label()}")
+    print("=" * 72)
+
+    markets = feed.load_markets()
+    tickers = feed.fetch_tickers()
+    broad = broad_service.get()
+    if broad is None:
+        print("NO BROAD UNIVERSE -- entries are suspended; nothing to diagnose.")
+        return {"error": "no broad universe"}
+
+    print(f"venue markets ({cfg.exchange.quote} spot) : {len(markets)}")
+    print(f"broad universe assets                     : {len(broad)} "
+          f"({broad.source}, scanned {broad.scanned})")
+
+    # ---- stage 0: intersection -------------------------------------------
+    intersect, not_in_broad, ambiguous = [], [], []
+    for sym, meta in markets.items():
+        res = broad.resolve(meta.base)
+        if res.ok:
+            intersect.append(sym)
+        elif "claimed by" in res.reason:
+            ambiguous.append((sym, res.reason))
+        else:
+            not_in_broad.append(sym)
+    print(f"intersecting the broad universe           : {len(intersect)}")
+
+    # ---- stage 1: static / liquidity / spread ----------------------------
+    keep, audit = UniverseBuilder(cfg.universe).build_candidates(
+        markets, tickers, broad)
+    stage1_reasons: dict[str, list] = {}
+    for row in audit:
+        if row["included"]:
+            continue
+        reason = _bucket(row["reject_reason"])
+        stage1_reasons.setdefault(reason, []).append(row["symbol"])
+
+    tradable = keep[:cfg.universe.max_tradable]
+    over_cap = keep[cfg.universe.max_tradable:]
+
+    print(f"surviving stage 1 (static/liquidity/spread): {len(keep)}")
+    print(f"entering the pipeline (max_tradable={cfg.universe.max_tradable:<3})   : "
+          f"{len(tradable)}")
+
+    print(NEWLINE + "--- STAGE 1 REJECTIONS BY REASON " + "-" * 38)
+    for reason, syms in sorted(stage1_reasons.items(), key=lambda kv: -len(kv[1])):
+        print(f"  {len(syms):5}  {reason}")
+        print(f"         e.g. {', '.join(sorted(syms)[:6])}")
+
+    # ---- stage 2: history / age / volatility -----------------------------
+    probe = tradable if limit is None else tradable[:limit]
+    print(NEWLINE + f"--- STAGE 2 (per-symbol history fetch) on {len(probe)} "
+          f"symbol(s) " + "-" * 12)
+    print("    this is where a venue history cap shows up" + NEWLINE)
+
+    builder = UniverseBuilder(cfg.universe)
+    stage2_reasons: dict[str, list] = {}
+    survivors, bar_counts = [], []
+    want_1h = cfg.required_history_bars(cfg.strategy.entry_timeframe)
+    want_htf = cfg.required_history_bars(cfg.strategy.regime_timeframe)
+    print(f"    requesting {want_1h} x {cfg.strategy.entry_timeframe} and "
+          f"{want_htf} x {cfg.strategy.regime_timeframe} per symbol")
+
+    for sym in probe:
+        try:
+            raw = feed.fetch_ohlcv(sym, cfg.strategy.entry_timeframe, want_1h)
+        except DataUnavailable as e:
+            stage2_reasons.setdefault("1h fetch failed", []).append(sym)
+            print(f"    {sym:16} FETCH FAILED  {str(e)[:60]}")
+            continue
+        series = raw.drop_unclosed(now_ms(), cfg.safety.candle_close_buffer_s * 1000)
+        bars = len(series)
+        bar_counts.append((sym, bars))
+        span_d = ((int(series.open_ms[-1]) - int(series.open_ms[0])) / 86_400_000
+                  if bars > 1 else 0.0)
+
+        try:
+            htf = feed.fetch_ohlcv(sym, cfg.strategy.regime_timeframe, want_htf)
+            htf_bars = len(htf.drop_unclosed(
+                now_ms(), cfg.safety.candle_close_buffer_s * 1000))
+        except DataUnavailable:
+            htf_bars = 0
+
+        atr_pct = _atr_pct(series, cfg.strategy.atr_period)
+        reason = builder.filter_by_history(sym, series, atr_pct,
+                                           requested_bars=want_1h)
+        if not reason and htf_bars < cfg.strategy.regime_ema + 2:
+            reason = (f"insufficient {cfg.strategy.regime_timeframe} history "
+                      f"({htf_bars} bars)")
+        print(f"    {sym:16} 1h={bars:<5} {cfg.strategy.regime_timeframe}={htf_bars:<5} "
+              f"span={span_d:6.1f}d atr={atr_pct if atr_pct is None else round(atr_pct, 2)}"
+              f"  {reason or 'ELIGIBLE'}")
+        if reason:
+            stage2_reasons.setdefault(_bucket(reason), []).append(sym)
+        else:
+            survivors.append(sym)
+
+    # ---- the accounting ---------------------------------------------------
+    print(NEWLINE + "=" * 72)
+    print("DIAGNOSTIC SUMMARY -- every venue market accounted for")
+    print("=" * 72)
+    print(f"  {len(markets):5}  venue {cfg.exchange.quote} spot markets")
+    print(f"  {len(not_in_broad):5}  not in the broad top-N asset universe")
+    print(f"  {len(ambiguous):5}  ambiguous ticker (claimed by >1 asset)")
+    for reason, syms in sorted(stage1_reasons.items(), key=lambda kv: -len(kv[1])):
+        if "broad top-N" in reason or "claimed by" in reason:
+            continue
+        print(f"  {len(syms):5}  stage 1: {reason}")
+    print(f"  {len(over_cap):5}  beyond max_tradable cap")
+    for reason, syms in sorted(stage2_reasons.items(), key=lambda kv: -len(kv[1])):
+        print(f"  {len(syms):5}  stage 2: {reason}")
+    print(f"  {len(survivors):5}  ELIGIBLE FOR SIGNAL EVALUATION")
+    if survivors:
+        print(f"         {', '.join(survivors)}")
+
+    if bar_counts:
+        counts = [b for _, b in bar_counts]
+        short = [(s, b) for s, b in bar_counts if b < want_1h]
+        print(NEWLINE + f"  1h bars returned: min={min(counts)} max={max(counts)} "
+              f"requested={want_1h}")
+        if short:
+            print(f"  {len(short)}/{len(bar_counts)} symbols got FEWER bars than "
+                  f"requested -- the venue is capping history.")
+            print(f"  Worst: {sorted(short, key=lambda x: x[1])[:5]}")
+        else:
+            print("  every symbol supplied the full requested history")
+    print("=" * 72)
+
+    return {"markets": len(markets), "intersecting": len(intersect),
+            "stage1_kept": len(keep), "tradable": len(tradable),
+            "eligible": len(survivors), "stage1_reasons": stage1_reasons,
+            "stage2_reasons": stage2_reasons, "bar_counts": bar_counts,
+            "requested_1h": want_1h}
+
+
+def _bucket(reason: str) -> str:
+    """Collapse a reason to its family so counts are meaningful."""
+    r = (reason or "").strip()
+    for prefix in ("venue supplied only", "history truncated by venue",
+                   "market too new", "only ", "24h volume", "spread ",
+                   "too quiet", "too volatile", "not in the broad",
+                   "outside top", "candle data failed", "no candle data",
+                   "insufficient "):
+        if r.startswith(prefix):
+            return prefix.strip() if prefix.strip() != "only" else "insufficient 1h history"
+    if "claimed by" in r:
+        return "ambiguous ticker"
+    return r.split("(")[0].split("$")[0].strip()[:56] or "unknown"
+
+
+def _atr_pct(series, period: int):
+    import numpy as np
+
+    from .indicators import atr, last_valid
+    if len(series) <= period + 2:
+        return None
+    a = last_valid(atr(series.high, series.low, series.close, period))
+    px = float(series.close[-1])
+    if not np.isfinite(a) or px <= 0:
+        return None
+    return a / px * 100.0
 
 
 # ------------------------------------------------------------------ cycle

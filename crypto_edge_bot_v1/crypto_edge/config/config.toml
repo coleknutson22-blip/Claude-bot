@@ -11,7 +11,18 @@
 name = "binance"          # any ccxt-supported venue; public endpoints only
 quote = "USDT"
 rate_limit_ms = 250
-ohlcv_limit = 300         # candles fetched per request
+# Candles per REQUEST -- a paging hint, not the total history fetched. Venues
+# cap responses and some ignore this entirely (Kraken's OHLC endpoint disregards
+# it and returns at most 720). The feed pages with `since` until it holds the
+# depth the universe filters require, which is DERIVED from those filters:
+#   max(min_candles_1h, warmup_bars, min_market_age_days in bars)
+# At the shipped settings that is 1085 x 1h bars. Fetching less would not make
+# the filters stricter -- it would make them unsatisfiable, rejecting every
+# symbol for history it was never given the chance to supply.
+ohlcv_limit = 300
+max_history_bars = 2000   # safety ceiling on paging; startup FAILS if this is
+                          # below what the filters need, rather than silently
+                          # rejecting everything
 
 [universe]
 # "Top 200" means the top ~200 legitimate crypto ASSETS by market capitalisation

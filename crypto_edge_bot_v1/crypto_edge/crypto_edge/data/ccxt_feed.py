@@ -34,7 +34,7 @@ import time
 
 from ..logging_setup import log_event
 from ..models import TS_LOCAL, TS_VENUE, MarketMeta, Quote, Series
-from ..timeutils import now_ms
+from ..timeutils import now_ms, tf_ms
 from .feed import DataUnavailable
 
 # CCXT precision-mode constants, restated so this module can interpret market
@@ -92,7 +92,8 @@ def _precision_fields(raw, mode: int) -> tuple[int, float]:
 class CCXTFeed:
     def __init__(self, exchange: str = "binance", quote: str = "USDT",
                  rate_limit_ms: int = 250, timeout_s: int = 20,
-                 quote_ts_fallback: str = "local") -> None:
+                 quote_ts_fallback: str = "local",
+                 page_limit: int = 300) -> None:
         """`quote_ts_fallback` controls what happens when a venue ticker has no
         timestamp: "local" stamps it with receive time and flags it as such,
         "reject" discards the quote entirely (fails closed for entries)."""
@@ -107,6 +108,8 @@ class CCXTFeed:
         self.quote = quote
         self.rate_limit_ms = rate_limit_ms
         self.quote_ts_fallback = quote_ts_fallback
+        # Bars per REQUEST (a paging hint), not the total history we want.
+        self.page_limit = page_limit
         # No apiKey / secret. Public data only. This is deliberate.
         self.client = getattr(ccxt, exchange)({
             "enableRateLimit": True,
@@ -166,10 +169,17 @@ class CCXTFeed:
             raise DataUnavailable(f"fetch_tickers failed: {e}") from e
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> Series:
-        try:
-            rows = self.client.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        except Exception as e:
-            raise DataUnavailable(f"fetch_ohlcv {symbol} {timeframe} failed: {e}") from e
+        """Return up to `limit` candles, PAGING if the venue caps a request.
+
+        Venues do not agree on how much history one request may return, and some
+        ignore `limit` entirely: Kraken's OHLC endpoint disregards it and caps
+        every response at 720 candles. Treating one response as "all the history
+        there is" makes a decade-old market look days old, which the universe
+        filters then read as a quality signal rather than the fetch limitation
+        it actually is. So we page backwards with `since` until we have what was
+        asked for or the venue genuinely runs out.
+        """
+        rows = self._fetch_ohlcv_paged(symbol, timeframe, limit)
         if not rows:
             raise DataUnavailable(f"empty OHLCV for {symbol} {timeframe}")
         clean = [r for r in rows
@@ -186,6 +196,56 @@ class CCXTFeed:
         except (TypeError, ValueError) as e:
             raise DataUnavailable(
                 f"unparseable OHLCV for {symbol} {timeframe}: {e}") from e
+
+    def _fetch_ohlcv_paged(self, symbol: str, timeframe: str, want: int) -> list:
+        """Accumulate `want` candles, oldest-first, across as many requests as
+        the venue needs. Returns whatever it managed to get."""
+        step = tf_ms(timeframe)
+        want = max(1, int(want))
+        page = max(1, int(self.page_limit))
+        # Reach back a little further than needed: venues round `since` to their
+        # own bar boundaries and some drop the first partial bar.
+        since = now_ms() - (want + 2) * step
+        by_open: dict[int, list] = {}
+        pages = 0
+        max_pages = max(1, math.ceil(want / page) + 3)
+
+        while pages < max_pages:
+            pages += 1
+            try:
+                batch = self.client.fetch_ohlcv(symbol, timeframe=timeframe,
+                                                since=since, limit=page)
+            except Exception as e:
+                if by_open:
+                    log_event("data", "WARNING",
+                              "OHLCV pagination stopped early", symbol=symbol,
+                              timeframe=timeframe, have=len(by_open), error=str(e))
+                    break
+                raise DataUnavailable(
+                    f"fetch_ohlcv {symbol} {timeframe} failed: {e}") from e
+            if not batch:
+                break
+
+            before = len(by_open)
+            for row in batch:
+                if row and len(row) >= 6 and row[0] is not None:
+                    by_open[int(row[0])] = row
+            # No NEW bars means the venue has nothing further; stop rather than
+            # spin. This is the guard that makes the loop always terminate.
+            if len(by_open) == before:
+                break
+            newest = max(by_open)
+            if len(by_open) >= want or newest + step >= now_ms():
+                break
+            since = newest + step
+            self._sleep()
+
+        ordered = [by_open[k] for k in sorted(by_open)]
+        if len(ordered) < want:
+            log_event("data", "DEBUG", "venue supplied less history than requested",
+                      symbol=symbol, timeframe=timeframe,
+                      wanted=want, got=len(ordered), pages=pages)
+        return ordered[-want:]
 
     def fetch_quote(self, symbol: str) -> Quote | None:
         try:

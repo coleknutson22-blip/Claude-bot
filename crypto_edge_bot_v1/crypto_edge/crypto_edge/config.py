@@ -2,6 +2,7 @@
 ever read from the TOML file, and no credential is ever hard-coded."""
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import dataclass, field, asdict
@@ -45,7 +46,12 @@ class ExchangeCfg:
     # Public market-data endpoints only. No API key is required for paper mode
     # and none is read here -- see safety.live_trading_enabled.
     rate_limit_ms: int = 250
+    # Bars per REQUEST -- a paging hint, not the total history we want. Venues
+    # cap responses (Kraken at 720, and it ignores this value entirely), so the
+    # feed pages until it has the depth the universe filters require. See
+    # Config.required_history_bars().
     ohlcv_limit: int = 300
+    max_history_bars: int = 2000        # hard ceiling on paging per symbol
 
 
 @dataclass
@@ -284,6 +290,16 @@ class Config:
                         "(set one, or explicitly disable the requirement)")
         if self.execution.taker_fee_bps < 0 or self.execution.slippage_bps < 0:
             errs.append("fees and slippage must be non-negative")
+        needed = self.required_history_bars()
+        if self.exchange.max_history_bars < needed:
+            errs.append(
+                f"exchange.max_history_bars ({self.exchange.max_history_bars}) is "
+                f"below the {needed} bars the universe filters require "
+                f"(min_candles_1h={self.universe.min_candles_1h}, "
+                f"min_market_age_days={self.universe.min_market_age_days}); every "
+                f"symbol would be rejected for history it was never fetched")
+        if self.exchange.ohlcv_limit < 1:
+            errs.append("exchange.ohlcv_limit must be >= 1")
         if self.execution.max_quote_age_s <= 0:
             errs.append("execution.max_quote_age_s must be > 0")
         if self.execution.quote_ts_fallback not in ("local", "reject"):
@@ -295,6 +311,32 @@ class Config:
         if self.telegram.enabled and not (self.telegram_token and self.telegram_chat_id):
             errs.append("telegram enabled but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are unset")
         return errs
+
+    def required_history_bars(self, timeframe: str | None = None) -> int:
+        """How many bars must be fetched for a symbol to be ABLE to pass stage 2.
+
+        Requesting fewer than this does not make the filters stricter -- it makes
+        them unsatisfiable, because a symbol is then rejected for history it was
+        never given the chance to supply. Derived from the filters themselves so
+        the two cannot drift apart:
+
+          * min_candles_1h      -- a bar count, directly
+          * min_market_age_days -- a SPAN, converted to bars at this timeframe
+          * warmup_bars         -- indicator warm-up
+        """
+        from .timeutils import tf_ms
+        tf = timeframe or self.strategy.entry_timeframe
+        step_ms = tf_ms(tf)
+        age_bars = 0
+        if step_ms > 0:
+            age_bars = math.ceil(self.universe.min_market_age_days * 86_400_000 / step_ms)
+        # Deliberately NOT clamped to max_history_bars. Clamping would silently
+        # hand back a depth that cannot satisfy the filters -- reintroducing the
+        # exact failure this method exists to prevent, just one layer down.
+        # The ceiling is enforced as a VALIDATION error instead, so an
+        # impossible budget refuses to start rather than rejecting every symbol.
+        return max(self.universe.min_candles_1h, self.strategy.warmup_bars,
+                   age_bars) + 5            # small margin for venue rounding
 
     def exchange_label(self) -> str:
         """The single string every surface should show for "which venue"."""

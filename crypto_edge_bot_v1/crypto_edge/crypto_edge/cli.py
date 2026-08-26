@@ -11,6 +11,7 @@
     python -m crypto_edge.cli test
     python -m crypto_edge.cli verify-live --cycle
     python -m crypto_edge.cli verify-restart
+    python -m crypto_edge.cli diagnose
 """
 from __future__ import annotations
 
@@ -50,7 +51,8 @@ def _bootstrap(args, need_feed: bool = True):
         from .data.ccxt_feed import CCXTFeed
         feed = CCXTFeed(cfg.exchange.name, cfg.exchange.quote,
                         cfg.exchange.rate_limit_ms,
-                        quote_ts_fallback=cfg.execution.quote_ts_fallback)
+                        quote_ts_fallback=cfg.execution.quote_ts_fallback,
+                        page_limit=cfg.exchange.ohlcv_limit)
     return cfg, repo, feed, notifier
 
 
@@ -307,6 +309,16 @@ def cmd_verify_live(args) -> int:
     return 0 if rep.passed else 1
 
 
+def cmd_diagnose(args) -> int:
+    """Account for every venue market: where it was dropped and why."""
+    from .verify_live import diagnose_universe
+
+    cfg, repo, feed, _ = _bootstrap(args, need_feed=True)
+    diagnose_universe(cfg, repo, _broad_service(cfg, repo), feed,
+                      limit=args.limit)
+    return 0
+
+
 def cmd_verify_restart(args) -> int:
     """Prove that stopping and restarting loses nothing.
 
@@ -434,6 +446,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--skip-telegram", action="store_true")
     s.add_argument("--skip-universe", action="store_true")
     s.set_defaults(func=cmd_verify_live)
+
+    s = sub.add_parser("diagnose",
+                       help="explain, per venue market, why it is or is not "
+                            "in the tradable universe")
+    s.add_argument("--limit", type=int, default=None,
+                   help="probe at most N surviving symbols in stage 2 "
+                        "(each costs one history fetch)")
+    s.set_defaults(func=cmd_diagnose)
 
     sub.add_parser("verify-restart",
                    help="prove persisted state survives a restart"

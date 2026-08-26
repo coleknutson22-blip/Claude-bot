@@ -116,6 +116,9 @@ class TradingEngine:
         self._series_1h: dict[str, Series] = {}
         self._series_htf: dict[str, Series] = {}
         self._tickers: dict[str, dict] = {}
+        # bars asked of the venue per (symbol, timeframe); lets stage 2 separate
+        # "the venue has no more history" from "this market is genuinely new"
+        self._requested_bars: dict[tuple[str, str], int] = {}
         self._running = False
         repo.record_strategy_version(self.strategy.name, self.strategy.version,
                                      cfg.strategy_fingerprint())
@@ -245,8 +248,12 @@ class TradingEngine:
         for sym in needed:
             for tf, store in ((c.strategy.entry_timeframe, self._series_1h),
                               (c.strategy.regime_timeframe, self._series_htf)):
+                # Ask for the history the universe filters actually require, not
+                # a fixed page size. Fetching less does not make the filters
+                # stricter, it makes them unsatisfiable.
+                want = c.required_history_bars(tf)
                 try:
-                    s = self.feed.fetch_ohlcv(sym, tf, c.exchange.ohlcv_limit)
+                    s = self.feed.fetch_ohlcv(sym, tf, want)
                 except DataUnavailable as e:
                     self.status.data_errors += 1
                     log_event("data", "WARNING", "ohlcv fetch failed",
@@ -258,6 +265,7 @@ class TradingEngine:
                     store.pop(sym, None)
                     continue
                 store[sym] = closed
+                self._requested_bars[(sym, tf)] = want
                 ok += 1
         if ok:
             self.status.last_data_ms = now
@@ -439,7 +447,10 @@ class TradingEngine:
             a = last_valid(atr(s.high, s.low, s.close, c.strategy.atr_period))
             px = float(s.close[-1])
             atr_pct = (a / px * 100.0) if (np.isfinite(a) and px > 0) else None
-            hist_reject = self.universe_builder.filter_by_history(sym, s, atr_pct)
+            hist_reject = self.universe_builder.filter_by_history(
+                sym, s, atr_pct,
+                requested_bars=self._requested_bars.get(
+                    (sym, c.strategy.entry_timeframe)))
 
             sig = self.strategy.evaluate(s, htf, ctx, meta_extra)
             self.status.signals_evaluated += 1

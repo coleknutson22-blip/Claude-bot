@@ -154,13 +154,17 @@ class TestQuoteTimestampResolution(unittest.TestCase):
 class _Bare(CCXTFeed):
     """A CCXTFeed with no ccxt client, for testing pure parsing paths."""
 
-    def __init__(self, client, mode=TICK_SIZE, fallback="local"):
+    def __init__(self, client, mode=TICK_SIZE, fallback="local", page_limit=300):
         self.name, self.quote, self.rate_limit_ms = "test", "USDT", 0
         self.client = client
         self.precision_mode = mode
         self.quote_ts_fallback = fallback
+        self.page_limit = page_limit
         self._markets = {}
         self.quote_ts_venue = self.quote_ts_local = 0
+
+    def _sleep(self):
+        pass
 
 
 class FakeClient:
@@ -178,8 +182,11 @@ class FakeClient:
     def fetch_ticker(self, symbol):
         return dict(self._ticker)
 
-    def fetch_ohlcv(self, symbol, timeframe, limit):
-        return list(self._ohlcv)
+    def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
+        rows = list(self._ohlcv)
+        if since is not None:
+            rows = [r for r in rows if r and r[0] is not None and r[0] >= since]
+        return rows[:limit] if limit else rows
 
 
 def spot_market(symbol="BTC/USDT", amount=0.00001, price=0.01, active=True):

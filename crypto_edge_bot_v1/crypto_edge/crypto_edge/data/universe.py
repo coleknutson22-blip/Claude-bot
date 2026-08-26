@@ -172,18 +172,39 @@ class UniverseBuilder:
         return keep, audit
 
     def filter_by_history(self, symbol: str, series: Series | None,
-                          atr_pct: float | None = None) -> str:
-        """Stage 2: needs candles. Applied after OHLCV is fetched."""
+                          atr_pct: float | None = None, *,
+                          requested_bars: int | None = None) -> str:
+        """Stage 2: needs candles. Applied after OHLCV is fetched.
+
+        `requested_bars` is how many bars were asked of the venue. It is what
+        separates "this market is genuinely young" from "this venue would not
+        give us more history", which look identical in the data and are very
+        different facts. Both still block an entry -- we fail closed either way
+        -- but they must not be reported as the same thing, because one is a
+        property of the asset and the other is a property of our data feed.
+        """
         c = self.cfg
         if series is None or len(series) == 0:
             return "no candle data"
+        truncated = (requested_bars is not None and len(series) < requested_bars)
         if len(series) < c.min_candles_1h:
+            if truncated:
+                return (f"venue supplied only {len(series)} of {requested_bars} "
+                        f"requested bars (need {c.min_candles_1h})")
             return f"only {len(series)} 1h candles (< {c.min_candles_1h})"
         if not series.is_sane():
             return "candle data failed sanity check"
         age_ms = int(series.open_ms[-1] - series.open_ms[0])
         min_age_ms = c.min_market_age_days * 86_400_000
         if age_ms < min_age_ms:
+            if truncated:
+                # We did not receive enough history to demonstrate the market's
+                # age. Saying "too new" here would blame the asset for a limit
+                # of our own fetch -- the mistake that made every Kraken market
+                # look days old regardless of how long it had existed.
+                return (f"history truncated by venue: {len(series)} of "
+                        f"{requested_bars} bars spans {age_ms / 86_400_000:.0f}d, "
+                        f"cannot verify {c.min_market_age_days}d age")
             return f"market too new ({age_ms / 86_400_000:.0f}d < {c.min_market_age_days}d)"
         if atr_pct is not None and np.isfinite(atr_pct):
             if atr_pct < c.min_atr_pct:
