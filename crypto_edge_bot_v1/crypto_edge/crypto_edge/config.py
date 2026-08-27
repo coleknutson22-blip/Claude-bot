@@ -2,12 +2,13 @@
 ever read from the TOML file, and no credential is ever hard-coded."""
 from __future__ import annotations
 
-import math
 import os
 import tomllib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
+
+from .timeutils import tf_ms
 
 
 class ConfigError(Exception):
@@ -96,6 +97,13 @@ class UniverseCfg:
     # e.g. {"GRT" = "the-graph"}. Consulted before anything else, so it also
     # rescues a ticker that would otherwise be refused as ambiguous.
     broad_symbol_overrides: dict = field(default_factory=dict)
+    # --- market age, established independently of indicator history -------
+    # A venue's OHLCV cap is PER TIMEFRAME: Kraken's 720-bar limit is 30 days at
+    # 1h but 720 days at 1d. Age therefore asks at a coarse resolution, where
+    # reach matters, while the indicators keep asking at 1h, where density does.
+    age_probe_timeframe: str = "1d"
+    age_probe_bars: int = 400          # 400 daily bars ~= 400 days of reach
+    age_cache_hours: int = 24          # age changes slowly; re-probe rarely
     # With no live and no usable cached broad universe, NEW ENTRIES stop.
     # Open positions are managed regardless -- see TradingEngine.fetch_data.
     require_broad_universe: bool = True
@@ -290,6 +298,15 @@ class Config:
                         "(set one, or explicitly disable the requirement)")
         if self.execution.taker_fee_bps < 0 or self.execution.slippage_bps < 0:
             errs.append("fees and slippage must be non-negative")
+        probe_span_days = (self.universe.age_probe_bars
+                           * tf_ms(self.universe.age_probe_timeframe) / 86_400_000.0)
+        if probe_span_days < self.universe.min_market_age_days:
+            errs.append(
+                f"universe.age_probe_bars ({self.universe.age_probe_bars} x "
+                f"{self.universe.age_probe_timeframe}) reaches only "
+                f"{probe_span_days:.0f} days, below the "
+                f"{self.universe.min_market_age_days}-day age gate; every market "
+                f"would be unverifiable")
         needed = self.required_history_bars()
         if self.exchange.max_history_bars < needed:
             errs.append(
@@ -313,30 +330,22 @@ class Config:
         return errs
 
     def required_history_bars(self, timeframe: str | None = None) -> int:
-        """How many bars must be fetched for a symbol to be ABLE to pass stage 2.
+        """Bars of INDICATOR history a symbol needs -- nothing to do with age.
 
-        Requesting fewer than this does not make the filters stricter -- it makes
-        them unsatisfiable, because a symbol is then rejected for history it was
-        never given the chance to supply. Derived from the filters themselves so
-        the two cannot drift apart:
+        Deliberately EXCLUDES min_market_age_days. Age is a calendar span and a
+        property of the asset; folding it in here demanded 1080 hourly bars from
+        venues that cap responses at 720, so every market failed forever, on
+        every asset. Age is established separately at a coarse timeframe, where
+        the same cap buys years instead of days -- see data/market_age.py.
 
-          * min_candles_1h      -- a bar count, directly
-          * min_market_age_days -- a SPAN, converted to bars at this timeframe
-          * warmup_bars         -- indicator warm-up
+          * min_candles_1h -- a bar count, directly
+          * warmup_bars    -- indicator warm-up
+
+        Deliberately NOT clamped to max_history_bars either: clamping would
+        silently return a depth that cannot satisfy the filters, reintroducing
+        the same class of bug one layer down. The ceiling is a validation error.
         """
-        from .timeutils import tf_ms
-        tf = timeframe or self.strategy.entry_timeframe
-        step_ms = tf_ms(tf)
-        age_bars = 0
-        if step_ms > 0:
-            age_bars = math.ceil(self.universe.min_market_age_days * 86_400_000 / step_ms)
-        # Deliberately NOT clamped to max_history_bars. Clamping would silently
-        # hand back a depth that cannot satisfy the filters -- reintroducing the
-        # exact failure this method exists to prevent, just one layer down.
-        # The ceiling is enforced as a VALIDATION error instead, so an
-        # impossible budget refuses to start rather than rejecting every symbol.
-        return max(self.universe.min_candles_1h, self.strategy.warmup_bars,
-                   age_bars) + 5            # small margin for venue rounding
+        return max(self.universe.min_candles_1h, self.strategy.warmup_bars) + 5
 
     def exchange_label(self) -> str:
         """The single string every surface should show for "which venue"."""

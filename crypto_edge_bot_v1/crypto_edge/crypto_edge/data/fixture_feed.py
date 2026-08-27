@@ -55,6 +55,12 @@ class FixtureFeed:
         from .feed import DataUnavailable
         s = self._series.get((symbol, timeframe))
         if s is None:
+            # A real venue serves every timeframe it advertises, so a fixture
+            # that only holds 1h would misrepresent one -- and the market-age
+            # probe legitimately asks at a coarser resolution. Derive it by
+            # resampling the finest series we do have.
+            s = self._derive(symbol, timeframe)
+        if s is None:
             raise DataUnavailable(f"no fixture series for {symbol} {timeframe}")
         if self.clock_ms is None:
             return s
@@ -66,6 +72,31 @@ class FixtureFeed:
         return Series(symbol, timeframe, s.open_ms[start:keep], s.open[start:keep],
                       s.high[start:keep], s.low[start:keep], s.close[start:keep],
                       s.volume[start:keep])
+
+    def _derive(self, symbol: str, timeframe: str) -> Series | None:
+        """Resample a coarser series from the finest one held for `symbol`."""
+        target = tf_ms(timeframe)
+        candidates = [(tf, ser) for (sym, tf), ser in self._series.items()
+                      if sym == symbol and len(ser) and tf_ms(tf) < target]
+        if not candidates:
+            return None
+        src_tf, src = min(candidates, key=lambda kv: tf_ms(kv[0]))
+        step = tf_ms(src_tf)
+        per = max(1, target // step)
+        rows = []
+        for i in range(0, len(src) - per + 1, per):
+            chunk = slice(i, i + per)
+            bucket = int(src.open_ms[i]) // target * target
+            rows.append([bucket, float(src.open[i]),
+                         float(np.max(src.high[chunk])),
+                         float(np.min(src.low[chunk])),
+                         float(src.close[i + per - 1]),
+                         float(np.sum(src.volume[chunk]))])
+        if not rows:
+            return None
+        derived = Series.from_ohlcv(symbol, timeframe, rows)
+        self._series[(symbol, timeframe)] = derived
+        return derived
 
     def fetch_quote(self, symbol: str) -> Quote | None:
         for tf in ("1h", "4h", "1d"):

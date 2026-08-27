@@ -248,7 +248,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 481 automated tests, all passing
+### VERIFIED OFFLINE — 527 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -326,7 +326,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               481 tests
+tests/               527 tests
 ```
 
 ## Safety notes

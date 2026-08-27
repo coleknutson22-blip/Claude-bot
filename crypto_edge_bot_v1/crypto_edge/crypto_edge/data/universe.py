@@ -38,6 +38,15 @@ from ..timeutils import now_ms, tf_ms
 LEVERAGED_RE = re.compile(r"(\d+[LS])$")
 
 
+def _num(v) -> float:
+    """Tolerant numeric read. CCXT hands back strings from safe_string."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if np.isfinite(f) and f >= 0 else 0.0
+
+
 class UniverseBuilder:
     def __init__(self, cfg: UniverseCfg) -> None:
         self.cfg = cfg
@@ -64,21 +73,42 @@ class UniverseBuilder:
         return ""
 
     # ------------------------------------------------------ liquidity screen
+    @staticmethod
+    def quote_volume(ticker: dict) -> tuple[float, str]:
+        """24h notional in the QUOTE currency, and how it was derived.
+
+        Order matters and each step is a different accuracy:
+
+          1. `quoteVolume` -- already in quote units. CCXT computes it correctly
+             per venue (Kraken: base volume x 24h vwap), so it is preferred.
+          2. baseVolume x vwap -- vwap is the 24h average, so this is the right
+             conversion when only base volume is published.
+          3. baseVolume x last -- last price is a point estimate of a 24h
+             quantity and will misstate a trending market, so it is the last
+             resort rather than the default.
+
+        A zero or unparseable value falls THROUGH to the next source instead of
+        being accepted: treating a missing figure as "zero volume" silently
+        rejects a market for illiquidity it may not have.
+        """
+        t = ticker or {}
+        qv = _num(t.get("quoteVolume"))
+        if qv > 0:
+            return qv, "quoteVolume"
+        bv = _num(t.get("baseVolume"))
+        if bv > 0:
+            vwap = _num(t.get("vwap"))
+            if vwap > 0:
+                return bv * vwap, "baseVolume x vwap"
+            last = _num(t.get("last")) or _num(t.get("close"))
+            if last > 0:
+                return bv * last, "baseVolume x last"
+        return 0.0, "unavailable"
+
     def rank_by_volume(self, tickers: dict[str, dict],
                        markets: dict[str, MarketMeta]) -> list[tuple[str, float]]:
-        rows = []
-        for sym, meta in markets.items():
-            t = tickers.get(sym) or {}
-            qv = t.get("quoteVolume")
-            if qv is None:
-                last = t.get("last") or t.get("close")
-                bv = t.get("baseVolume")
-                qv = (float(last) * float(bv)) if (last and bv) else 0.0
-            try:
-                qv = float(qv or 0.0)
-            except (TypeError, ValueError):
-                qv = 0.0
-            rows.append((sym, qv))
+        rows = [(sym, self.quote_volume(tickers.get(sym) or {})[0])
+                for sym in markets]
         rows.sort(key=lambda r: r[1], reverse=True)
         return rows
 
@@ -194,18 +224,11 @@ class UniverseBuilder:
             return f"only {len(series)} 1h candles (< {c.min_candles_1h})"
         if not series.is_sane():
             return "candle data failed sanity check"
-        age_ms = int(series.open_ms[-1] - series.open_ms[0])
-        min_age_ms = c.min_market_age_days * 86_400_000
-        if age_ms < min_age_ms:
-            if truncated:
-                # We did not receive enough history to demonstrate the market's
-                # age. Saying "too new" here would blame the asset for a limit
-                # of our own fetch -- the mistake that made every Kraken market
-                # look days old regardless of how long it had existed.
-                return (f"history truncated by venue: {len(series)} of "
-                        f"{requested_bars} bars spans {age_ms / 86_400_000:.0f}d, "
-                        f"cannot verify {c.min_market_age_days}d age")
-            return f"market too new ({age_ms / 86_400_000:.0f}d < {c.min_market_age_days}d)"
+        # NOTE: market age is NOT judged here. The span of the window we
+        # happened to fetch is a fact about our request, not about the asset --
+        # measuring it here is what made every Kraken market look 30 days old
+        # regardless of its real age. Age is established independently, at a
+        # coarse timeframe, by data/market_age.py.
         if atr_pct is not None and np.isfinite(atr_pct):
             if atr_pct < c.min_atr_pct:
                 return f"too quiet (ATR {atr_pct:.2f}% < {c.min_atr_pct}%)"

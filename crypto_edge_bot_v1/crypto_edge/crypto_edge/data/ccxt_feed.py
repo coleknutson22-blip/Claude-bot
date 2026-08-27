@@ -150,6 +150,7 @@ class CCXTFeed:
                 min_amount=_limit(limits, "amount"),
                 min_cost=_limit(limits, "cost"),
                 amount_step=amount_step, price_step=price_step,
+                created_ms=_ts(m.get("created")),
             )
         if not out:
             raise DataUnavailable(
@@ -322,6 +323,15 @@ def _num(v) -> float:
     except (TypeError, ValueError):
         return 0.0
     return f if math.isfinite(f) else 0.0
+
+
+def _ts(raw) -> int:
+    """A venue listing timestamp, or 0 when absent or implausible."""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return v if 0 < v <= now_ms() else 0
 
 
 def _limit(limits: dict, key: str) -> float:

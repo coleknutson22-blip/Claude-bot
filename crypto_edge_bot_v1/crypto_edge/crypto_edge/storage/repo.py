@@ -434,6 +434,39 @@ class Repo:
             "DELETE FROM telegram_outbox WHERE status='SENT' AND sent_ms < ?",
             (older_than_ms,))
 
+    # ------------------------------------------------------------ market age
+    def get_market_age(self, symbol: str) -> dict | None:
+        r = self.conn.execute("SELECT * FROM market_age WHERE symbol=?",
+                              (symbol,)).fetchone()
+        return dict(r) if r else None
+
+    def record_market_age(self, symbol: str, first_ms: int, source: str,
+                          observed_ms: int, detail: str = "") -> int:
+        """Store the earliest evidence of this market's existence.
+
+        Monotonic in `first_ms`: only an EARLIER timestamp replaces the stored
+        one. A venue that later serves less history must not be able to make an
+        already-verified market look young again.
+        """
+        existing = self.get_market_age(symbol)
+        if existing and int(existing["first_ms"]) > 0:
+            if first_ms <= 0 or int(existing["first_ms"]) <= first_ms:
+                # keep the older evidence, but refresh when it was confirmed
+                self.conn.execute(
+                    "UPDATE market_age SET observed_ms=? WHERE symbol=?",
+                    (observed_ms, symbol))
+                return int(existing["first_ms"])
+        self.conn.execute(
+            """INSERT OR REPLACE INTO market_age
+               (symbol, first_ms, source, observed_ms, detail)
+               VALUES(?,?,?,?,?)""",
+            (symbol, int(first_ms), source, int(observed_ms), detail[:200]))
+        return int(first_ms)
+
+    def all_market_ages(self) -> dict[str, dict]:
+        return {r["symbol"]: dict(r)
+                for r in self.conn.execute("SELECT * FROM market_age")}
+
     # ------------------------------------------------------- broad universe
     def save_broad_universe(self, source: str, fetched_ms: int, as_of_ms: int,
                             assets: list[dict], content_hash: str,

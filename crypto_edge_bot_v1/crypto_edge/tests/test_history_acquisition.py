@@ -89,48 +89,67 @@ def bare_feed(client, page_limit=300):
     return feed
 
 
-class TestTheUnsatisfiableConfiguration(unittest.TestCase):
-    """The arithmetic that made every symbol fail, stated as tests."""
+class TestHistoryDepthIsIndicatorsOnly(unittest.TestCase):
+    """Age was folded into the history requirement; it no longer is.
 
-    def test_satisfying_both_filters_needs_more_bars_than_one_request_gives(self):
+    Combining them demanded max(400, 45*24) = 1080 hourly bars from a venue that
+    returns 720, so every market failed forever. Indicator depth and calendar
+    age are now answered separately, at the resolution each one needs.
+    """
+
+    def test_indicator_depth_excludes_the_age_gate(self):
         cfg = load_config("config/config.toml", "/nonexistent")
         need = cfg.required_history_bars("1h")
         self.assertGreaterEqual(need, cfg.universe.min_candles_1h)
-        self.assertGreaterEqual(need, cfg.universe.min_market_age_days * 24)
-        self.assertGreater(need, KrakenLikeClient.cap,
-                           "the required depth exceeds one Kraken response, "
-                           "which is exactly why paging is required")
+        self.assertGreaterEqual(need, cfg.strategy.warmup_bars)
+        self.assertLess(need, cfg.universe.min_market_age_days * 24,
+                        "the age gate must no longer inflate the bar request")
 
-    def test_required_depth_is_derived_from_the_filters_not_hardcoded(self):
-        cfg = test_config()
-        cfg.universe.min_candles_1h = 400
-        cfg.universe.min_market_age_days = 45
-        self.assertGreaterEqual(cfg.required_history_bars("1h"), 45 * 24)
-        cfg.universe.min_market_age_days = 90
-        self.assertGreaterEqual(cfg.required_history_bars("1h"), 90 * 24,
-                                "raising the age gate must raise the fetch depth")
+    def test_the_indicator_depth_now_fits_one_kraken_response(self):
+        cfg = load_config("config/config.toml", "/nonexistent")
+        self.assertLessEqual(cfg.required_history_bars("1h"),
+                             KrakenLikeClient.cap,
+                             "405 bars fits inside Kraken's 720-bar cap")
 
-    def test_the_htf_timeframe_needs_proportionally_fewer_bars(self):
+    def test_raising_the_age_gate_does_not_change_the_bar_request(self):
         cfg = test_config()
-        cfg.universe.min_market_age_days = 45
-        self.assertLess(cfg.required_history_bars("4h"),
-                        cfg.required_history_bars("1h"))
+        before = cfg.required_history_bars("1h")
+        cfg.universe.min_market_age_days = 365
+        self.assertEqual(cfg.required_history_bars("1h"), before,
+                         "age is a calendar span; it must not move a bar count")
+
+    def test_raising_the_indicator_requirements_does_change_it(self):
+        cfg = test_config()
+        before = cfg.required_history_bars("1h")
+        cfg.universe.min_candles_1h += 200
+        self.assertGreater(cfg.required_history_bars("1h"), before)
+
+    def test_an_age_probe_that_cannot_reach_the_gate_is_rejected(self):
+        cfg = load_config("config/config.toml", "/nonexistent")
+        cfg.telegram.enabled = False
+        cfg.universe.age_probe_bars = 5          # 5 days of reach vs a 45d gate
+        errs = cfg.validate()
+        self.assertTrue(any("age_probe_bars" in e for e in errs),
+                        "a probe that can never evidence the gate must refuse "
+                        "to start, not silently fail every market")
+
+    def test_the_shipped_age_probe_reaches_well_past_the_gate(self):
+        cfg = load_config("config/config.toml", "/nonexistent")
+        reach_days = cfg.universe.age_probe_bars * tf_ms(
+            cfg.universe.age_probe_timeframe) / 86_400_000
+        self.assertGreater(reach_days, cfg.universe.min_market_age_days * 2,
+                           "comfortable headroom, not a knife edge")
 
     def test_an_unsatisfiable_history_budget_refuses_to_start(self):
         cfg = load_config("config/config.toml", "/nonexistent")
         cfg.telegram.enabled = False
-        cfg.exchange.max_history_bars = 300
-        errs = cfg.validate()
-        self.assertTrue(any("max_history_bars" in e for e in errs),
-                        "a budget that can never satisfy the filters must be "
-                        "rejected loudly, not silently reject every symbol")
+        cfg.exchange.max_history_bars = 10
+        self.assertTrue(any("max_history_bars" in e for e in cfg.validate()))
 
     def test_the_shipped_configuration_is_satisfiable(self):
         cfg = load_config("config/config.toml", "/nonexistent")
         cfg.telegram.enabled = False
         self.assertEqual(cfg.validate(), [])
-        self.assertGreaterEqual(cfg.exchange.max_history_bars,
-                                cfg.required_history_bars("1h"))
 
 
 class TestPagingReachesTheRequiredDepth(unittest.TestCase):
@@ -222,12 +241,11 @@ class TestPagingReachesTheRequiredDepth(unittest.TestCase):
 
 
 class TestTruncationIsNotBlamedOnTheAsset(unittest.TestCase):
-    """A venue history cap and a young market look identical in the data."""
+    """A short response is a fact about our fetch, not about the asset."""
 
     def setUp(self):
         cfg = test_config()
         cfg.universe.min_candles_1h = 400
-        cfg.universe.min_market_age_days = 45
         cfg.universe.min_atr_pct = 0.0
         cfg.universe.max_atr_pct = 1000.0
         self.b = UniverseBuilder(cfg.universe)
@@ -237,95 +255,79 @@ class TestTruncationIsNotBlamedOnTheAsset(unittest.TestCase):
         start = now_ms() - bars * HOUR
         return make_series("X/USDT", "1h", closes, start)
 
-    def test_a_truncated_response_is_reported_as_a_venue_limitation(self):
-        """720 bars when 1085 were asked for: our fetch is short, not the asset."""
-        reason = self.b.filter_by_history("X/USDT", self._series(720),
-                                          requested_bars=1085)
-        self.assertIn("truncated by venue", reason)
-        self.assertIn("1085", reason)
-        self.assertNotIn("too new", reason,
-                         "the asset must not be blamed for our fetch depth")
-
-    def test_a_genuinely_young_market_is_still_called_young(self):
-        """Everything we asked for arrived and it really is only 30 days old."""
-        reason = self.b.filter_by_history("X/USDT", self._series(720),
-                                          requested_bars=720)
-        self.assertIn("too new", reason)
-        self.assertNotIn("truncated", reason)
-
-    def test_full_history_passes_the_age_gate(self):
-        self.assertEqual(
-            self.b.filter_by_history("X/USDT", self._series(1085),
-                                     requested_bars=1085),
-            "", "1085 bars is 45 days; the gate must be satisfiable")
-
-    def test_a_short_truncated_response_names_the_venue_too(self):
+    def test_a_short_truncated_response_names_the_venue(self):
         reason = self.b.filter_by_history("X/USDT", self._series(300),
-                                          requested_bars=1085)
+                                          requested_bars=405)
         self.assertIn("venue supplied only", reason)
         self.assertIn("300", reason)
 
-    def test_without_the_request_context_behaviour_is_unchanged(self):
-        """Callers that do not pass requested_bars keep the original reasons."""
+    def test_a_short_response_without_request_context_reads_as_history(self):
         reason = self.b.filter_by_history("X/USDT", self._series(300))
         self.assertIn("1h candles", reason)
-        self.assertNotIn("venue", reason)
 
-    def test_both_outcomes_still_block_the_entry(self):
-        """Distinguishing the reasons must not make either of them permissive."""
-        for requested in (720, 1085):
-            self.assertNotEqual(
-                self.b.filter_by_history("X/USDT", self._series(720),
-                                         requested_bars=requested), "",
-                "fail closed either way")
+    def test_enough_bars_passes_regardless_of_the_span_they_cover(self):
+        """The decoupling, stated directly: 405 bars is 17 days of calendar and
+        that is now irrelevant to the history gate."""
+        self.assertEqual(
+            self.b.filter_by_history("X/USDT", self._series(405),
+                                     requested_bars=405), "")
+
+    def test_a_720_bar_kraken_response_satisfies_the_history_gate(self):
+        """The exact series that used to be rejected as 'too new'."""
+        self.assertEqual(
+            self.b.filter_by_history("X/USDT", self._series(720),
+                                     requested_bars=405), "")
+
+    def test_the_history_gate_no_longer_mentions_age_at_all(self):
+        for bars in (405, 500, 720, 1085):
+            reason = self.b.filter_by_history("X/USDT", self._series(bars),
+                                              requested_bars=405)
+            self.assertNotIn("too new", reason)
+            self.assertNotIn("truncated by venue", reason)
 
 
 class TestEndToEndOnAKrakenLikeVenue(unittest.TestCase):
     """The reported symptom, reproduced and then shown fixed."""
 
-    def _pipeline(self, feed, cfg, symbol="SOL/USDT"):
+    def _history_reason(self, feed, cfg, symbol="SOL/USDT"):
         want = cfg.required_history_bars("1h")
         series = feed.fetch_ohlcv(symbol, "1h", want)
         return UniverseBuilder(cfg.universe).filter_by_history(
             symbol, series, None, requested_bars=want), len(series)
 
-    def test_the_old_single_request_behaviour_rejected_everything(self):
-        """Pinning the defect: one capped response can never satisfy the gates."""
+    def test_the_old_combined_requirement_rejected_a_full_kraken_response(self):
+        """Pinning the defect: 720 bars is everything Kraken has at 1h, and the
+        old requirement of 1080 rejected it -- so no asset could ever pass."""
         cfg = load_config("config/config.toml", "/nonexistent")
-        client = KrakenLikeClient()
-        one_page = client.fetch_ohlcv("SOL/USDT", "1h", limit=300)
-        series = make_series(
-            "SOL/USDT", "1h",
-            [r[4] for r in one_page],
-            one_page[0][0])
-        reason = UniverseBuilder(cfg.universe).filter_by_history(
-            "SOL/USDT", series, None)
-        self.assertNotEqual(reason, "",
-                            "a single capped response is always rejected")
+        old_combined = max(cfg.universe.min_candles_1h, cfg.strategy.warmup_bars,
+                           cfg.universe.min_market_age_days * 24)
+        self.assertGreater(old_combined, KrakenLikeClient.cap)
+        self.assertLessEqual(cfg.required_history_bars("1h"),
+                             KrakenLikeClient.cap,
+                             "the corrected requirement fits what Kraken gives")
 
-    def test_with_paging_a_mature_market_becomes_eligible(self):
+    def test_a_kraken_capped_response_now_satisfies_the_history_gate(self):
         cfg = load_config("config/config.toml", "/nonexistent")
         cfg.universe.min_atr_pct = 0.0
         feed = bare_feed(KrakenLikeClient(total_bars=5000))
-        reason, bars = self._pipeline(feed, cfg)
+        reason, bars = self._history_reason(feed, cfg)
         self.assertGreaterEqual(bars, cfg.universe.min_candles_1h)
-        self.assertGreaterEqual(bars, cfg.universe.min_market_age_days * 24)
-        self.assertEqual(reason, "",
-                         f"a mature market must survive stage 2; got {reason!r}")
+        self.assertEqual(reason, "", f"expected eligible, got {reason!r}")
 
-    def test_a_genuinely_new_listing_is_still_excluded(self):
-        """The fix must not smuggle young markets in -- that would be loosening."""
+    def test_a_genuinely_short_series_is_still_excluded(self):
         cfg = load_config("config/config.toml", "/nonexistent")
         feed = bare_feed(KrakenLikeClient(total_bars=200))
-        reason, bars = self._pipeline(feed, cfg)
+        reason, bars = self._history_reason(feed, cfg)
         self.assertEqual(bars, 200)
-        self.assertNotEqual(reason, "", "200 bars must never be eligible")
+        self.assertNotEqual(reason, "", "200 bars must never satisfy 400")
 
     def test_thresholds_themselves_are_untouched(self):
         """Guard against 'fixing' this by weakening the strategy."""
         cfg = load_config("config/config.toml", "/nonexistent")
         self.assertEqual(cfg.universe.min_candles_1h, 400)
         self.assertEqual(cfg.universe.min_market_age_days, 45)
+        self.assertEqual(cfg.universe.min_dollar_volume_24h, 5_000_000.0)
+        self.assertEqual(cfg.universe.max_spread_bps, 15.0)
         self.assertEqual(cfg.strategy.warmup_bars, 250)
         self.assertEqual(cfg.strategy.ema_trend, 200)
         self.assertEqual(cfg.risk.risk_per_trade_pct, 0.5)

@@ -492,11 +492,20 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
     Stage 2 costs one OHLCV fetch per surviving symbol, so it is opt-in via
     `limit` when the survivor list is long.
     """
+    from .data.market_age import MarketAgeService
     from .data.universe import UniverseBuilder
 
     print("=" * 72)
     print(f"UNIVERSE DIAGNOSTIC -- {cfg.exchange_label()}")
     print("=" * 72)
+    print(f"required 1h history (indicators only) : "
+          f"{cfg.required_history_bars(cfg.strategy.entry_timeframe)} bars")
+    print(f"required {cfg.strategy.regime_timeframe} history                    "
+          f": {cfg.required_history_bars(cfg.strategy.regime_timeframe)} bars")
+    print(f"market-age method                    : {cfg.universe.age_probe_bars} x "
+          f"{cfg.universe.age_probe_timeframe} probe "
+          f"({cfg.universe.age_probe_bars * tf_ms(cfg.universe.age_probe_timeframe) / 86_400_000:.0f} "
+          f"days of reach) vs a {cfg.universe.min_market_age_days}-day gate")
 
     markets = feed.load_markets()
     tickers = feed.fetch_tickers()
@@ -520,6 +529,30 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
         else:
             not_in_broad.append(sym)
     print(f"intersecting the broad universe           : {len(intersect)}")
+
+    # ---- the 24h volume audit, every intersecting market, raw fields -----
+    print(NEWLINE + "--- 24H VOLUME AUDIT (all intersecting markets) " + "-" * 24)
+    print(f"    threshold: ${cfg.universe.min_dollar_volume_24h:,.0f} in "
+          f"{cfg.exchange.quote}")
+    print(f"    {'symbol':16} {'baseVolume':>16} {'quoteVolume':>16} "
+          f"{'vwap':>12} {'last':>12} {'-> notional':>16}  {'via':<18} R")
+    vol_rows = []
+    for sym in sorted(intersect):
+        t = tickers.get(sym) or {}
+        notional, how = UniverseBuilder.quote_volume(t)
+        ok = notional >= cfg.universe.min_dollar_volume_24h
+        vol_rows.append((sym, t, notional, how, ok))
+        print(f"    {sym:16} {_f(t.get('baseVolume')):>16} "
+              f"{_f(t.get('quoteVolume')):>16} {_f(t.get('vwap')):>12} "
+              f"{_f(t.get('last')):>12} {notional:>16,.0f}  {how:<18} "
+              f"{'PASS' if ok else 'FAIL'}")
+    passing = sum(1 for r in vol_rows if r[4])
+    print(f"    {passing}/{len(vol_rows)} clear the threshold")
+    unavailable = [r[0] for r in vol_rows if r[3] == "unavailable"]
+    if unavailable:
+        print(f"    !! {len(unavailable)} market(s) published NO usable volume "
+              f"field: {unavailable[:8]}")
+        print("    !! that is an adapter/venue problem, not illiquidity")
 
     # ---- stage 1: static / liquidity / spread ----------------------------
     keep, audit = UniverseBuilder(cfg.universe).build_candidates(
@@ -550,6 +583,10 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
     print("    this is where a venue history cap shows up" + NEWLINE)
 
     builder = UniverseBuilder(cfg.universe)
+    age_svc = MarketAgeService(
+        repo, probe_timeframe=cfg.universe.age_probe_timeframe,
+        probe_bars=cfg.universe.age_probe_bars,
+        cache_hours=cfg.universe.age_cache_hours)
     stage2_reasons: dict[str, list] = {}
     survivors, bar_counts = [], []
     want_1h = cfg.required_history_bars(cfg.strategy.entry_timeframe)
@@ -583,8 +620,14 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
         if not reason and htf_bars < cfg.strategy.regime_ema + 2:
             reason = (f"insufficient {cfg.strategy.regime_timeframe} history "
                       f"({htf_bars} bars)")
+        verdict = age_svc.age_of(sym, meta=markets.get(sym), feed=feed)
+        if not reason and cfg.universe.min_market_age_days > 0:
+            reason = verdict.reason_if_blocked(cfg.universe.min_market_age_days)
+        age_txt = ("?" if not verdict.known
+                   else f"{verdict.age_days:.0f}d/{verdict.source[:12]}")
         print(f"    {sym:16} 1h={bars:<5} {cfg.strategy.regime_timeframe}={htf_bars:<5} "
-              f"span={span_d:6.1f}d atr={atr_pct if atr_pct is None else round(atr_pct, 2)}"
+              f"span={span_d:6.1f}d age={age_txt:<22} "
+              f"atr={atr_pct if atr_pct is None else round(atr_pct, 2)}"
               f"  {reason or 'ELIGIBLE'}")
         if reason:
             stage2_reasons.setdefault(_bucket(reason), []).append(sym)
@@ -611,15 +654,19 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
 
     if bar_counts:
         counts = [b for _, b in bar_counts]
-        short = [(s, b) for s, b in bar_counts if b < want_1h]
+        # Compare against the REQUIREMENT, not the padded request. The request
+        # carries a small margin for venue rounding, so "one bar short of the
+        # padded ask" is normal and must not be reported as a venue cap.
+        floor = cfg.universe.min_candles_1h
+        short = [(s, b) for s, b in bar_counts if b < floor]
         print(NEWLINE + f"  1h bars returned: min={min(counts)} max={max(counts)} "
               f"requested={want_1h}")
         if short:
-            print(f"  {len(short)}/{len(bar_counts)} symbols got FEWER bars than "
-                  f"requested -- the venue is capping history.")
+            print(f"  {len(short)}/{len(bar_counts)} symbols came back below the "
+                  f"{floor}-bar requirement -- the venue is capping history.")
             print(f"  Worst: {sorted(short, key=lambda x: x[1])[:5]}")
         else:
-            print("  every symbol supplied the full requested history")
+            print(f"  every symbol met the {floor}-bar indicator requirement")
     print("=" * 72)
 
     return {"markets": len(markets), "intersecting": len(intersect),
@@ -629,6 +676,16 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
             "requested_1h": want_1h}
 
 
+def _f(v) -> str:
+    """Format a raw ticker field for the audit table, preserving its absence."""
+    if v is None:
+        return "None"
+    try:
+        return f"{float(v):,.4g}"
+    except (TypeError, ValueError):
+        return repr(v)[:16]
+
+
 def _bucket(reason: str) -> str:
     """Collapse a reason to its family so counts are meaningful."""
     r = (reason or "").strip()
@@ -636,7 +693,7 @@ def _bucket(reason: str) -> str:
                    "market too new", "only ", "24h volume", "spread ",
                    "too quiet", "too volatile", "not in the broad",
                    "outside top", "candle data failed", "no candle data",
-                   "insufficient "):
+                   "market age could not be established", "insufficient "):
         if r.startswith(prefix):
             return prefix.strip() if prefix.strip() != "only" else "insufficient 1h history"
     if "claimed by" in r:

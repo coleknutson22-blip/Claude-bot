@@ -123,6 +123,10 @@ class MarketMeta:
     min_cost: float = 0.0          # minimum notional in quote currency
     amount_step: float = 0.0       # absolute tick for quantity (0 = unspecified)
     price_step: float = 0.0        # absolute tick for price   (0 = unspecified)
+    # Venue-reported listing time, where the venue offers one (binance does,
+    # kraken does not). 0 == not supplied. This is the most authoritative
+    # answer to "how old is this market"; see data/market_age.py.
+    created_ms: int = 0
 
 
 # Where a quote's timestamp came from. This matters: if the venue did not

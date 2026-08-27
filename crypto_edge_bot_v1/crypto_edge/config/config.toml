@@ -48,6 +48,18 @@ broad_collision_scan_limit = 1000
 #   [universe.broad_symbol_overrides]
 #   GRT = "the-graph"
 broad_symbol_overrides = {}
+
+# --- market age, established INDEPENDENTLY of indicator history -----------
+# A venue's OHLCV cap is PER TIMEFRAME. Kraken's 720-bar limit is 30 days at 1h
+# but 720 days at 1d, so asking about age at 1h could never evidence a 45-day
+# gate -- every market, however old, read as "too new". Age now asks at a coarse
+# resolution where reach is cheap, while the indicators keep asking at 1h where
+# density matters. Sources are tried in order: venue listing metadata, coarse
+# OHLCV, stored earlier observation, provider asset history. If none answers,
+# the market FAILS CLOSED rather than being assumed old enough.
+age_probe_timeframe = "1d"
+age_probe_bars = 400      # 400 days of reach against a 45-day gate
+age_cache_hours = 24      # age changes slowly; do not re-probe every cycle
 # With neither a live nor a usable cached broad universe, NEW ENTRIES STOP.
 # Open positions keep being managed regardless -- the ranking provider is never
 # allowed to become a single point of failure for risk already on the books.

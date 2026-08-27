@@ -23,7 +23,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -250,6 +250,18 @@ CREATE TABLE IF NOT EXISTS broad_universe_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_broad_universe ON broad_universe_cache(fetched_ms DESC);
 
+-- Market age, established independently of indicator history and remembered
+-- with its provenance. `first_ms` only ever moves EARLIER (see
+-- Repo.record_market_age): a venue trimming its history must not make a market
+-- appear to grow younger.
+CREATE TABLE IF NOT EXISTS market_age (
+    symbol TEXT PRIMARY KEY,
+    first_ms INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    observed_ms INTEGER NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS strategy_versions (
     strategy TEXT NOT NULL,
     version TEXT NOT NULL,
@@ -298,7 +310,14 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     """)
 
 
-MIGRATIONS = {1: _migrate_v1_to_v2}
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """v3 only ADDS the market_age table, which the schema script creates with
+    CREATE TABLE IF NOT EXISTS. Nothing to rewrite; this exists so the version
+    step is explicit and auditable rather than implied."""
+    return
+
+
+MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3}
 
 
 def init_db(conn: sqlite3.Connection) -> None:

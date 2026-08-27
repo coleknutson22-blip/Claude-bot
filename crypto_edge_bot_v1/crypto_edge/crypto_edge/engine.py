@@ -29,6 +29,7 @@ from .data.broad_universe import (BroadUniverseService,
                                   CoinGeckoUniverseProvider,
                                   StaticBroadUniverseProvider)
 from .data.feed import DataUnavailable
+from .data.market_age import MarketAgeService
 from .data.universe import UniverseBuilder
 from .execution.paper_broker import PaperBroker
 from .indicators import atr, last_valid, log_returns, roc
@@ -97,6 +98,10 @@ class TradingEngine:
         self.journal = ResearchJournal(repo)
         self.perf = PerformanceCalculator(repo)
         self.universe_builder = UniverseBuilder(cfg.universe)
+        self.market_age = MarketAgeService(
+            repo, probe_timeframe=cfg.universe.age_probe_timeframe,
+            probe_bars=cfg.universe.age_probe_bars,
+            cache_hours=cfg.universe.age_cache_hours)
         self.broad_universe = BroadUniverseService(
             repo, broad_provider or _build_broad_provider(cfg),
             limit=cfg.universe.broad_limit,
@@ -451,6 +456,13 @@ class TradingEngine:
                 sym, s, atr_pct,
                 requested_bars=self._requested_bars.get(
                     (sym, c.strategy.entry_timeframe)))
+            if not hist_reject and c.universe.min_market_age_days > 0:
+                # Age is a separate question with its own source; see
+                # data/market_age.py for why it must not come from `s`.
+                verdict = self.market_age.age_of(
+                    sym, meta=self._markets.get(sym), feed=self.feed)
+                hist_reject = verdict.reason_if_blocked(
+                    c.universe.min_market_age_days)
 
             sig = self.strategy.evaluate(s, htf, ctx, meta_extra)
             self.status.signals_evaluated += 1
