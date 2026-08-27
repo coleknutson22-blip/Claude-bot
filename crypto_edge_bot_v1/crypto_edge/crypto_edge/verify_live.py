@@ -24,7 +24,8 @@ from dataclasses import dataclass, field
 from .config import Config
 from .data.feed import DataUnavailable
 from .models import TS_LOCAL, TS_VENUE
-from .timeutils import candle_close_ms, iso, now_ms, tf_ms
+from .timeutils import (candle_close_ms, iso, last_closed_open_ms,
+                        now_ms, tf_ms)
 
 CRITICAL, INFO = "CRITICAL", "INFO"
 NEWLINE = chr(10)
@@ -43,6 +44,7 @@ class Step:
     ok: bool
     severity: str
     detail: str = ""
+    topic: str = ""     # which summary line this check belongs to
 
 
 @dataclass
@@ -51,8 +53,8 @@ class VerifyReport:
     facts: dict = field(default_factory=dict)
 
     def add(self, name: str, ok: bool, detail: str = "",
-            severity: str = CRITICAL) -> bool:
-        self.steps.append(Step(name, ok, severity, detail))
+            severity: str = CRITICAL, topic: str = "") -> bool:
+        self.steps.append(Step(name, ok, severity, detail, topic))
         mark = "PASS" if ok else ("FAIL" if severity == CRITICAL else "WARN")
         print(f"  [{mark:4}] {name:38} {detail}")
         return ok
@@ -61,22 +63,44 @@ class VerifyReport:
     def passed(self) -> bool:
         return all(s.ok for s in self.steps if s.severity == CRITICAL)
 
+    def failures_for(self, topic: str) -> list[str]:
+        """Names of the CRITICAL checks that failed for one summary line."""
+        return [s.name for s in self.steps
+                if s.topic == topic and s.severity == CRITICAL and not s.ok]
+
+    def fact(self, key: str, default: str = "-") -> str:
+        """A summary line, OVERRULED BY ITS OWN CHECKS.
+
+        The detailed section once printed `[FAIL] data freshness (1h)` while the
+        summary printed `BTC 1H DATA STATUS OK`, because the fact string was
+        assigned unconditionally further down the same function. A reader who
+        trusts the summary -- which is the part written to be trusted -- would
+        have started trading on data the run had already rejected.
+
+        Making the summary DERIVE from the recorded checks removes the chance to
+        disagree, rather than fixing the one place they happened to.
+        """
+        failed = self.failures_for(key)
+        if failed:
+            return f"FAILED: {', '.join(failed)}"
+        return str(self.facts.get(key, default))
+
     def render_summary(self) -> str:
         f = self.facts
         lines = [
             "", "=" * 72, "LIVE VERIFICATION SUMMARY", "=" * 72,
             f"EXCHANGE USED                  {f.get('exchange', '?')}",
-            f"LIVE CCXT RESULT               {f.get('ccxt_result', 'NOT RUN')}",
-            f"BROAD UNIVERSE RESULT          {f.get('broad_result', 'NOT RUN')}",
+            f"LIVE CCXT RESULT               {self.fact('ccxt_result', 'NOT RUN')}",
+            f"BROAD UNIVERSE RESULT          {self.fact('broad_result', 'NOT RUN')}",
             f"NUMBER OF ASSETS RETURNED      {f.get('broad_n', '-')}",
             f"NUMBER INTERSECTING EXCHANGE   {f.get('intersecting', '-')}",
             f"NUMBER AFTER FILTERING         {f.get('after_filter', '-')}",
-            f"BTC 1H DATA STATUS             {f.get('btc_1h', '-')}",
-            f"BTC 4H DATA STATUS             {f.get('btc_4h', '-')}",
-            f"QUOTE/SPREAD STATUS            {f.get('quote_status', '-')}",
+            f"BTC 1H DATA STATUS             {self.fact('btc_1h', '-')}",
+            f"BTC 4H DATA STATUS             {self.fact('btc_4h', '-')}",
+            f"QUOTE/SPREAD STATUS            {self.fact('quote_status', '-')}",
             f"QUOTE TIMESTAMP FINDINGS       {f.get('ts_findings', '-')}",
-            f"TELEGRAM DELIVERY RESULT       {f.get('telegram', 'NOT RUN')}",
-            f"COMPLETE ENGINE CYCLE RESULT   {f.get('cycle', 'NOT RUN')}",
+            f"TELEGRAM DELIVERY RESULT       {self.fact('telegram', 'NOT RUN')}",
+            f"COMPLETE ENGINE CYCLE RESULT   {self.fact('cycle', 'NOT RUN')}",
             "=" * 72,
             "VERDICT: " + ("ALL CRITICAL CHECKS PASSED" if self.passed
                            else "FAILURES ABOVE -- do not run continuously yet"),
@@ -166,30 +190,47 @@ def verify_exchange(cfg: Config, feed, rep: VerifyReport) -> dict:
             rep.facts[label] = "FAILED: no closed candles"
             continue
 
+        now = now_ms()
+        step_ms = tf_ms(tf)
+        # CCXT DELIVERS CANDLE **OPEN** TIMESTAMPS. A bar stamped 03:00 on a 1h
+        # series spans 03:00 -> 04:00 and only becomes complete at 04:00, so
+        # every freshness figure below is measured from the CLOSE, never the
+        # stamp. Calling the stamp a "close" -- as this report once did -- makes
+        # a perfectly current 4h series look four hours stale.
         last_open = int(closed.open_ms[-1])
         close_ms = candle_close_ms(last_open, tf)
-        age_min = (now_ms() - close_ms) / 60_000.0
+        age_min = (now - close_ms) / 60_000.0
+        # What the venue SHOULD be able to give us right now.
+        expected_open = last_closed_open_ms(tf, now, buffer_ms)
+        bars_behind = max(0, round((expected_open - last_open) / step_ms))
+
         # the newest CLOSED candle must genuinely be closed, and no more than
         # one timeframe old (plus the buffer) or we are behind the market
-        properly_closed = close_ms + buffer_ms <= now_ms()
-        fresh = age_min <= (tf_ms(tf) / 60_000.0) + 5
+        properly_closed = close_ms + buffer_ms <= now
+        fresh = age_min <= (step_ms / 60_000.0) + 5
         sane_ts = bool(closed.is_sane())
 
         rep.add(f"fetch_ohlcv {btc} {tf}", True,
-                f"{len(raw)} rows, {dropped} unclosed discarded, "
-                f"last close {iso(close_ms)} ({age_min:.1f} min ago)")
+                f"{len(raw)} rows, {dropped} unclosed discarded, newest "
+                f"retained OPEN {iso(last_open)} -> COMPLETE at {iso(close_ms)}",
+                topic=label)
         rep.add(f"unclosed candles discarded ({tf})", properly_closed,
-                "newest retained candle is genuinely closed" if properly_closed
-                else "a retained candle has NOT closed yet -- look-ahead risk")
+                "newest retained candle is genuinely complete" if properly_closed
+                else "a retained candle has NOT closed yet -- look-ahead risk",
+                topic=label)
         rep.add(f"timestamps sane ({tf})", sane_ts,
                 "monotonic, evenly spaced, OHLC consistent" if sane_ts
-                else "series failed sanity check")
+                else "series failed sanity check", topic=label)
         rep.add(f"data freshness ({tf})", fresh,
-                f"{age_min:.1f} min behind" if fresh
-                else f"{age_min:.1f} min behind -- stale for a {tf} strategy",
-                severity=CRITICAL if not fresh else INFO)
+                f"complete {age_min:.1f} min ago; newest available open is "
+                f"{iso(expected_open)} and we have {iso(last_open)} "
+                f"({bars_behind} bar(s) behind)" if fresh
+                else f"complete {age_min:.1f} min ago -- {bars_behind} bar(s) "
+                     f"behind the newest available {tf} candle",
+                severity=CRITICAL if not fresh else INFO, topic=label)
         rep.facts[label] = (f"OK ({len(raw)} rows, {dropped} unclosed dropped, "
-                            f"last close {age_min:.1f} min ago)")
+                            f"complete {age_min:.1f} min ago, "
+                            f"{bars_behind} bar(s) behind)")
         out[label] = closed
 
     # --- clock ---

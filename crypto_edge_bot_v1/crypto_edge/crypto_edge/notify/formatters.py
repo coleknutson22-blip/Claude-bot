@@ -111,7 +111,8 @@ def circuit_breaker(*, kind: str, reason: str, equity: float,
 def heartbeat(*, uptime_s: float, equity: float, today_pnl: float,
               total_pnl: float, open_positions: int, btc_regime: str,
               breadth: float, signals_evaluated: int, last_data_ms: int,
-              halted: bool) -> str:
+              halted: bool, cycle_s: float = 0.0, poll_s: float = 0.0,
+              overruns: int = 0) -> str:
     lines = [
         "💓 HEARTBEAT" + (" — HALTED" if halted else ""),
         f"Uptime: {fmt_duration(uptime_s)}",
@@ -123,6 +124,13 @@ def heartbeat(*, uptime_s: float, equity: float, today_pnl: float,
         f"Signals evaluated: {signals_evaluated}",
         f"Last data update: {iso(last_data_ms)}",
     ]
+    if cycle_s:
+        # Cadence is worth saying out loud: a bot quietly running 2.5x slower
+        # than its poll interval looks identical to a healthy one otherwise.
+        line = f"Cycle: {cycle_s:.1f}s / {poll_s:.0f}s poll"
+        if overruns:
+            line += f" — BEHIND for {overruns} cycle(s)"
+        lines.append(line)
     return "\n".join(lines)
 
 

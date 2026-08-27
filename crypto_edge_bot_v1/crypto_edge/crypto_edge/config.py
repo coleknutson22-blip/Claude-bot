@@ -52,6 +52,10 @@ class ExchangeCfg:
     # feed pages until it has the depth the universe filters require. See
     # Config.required_history_bars().
     ohlcv_limit: int = 300
+    # Closed candles kept in memory per (symbol, timeframe). A closed candle is
+    # immutable, so while no newer one has closed the cache IS the current state
+    # of the market and no request is made at all. 0 disables the cache.
+    ohlcv_cache_bars: int = 2000
     max_history_bars: int = 2000        # hard ceiling on paging per symbol
 
 
@@ -225,6 +229,10 @@ class TelegramCfg:
 @dataclass
 class EngineCfg:
     poll_seconds: int = 30
+    # A FLOOR on the gap between cycles, so a cycle that overruns `poll_seconds`
+    # cannot degrade into a back-to-back loop against the venue's rate limiter.
+    # The realised cadence is therefore max(poll_seconds, cycle + min_pause_seconds).
+    min_pause_seconds: float = 5.0
     db_path: str = "data/crypto_edge.db"
     log_dir: str = "logs"
     equity_snapshot_minutes: int = 15

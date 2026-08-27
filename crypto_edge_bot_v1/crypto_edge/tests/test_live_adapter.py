@@ -20,6 +20,7 @@ exercising the pure parsing functions and by bypassing __init__ where a feed
 instance is needed. Live behaviour is verified separately with
 `python -m crypto_edge.cli verify-live`.
 """
+import numpy as np
 import unittest
 
 import helpers  # noqa: F401  -- silences the engine's log handlers
@@ -284,17 +285,31 @@ class TestFetchOhlcv(unittest.TestCase):
         self.assertTrue(s.is_sane())
 
     def test_rows_containing_none_are_dropped_not_propagated_as_nan(self):
+        """A dropped row leaves a HOLE, and history restarts after it.
+
+        Removing the bad row and closing ranks would hand the indicators a
+        series whose bars are not one hour apart while still claiming to be --
+        an ATR or EMA computed across that join is silently wrong. Splicing is
+        the dangerous option, so the series is cut back to the unbroken run
+        that ends at the live edge instead. Shorter, and the depth check can
+        see it is shorter; never subtly misaligned.
+        """
         rows = self._rows()
         rows[2][3] = None
         feed = _Bare(FakeClient(ohlcv=rows))
         s = feed.fetch_ohlcv("BTC/USDT", "1h", 100)
-        self.assertEqual(len(s), 4, "the malformed row must be removed")
+        self.assertEqual(len(s), 2, "only the run after the hole survives")
+        self.assertEqual(int(s.open_ms[-1]), rows[-1][0], "the live edge is kept")
+        self.assertTrue(s.is_sane(), "and what is kept is evenly spaced")
+        self.assertFalse(np.any(np.isnan(s.close)), "no NaN reaches the indicators")
 
     def test_short_rows_are_dropped(self):
         rows = self._rows()
         rows[1] = [rows[1][0], 100.0]
         feed = _Bare(FakeClient(ohlcv=rows))
-        self.assertEqual(len(feed.fetch_ohlcv("BTC/USDT", "1h", 100)), 4)
+        s = feed.fetch_ohlcv("BTC/USDT", "1h", 100)
+        self.assertEqual(len(s), 3, "the run after the removed row")
+        self.assertTrue(s.is_sane())
 
     def test_extra_columns_are_ignored(self):
         rows = [r + ["junk"] for r in self._rows()]

@@ -48,11 +48,25 @@ HOUR = 3_600_000
 
 
 class KrakenLikeClient:
-    """A faithful stand-in for Kraken's OHLC endpoint.
+    """A faithful stand-in for Kraken's OHLC endpoint AS SEEN THROUGH CCXT.
 
-    Two behaviours matter and both are real: `limit` is IGNORED, and no response
-    ever contains more than `cap` candles. `since` is honoured, which is the
-    only reason paging can work at all.
+    Three behaviours matter and all three are real. The third was missing from
+    this stand-in for a long time, and its absence is the direct reason a
+    one-bar staleness bug reached a live machine with the suite fully green.
+
+    1. Kraken IGNORES `limit` server-side, and no response ever contains more
+       than `cap` candles.
+    2. The newest row is the candle CURRENTLY IN PROGRESS. Real venues return
+       it; a stand-in that stops at the last closed bar leaves `drop_unclosed`
+       with nothing to drop and hides every off-by-one around the live edge.
+    3. CCXT then post-processes the response in `filter_by_since_limit`. When
+       `since` is given it sets `shouldFilterFromStart=True`, so `filter_by_limit`
+       returns `array[0:limit]` -- the OLDEST `limit` rows, DISCARDING THE
+       NEWEST. Ask for a span wider than `limit` and the bars you lose are the
+       most recent ones.
+
+    Verified against ccxt 4.5.75: `base/exchange.py` `filter_by_since_limit`
+    (line ~3386) and `filter_by_limit` (line ~3353).
     """
 
     cap = 720
@@ -61,18 +75,29 @@ class KrakenLikeClient:
         if cap is not None:
             self.cap = cap
         self.step = step
-        newest = (now_ms() // step) * step - step
+        # bars[-1] is the IN-PROGRESS candle, exactly as a venue reports it.
+        newest = (now_ms() // step) * step
         self.bars = [[newest - (total_bars - 1 - i) * step,
                       100.0, 101.0, 99.0, 100.5, 10.0]
                      for i in range(total_bars)]
         self.calls = 0
 
+    def _venue_rows(self, since):
+        # No `since`: Kraken answers with its most recent `cap` candles.
+        # With `since`: it walks FORWARD from there, still capped at `cap`.
+        if since is None:
+            return self.bars[-self.cap:]
+        return [r for r in self.bars if r[0] >= since][:self.cap]
+
     def fetch_ohlcv(self, symbol, timeframe=None, since=None, limit=None):
         self.calls += 1
-        rows = self.bars
+        rows = self._venue_rows(since)
+        # --- ccxt's filter_by_since_limit, reproduced ---
         if since is not None:
             rows = [r for r in rows if r[0] >= since]
-        return [list(r) for r in rows[:self.cap]]      # `limit` deliberately ignored
+        if limit is not None:
+            rows = rows[:limit] if since is not None else rows[-limit:]
+        return [list(r) for r in rows]
 
 
 def bare_feed(client, page_limit=300):
@@ -161,9 +186,17 @@ class TestPagingReachesTheRequiredDepth(unittest.TestCase):
                          "Kraken ignores limit and caps at 720")
 
     def test_paging_reaches_the_full_requested_depth(self):
+        """The number that matters is CLOSED bars, after the live one is dropped.
+
+        The fetch deliberately returns one extra row -- the candle currently in
+        progress -- so that `drop_unclosed` leaves exactly the requested depth
+        rather than one short of it.
+        """
         feed = bare_feed(KrakenLikeClient())
         series = feed.fetch_ohlcv("BTC/USDT", "1h", 1085)
-        self.assertEqual(len(series), 1085)
+        closed = series.drop_unclosed(now_ms(), 0)
+        self.assertGreaterEqual(len(closed), 1085, "at least the depth asked for")
+        self.assertLessEqual(len(closed), 1088, "and not an unbounded over-fetch")
         self.assertGreater(feed.client.calls, 1, "more than one request needed")
 
     def test_paged_bars_are_ordered_unique_and_evenly_spaced(self):
@@ -201,15 +234,23 @@ class TestPagingReachesTheRequiredDepth(unittest.TestCase):
 
     def test_a_venue_that_honours_limit_still_works(self):
         class Honest(KrakenLikeClient):
+            """Binance-shaped: `limit` is applied SERVER-side.
+
+            With no `since` a real venue answers with its most RECENT rows --
+            that is what makes the since-less first request safe everywhere.
+            """
+
             def fetch_ohlcv(self, symbol, timeframe=None, since=None, limit=None):
                 self.calls += 1
-                rows = self.bars
-                if since is not None:
-                    rows = [r for r in rows if r[0] >= since]
-                return [list(r) for r in rows[:min(limit or self.cap, self.cap)]]
+                n = min(limit or self.cap, self.cap)
+                if since is None:
+                    return [list(r) for r in self.bars[-n:]]
+                return [list(r) for r in
+                        [r for r in self.bars if r[0] >= since][:n]]
 
         feed = bare_feed(Honest(), page_limit=1000)
-        self.assertEqual(len(feed.fetch_ohlcv("BTC/USDT", "1h", 1085)), 1085)
+        closed = feed.fetch_ohlcv("BTC/USDT", "1h", 1085).drop_unclosed(now_ms(), 0)
+        self.assertGreaterEqual(len(closed), 1085)
 
     def test_a_mid_page_failure_keeps_what_was_already_collected(self):
         class Flaky(KrakenLikeClient):
@@ -221,7 +262,14 @@ class TestPagingReachesTheRequiredDepth(unittest.TestCase):
 
         feed = bare_feed(Flaky())
         series = feed.fetch_ohlcv("BTC/USDT", "1h", 1085)
-        self.assertEqual(len(series), 720, "partial history beats no history")
+        self.assertGreater(len(series), 0, "partial history beats no history")
+        # WHICH bars survive matters more than how many. Paging backwards from
+        # the present means a failure costs the OLDEST history, never the
+        # newest -- the opposite trade to paging forwards, and the right one:
+        # a short recent series is usable, a long stale one is not.
+        self.assertEqual(int(series.open_ms[-1]), feed.client.bars[-1][0],
+                         "the live edge survives a mid-page failure")
+        self.assertTrue(series.is_sane(), "no hole spliced into what survived")
 
     def test_a_first_page_failure_is_still_an_error(self):
         from crypto_edge.data.feed import DataUnavailable
@@ -236,7 +284,7 @@ class TestPagingReachesTheRequiredDepth(unittest.TestCase):
     def test_4h_paging_works_at_its_own_step(self):
         feed = bare_feed(KrakenLikeClient(step=4 * HOUR, total_bars=3000))
         series = feed.fetch_ohlcv("BTC/USDT", "4h", 900)
-        self.assertEqual(len(series), 900)
+        self.assertGreaterEqual(len(series.drop_unclosed(now_ms(), 0)), 900)
         self.assertTrue(np.all(np.diff(series.open_ms) == 4 * HOUR))
 
 

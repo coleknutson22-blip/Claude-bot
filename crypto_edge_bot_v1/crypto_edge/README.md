@@ -252,6 +252,25 @@ The 24h volume floor is **notional traded in the selected quote currency**, so
 warning: the stored equity, fills and history are still denominated in the
 *old* currency, and the bot will not silently mix the two.
 
+**Candle freshness is measured from the CLOSE.** CCXT delivers candle *open*
+timestamps: a 1h bar stamped `03:00` spans `03:00 -> 04:00` and is only complete
+at `04:00`. Every staleness figure the bot reports is `now - close`, so a 1h and
+a 4h series that are both current read as equally fresh. The allowance is one
+timeframe plus five minutes, which is what "at most one bar behind" means.
+
+**Cycle pacing.** Cycles never overlap and never queue: `run()` is
+single-threaded and finishes one cycle before timing the next. If a cycle takes
+longer than `poll_seconds` the bot slows down rather than looping back to back —
+the realised cadence is `max(poll_seconds, cycle + min_pause_seconds)`, the
+overrun is logged, and the heartbeat says how far behind it is.
+
+**Candle caching.** A closed candle never changes, so the feed keeps
+`ohlcv_cache_bars` of them per symbol and timeframe and goes back to the venue
+only when a new candle has actually closed — not on a timer. Between bar closes
+a cycle makes zero OHLCV requests; a bar close costs one request per series. The
+candle in progress is never cached, and if the refresh fails the fetch fails
+closed rather than serving what it already has.
+
 To see exactly which markets survive each gate and why:
 
 ```bash
@@ -269,7 +288,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 563 automated tests, all passing
+### VERIFIED OFFLINE — 633 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -347,7 +366,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               563 tests
+tests/               633 tests
 ```
 
 ## Safety notes

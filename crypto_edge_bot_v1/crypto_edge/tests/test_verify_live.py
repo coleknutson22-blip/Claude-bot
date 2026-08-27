@@ -344,5 +344,102 @@ class TestReportRendering(unittest.TestCase):
         self.assertIn("do not run continuously", rep.render_summary())
 
 
+class TestSummaryCannotContradictItsOwnChecks(unittest.TestCase):
+    """DEFECT: the detail section said FAIL and the summary said OK.
+
+    A real Kraken/USD run printed
+
+        [FAIL] data freshness (1h)
+        ...
+        BTC 1H DATA STATUS             OK (300 rows, 1 unclosed dropped, ...)
+
+    because `rep.facts["btc_1h"]` was assigned the string "OK (...)"
+    unconditionally, further down the same function that had just recorded the
+    failure. The summary is the part of the report written to be trusted -- an
+    operator scrolls to it precisely so they do not have to audit every line --
+    so a summary that disagrees with the checks is worse than no summary.
+
+    The fix is structural: summary lines are DERIVED from the recorded checks
+    via `VerifyReport.fact()`, so the two cannot drift apart again. These tests
+    hold that structure in place rather than the one call site that was wrong.
+    """
+
+    def test_a_failed_critical_check_overrules_an_ok_fact(self):
+        rep = VerifyReport()
+        rep.facts["btc_1h"] = "OK (405 rows, 1 unclosed dropped)"
+        quiet(rep.add, "data freshness (1h)", False, "118.5 min behind",
+              topic="btc_1h")
+        line = [ln for ln in rep.render_summary().splitlines()
+                if "BTC 1H DATA STATUS" in ln][0]
+        self.assertNotIn("OK", line, "the summary must not claim OK")
+        self.assertIn("FAILED", line)
+        self.assertIn("data freshness (1h)", line, "and must name the check")
+
+    def test_the_summary_names_every_failed_check_for_that_dataset(self):
+        rep = VerifyReport()
+        rep.facts["btc_4h"] = "OK"
+        quiet(rep.add, "data freshness (4h)", False, "", topic="btc_4h")
+        quiet(rep.add, "timestamps sane (4h)", False, "", topic="btc_4h")
+        line = [ln for ln in rep.render_summary().splitlines()
+                if "BTC 4H DATA STATUS" in ln][0]
+        self.assertIn("data freshness (4h)", line)
+        self.assertIn("timestamps sane (4h)", line)
+
+    def test_a_passing_dataset_still_reports_its_fact(self):
+        rep = VerifyReport()
+        rep.facts["btc_1h"] = "OK (405 rows)"
+        quiet(rep.add, "data freshness (1h)", True, "", topic="btc_1h")
+        line = [ln for ln in rep.render_summary().splitlines()
+                if "BTC 1H DATA STATUS" in ln][0]
+        self.assertIn("OK (405 rows)", line)
+
+    def test_a_failure_on_another_dataset_does_not_leak_across(self):
+        rep = VerifyReport()
+        rep.facts["btc_1h"] = "OK (1h fine)"
+        rep.facts["btc_4h"] = "OK (4h fine)"
+        quiet(rep.add, "data freshness (4h)", False, "", topic="btc_4h")
+        summary = rep.render_summary()
+        one = [ln for ln in summary.splitlines() if "BTC 1H DATA" in ln][0]
+        four = [ln for ln in summary.splitlines() if "BTC 4H DATA" in ln][0]
+        self.assertIn("OK (1h fine)", one, "1h passed and must still say so")
+        self.assertIn("FAILED", four)
+
+    def test_a_warning_does_not_overrule_the_fact(self):
+        """Only CRITICAL failures invalidate a dataset; warnings are advisory."""
+        from crypto_edge.verify_live import INFO
+        rep = VerifyReport()
+        rep.facts["btc_1h"] = "OK (405 rows)"
+        quiet(rep.add, "something advisory", False, "", severity=INFO,
+              topic="btc_1h")
+        line = [ln for ln in rep.render_summary().splitlines()
+                if "BTC 1H DATA STATUS" in ln][0]
+        self.assertIn("OK (405 rows)", line)
+
+    def test_the_verdict_and_the_summary_lines_agree(self):
+        """If any line says FAILED, the verdict must not say all checks passed."""
+        rep = VerifyReport()
+        rep.facts["btc_1h"] = "OK"
+        quiet(rep.add, "data freshness (1h)", False, "", topic="btc_1h")
+        summary = rep.render_summary()
+        self.assertIn("FAILED", summary)
+        self.assertNotIn("ALL CRITICAL CHECKS PASSED", summary)
+        self.assertFalse(rep.passed)
+
+    def test_every_summary_topic_is_reachable_from_a_check(self):
+        """A topic string typo would silently disable this protection.
+
+        Each fact key rendered in the summary must be one that some check in
+        verify_live actually tags, otherwise `fact()` can never overrule it.
+        """
+        import inspect
+
+        import crypto_edge.verify_live as vl
+        src = inspect.getsource(vl)
+        for key in ("btc_1h", "btc_4h"):
+            self.assertIn(f'topic=label', src,
+                          "candle checks must be tagged with their fact key")
+            self.assertIn(key, src)
+
+
 if __name__ == "__main__":
     unittest.main()

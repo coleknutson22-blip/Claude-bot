@@ -79,6 +79,10 @@ class EngineStatus:
     halted: bool = False
     halt_reason: str = ""
     data_errors: int = 0
+    last_cycle_seconds: float = 0.0
+    slowest_cycle_seconds: float = 0.0
+    consecutive_overruns: int = 0
+    next_cycle_ms: int = 0
 
 
 class TradingEngine:
@@ -716,7 +720,10 @@ class TradingEngine:
                 btc_regime=self.status.btc_regime, breadth=self.status.breadth,
                 signals_evaluated=self.status.signals_evaluated,
                 last_data_ms=self.status.last_data_ms or now_ms(),
-                halted=self.status.halted),
+                halted=self.status.halted,
+                cycle_s=self.status.last_cycle_seconds,
+                poll_s=float(self.cfg.engine.poll_seconds),
+                overruns=self.status.consecutive_overruns),
             kind="heartbeat")
 
     def _daily_report(self, date: str) -> None:
@@ -790,6 +797,35 @@ class TradingEngine:
             self.rank_and_enter(signals, ctx)
         self.bookkeeping()
 
+    def pause_after_cycle(self, elapsed: float) -> float:
+        """Seconds to wait before starting the next cycle. NEVER ZERO.
+
+        Cycles cannot overlap -- `run` is single-threaded and calls `cycle()`
+        to completion before looking at the clock -- so there is no queue to
+        drain and no possibility of two cycles touching the database at once.
+        What CAN go wrong is subtler: the old code slept
+        `max(0, poll_seconds - elapsed)`, which for a cycle slower than the poll
+        interval is exactly zero. An 11-symbol Kraken cycle measured 74.6s
+        against a 30s interval, so the bot ran flat out with no gap between
+        requests, no CPU idle, and nothing anywhere saying it was behind. That
+        is how a paper bot earns a rate-limit ban.
+
+        A floor on the pause converts "as fast as possible" into a slower but
+        honest cadence of max(poll_seconds, elapsed + min_pause_seconds), and
+        the overrun is logged with the time the next cycle will start.
+        """
+        poll = float(self.cfg.engine.poll_seconds)
+        floor = max(0.0, float(getattr(self.cfg.engine, "min_pause_seconds", 0.0)))
+        if elapsed > poll:
+            self.status.consecutive_overruns += 1
+            log_event("app", "WARNING", "cycle slower than poll interval",
+                      cycle_seconds=round(elapsed, 1), poll_seconds=poll,
+                      pausing_seconds=round(floor, 1),
+                      consecutive=self.status.consecutive_overruns)
+            return floor
+        self.status.consecutive_overruns = 0
+        return max(floor, poll - elapsed)
+
     def run(self, max_cycles: int | None = None, sleep=time.sleep) -> None:
         self._running = True
         n = 0
@@ -803,10 +839,16 @@ class TradingEngine:
                 log_event("app", "ERROR", "cycle failed", error=str(e))
                 self.notifier.send_error("engine cycle", str(e))
             n += 1
-            if max_cycles is not None and n >= max_cycles:
-                break
             elapsed = time.time() - start
-            sleep(max(0.0, self.cfg.engine.poll_seconds - elapsed))
+            self.status.last_cycle_seconds = elapsed
+            self.status.slowest_cycle_seconds = max(
+                self.status.slowest_cycle_seconds, elapsed)
+            if max_cycles is not None and n >= max_cycles:
+                self.status.next_cycle_ms = 0
+                break
+            pause = self.pause_after_cycle(elapsed)
+            self.status.next_cycle_ms = now_ms() + int(pause * 1000)
+            sleep(pause)
 
     def stop(self) -> None:
         self._running = False

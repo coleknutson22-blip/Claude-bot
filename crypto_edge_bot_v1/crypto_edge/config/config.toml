@@ -25,6 +25,9 @@ rate_limit_ms = 250
 # the filters stricter -- it would make them unsatisfiable, rejecting every
 # symbol for history it was never given the chance to supply.
 ohlcv_limit = 300
+# Closed candles held in memory per symbol+timeframe. A closed candle never
+# changes, so no request is made until a new one actually closes. 0 disables.
+ohlcv_cache_bars = 2000
 max_history_bars = 2000   # safety ceiling on paging; startup FAILS if this is
                           # below what the filters need, rather than silently
                           # rejecting everything
@@ -189,6 +192,10 @@ outbox_retention_days = 30   # how long DELIVERED rows are kept
 
 [engine]
 poll_seconds = 30
+# Never run cycles back to back. If a cycle takes longer than poll_seconds the
+# next one still waits this long, so an overrunning bot slows down instead of
+# hammering the exchange. Realised cadence: max(poll_seconds, cycle + this).
+min_pause_seconds = 5.0
 db_path = "data/crypto_edge.db"
 log_dir = "logs"
 equity_snapshot_minutes = 15

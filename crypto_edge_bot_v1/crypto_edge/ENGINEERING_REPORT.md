@@ -98,7 +98,7 @@ message text (defect 2 above), not a wrong severity.
 
 ## TEST RESULTS
 
-**563 tests, all passing.** Run: `python -m crypto_edge.cli test`
+**633 tests, all passing.** Run: `python -m crypto_edge.cli test`
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -117,13 +117,15 @@ message text (defect 2 above), not a wrong severity.
 | `test_selfcheck.py` | 12 | Fail-closed behaviour, critical vs warning, log severity |
 | `test_live_adapter.py` | 45 | CCXT precision modes and tick rounding, quote-timestamp provenance, OHLCV parsing |
 | `test_symbol_collisions.py` | 26 | Ticker collisions, identity-based resolution, overrides, cached ambiguity |
-| `test_verify_live.py` | 26 | The live-verification harness itself, including credential masking |
+| `test_verify_live.py` | 33 | The live-verification harness itself, credential masking, summary cannot contradict its own checks |
 | `test_windows_operability.py` | 28 | UTF-8 BOM in `.env`, redirected output encoding, exchange override, unreachable-venue reporting |
 | `test_repository_integrity.py` | 8 | Every module is committed and importable; no source file is gitignored |
 | `test_exchange_consistency.py` | 25 | One effective venue across config, feed, selfcheck, status, report and Telegram |
 | `test_history_acquisition.py` | 27 | Paged OHLCV depth, venue caps, indicator depth decoupled from age |
 | `test_market_age.py` | 26 | Age sources and priority, monotonic evidence, unverifiable vs young, persistence |
 | `test_volume_semantics.py` | 18 | Quote-currency derivation, missing-is-not-zero, threshold unchanged |
+| `test_candle_freshness.py` | 30 | Freshness measured from the close, the CCXT head-truncation regression, boundary cases, genuinely stale data, incomplete-candle removal |
+| `test_cycle_pacing.py` | 33 | Cycles never overlap, no backlog, no zero-pause hot loop, closed-candle cache correctness and fail-closed |
 | `test_quote_currency.py` | 28 | Quote currency as one source of truth: BTC reference, always-include, volume units, provenance on change, no threshold moved |
 
 The tests worth singling out, because they are the ones that would catch a real
@@ -301,7 +303,7 @@ live but query tables no production code writes to. **A news event cannot
 currently stop a trade, and no funding or open-interest data is being
 recorded.** See the status table in the README.
 
-**7. Synthetic test data is a limited proxy.** 563 passing tests prove the
+**7. Synthetic test data is a limited proxy.** 633 passing tests prove the
 system is internally consistent and behaves correctly against data I generated.
 They cannot prove it behaves correctly against data reality generates.
 

@@ -53,7 +53,9 @@ def _bootstrap(args, need_feed: bool = True):
         feed = CCXTFeed(cfg.exchange.name, cfg.exchange.quote,
                         cfg.exchange.rate_limit_ms,
                         quote_ts_fallback=cfg.execution.quote_ts_fallback,
-                        page_limit=cfg.exchange.ohlcv_limit)
+                        page_limit=cfg.exchange.ohlcv_limit,
+                        close_buffer_ms=cfg.safety.candle_close_buffer_s * 1000,
+                        cache_bars=cfg.exchange.ohlcv_cache_bars)
     return cfg, repo, feed, notifier
 
 
@@ -123,7 +125,9 @@ def cmd_start(args) -> int:
     signal.signal(signal.SIGINT, _graceful)
     signal.signal(signal.SIGTERM, _graceful)
 
-    print(f"\nPAPER TRADING ACTIVE — polling every {cfg.engine.poll_seconds}s. "
+    print(f"\nPAPER TRADING ACTIVE — polling every {cfg.engine.poll_seconds}s "
+          f"(minimum {cfg.engine.min_pause_seconds:.0f}s between cycles; a cycle "
+          f"slower than the interval slows the cadence, it never overlaps). "
           f"Ctrl-C to stop safely.")
     engine.run(max_cycles=args.max_cycles)
     print("Stopped. State persisted; restart resumes exactly where it left off.")

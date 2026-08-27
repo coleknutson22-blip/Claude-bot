@@ -34,7 +34,7 @@ import time
 
 from ..logging_setup import log_event
 from ..models import TS_LOCAL, TS_VENUE, MarketMeta, Quote, Series
-from ..timeutils import now_ms, tf_ms
+from ..timeutils import last_closed_open_ms, now_ms, tf_ms
 from .feed import DataUnavailable
 
 # CCXT precision-mode constants, restated so this module can interpret market
@@ -93,7 +93,8 @@ class CCXTFeed:
     def __init__(self, exchange: str = "binance", quote: str = "USDT",
                  rate_limit_ms: int = 250, timeout_s: int = 20,
                  quote_ts_fallback: str = "local",
-                 page_limit: int = 300) -> None:
+                 page_limit: int = 300, close_buffer_ms: int = 0,
+                 cache_bars: int = 0) -> None:
         """`quote_ts_fallback` controls what happens when a venue ticker has no
         timestamp: "local" stamps it with receive time and flags it as such,
         "reject" discards the quote entirely (fails closed for entries)."""
@@ -121,9 +122,64 @@ class CCXTFeed:
         # observability for the quote-timestamp policy (see cli verify-live)
         self.quote_ts_venue = 0
         self.quote_ts_local = 0
+        # closed-candle cache (see fetch_ohlcv)
+        self.close_buffer_ms = int(close_buffer_ms)
+        self.cache_bars = int(cache_bars)
+        self._ohlcv_cache: dict[tuple, list] = {}
+        self.cache_hits = 0
+        self.cache_refreshes = 0
+        self.cache_bootstraps = 0
 
     def _sleep(self) -> None:
         time.sleep(self.rate_limit_ms / 1000.0)
+
+    # --------------------------------------------------------- candle cache
+    def _cache(self) -> dict:
+        cache = getattr(self, "_ohlcv_cache", None)
+        if cache is None:
+            cache = self._ohlcv_cache = {}
+        return cache
+
+    def _closed_rows(self, rows: list, step: int, now: int) -> list:
+        """Rows whose candle has genuinely finished, buffer included."""
+        buf = int(getattr(self, "close_buffer_ms", 0) or 0)
+        return [r for r in rows if r[0] + step + buf <= now]
+
+    def _fetch_recent_page(self, symbol: str, timeframe: str) -> list:
+        """ONE request for the venue's most recent window.
+
+        No `since`, deliberately: CCXT's `filter_by_since_limit` only slices
+        oldest-first when `since` is given, so a since-less request comes back
+        as `array[-limit:]` -- the NEWEST rows -- on every venue.
+        """
+        page = max(2, int(self.page_limit))
+        try:
+            batch = self.client.fetch_ohlcv(symbol, timeframe=timeframe,
+                                            since=None, limit=page)
+        except Exception as e:
+            raise DataUnavailable(
+                f"fetch_ohlcv {symbol} {timeframe} refresh failed: {e}") from e
+        rows = sorted((r for r in batch if _row_ok(r)), key=lambda r: r[0])
+        return self._contiguous_tail(rows, tf_ms(timeframe))
+
+    def _store_candles(self, key: tuple, closed_rows: list) -> None:
+        """Keep CLOSED bars only, capped, so the cache cannot hold a live bar.
+
+        The candle currently in progress changes on every tick. Storing it and
+        serving it later is precisely the "old data masquerading as current"
+        failure, so it never enters the cache -- it is passed straight through
+        from the request that fetched it and then forgotten.
+        """
+        if not closed_rows:
+            return
+        cap = max(1, int(getattr(self, "cache_bars", 0) or 0))
+        self._cache()[key] = closed_rows[-cap:]
+
+    def ohlcv_cache_stats(self) -> dict:
+        return {"series": len(self._cache()),
+                "hits": getattr(self, "cache_hits", 0),
+                "refreshes": getattr(self, "cache_refreshes", 0),
+                "bootstraps": getattr(self, "cache_bootstraps", 0)}
 
     # ------------------------------------------------------------- markets
     def load_markets(self) -> dict[str, MarketMeta]:
@@ -180,39 +236,140 @@ class CCXTFeed:
         it actually is. So we page backwards with `since` until we have what was
         asked for or the venue genuinely runs out.
         """
-        rows = self._fetch_ohlcv_paged(symbol, timeframe, limit)
-        if not rows:
-            raise DataUnavailable(f"empty OHLCV for {symbol} {timeframe}")
-        clean = [r for r in rows
-                 if r and len(r) >= 6 and all(v is not None for v in r[:6])]
-        if len(clean) != len(rows):
-            log_event("data", "WARNING", "dropped malformed OHLCV rows",
-                      symbol=symbol, timeframe=timeframe,
-                      dropped=len(rows) - len(clean), kept=len(clean))
+        want = max(1, int(limit))
+        step = tf_ms(timeframe)
+        now = now_ms()
+        key = (symbol, timeframe)
+        cache = self._cache()
+        cached = cache.get(key)
+        enabled = int(getattr(self, "cache_bars", 0) or 0) > 0
+
+        # The newest candle that COULD have finished by now. This, not a
+        # time-to-live, is what decides whether the cache is current: a closed
+        # candle is immutable, so while no newer one exists the cached series
+        # IS the present state of the market and re-downloading it would return
+        # byte-identical data.
+        newest_possible = last_closed_open_ms(
+            timeframe, now, int(getattr(self, "close_buffer_ms", 0) or 0))
+
+        clean: list | None = None
+        if enabled and cached and len(cached) >= want:
+            if cached[-1][0] >= newest_possible:
+                self.cache_hits += 1
+                clean = cached[-want:]
+            else:
+                # A candle has closed since we last looked: one request for the
+                # newest page, merged onto what we hold. If the fresh page does
+                # not JOIN the cache the merge is abandoned rather than spliced
+                # across the hole, and we bootstrap from scratch instead.
+                fresh = self._fetch_recent_page(symbol, timeframe)
+                merged = {r[0]: r for r in cached}
+                merged.update({r[0]: r for r in fresh})
+                joined = self._contiguous_tail(
+                    [merged[k] for k in sorted(merged)], step)
+                closed = self._closed_rows(joined, step, now)
+                if len(closed) >= want:
+                    self.cache_refreshes += 1
+                    self._store_candles(key, closed)
+                    live = [r for r in joined if r[0] > closed[-1][0]]
+                    clean = closed[-want:] + live[:1]
+
+        if clean is None:
+            if enabled:
+                self.cache_bootstraps += 1
+            clean = self._fetch_ohlcv_paged(symbol, timeframe, want)
+            if enabled and clean:
+                self._store_candles(
+                    key, self._closed_rows(clean, step, now))
+
         if not clean:
-            raise DataUnavailable(
-                f"all OHLCV rows for {symbol} {timeframe} were malformed")
+            raise DataUnavailable(f"empty OHLCV for {symbol} {timeframe}")
         try:
             return Series.from_ohlcv(symbol, timeframe, [list(r[:6]) for r in clean])
         except (TypeError, ValueError) as e:
             raise DataUnavailable(
                 f"unparseable OHLCV for {symbol} {timeframe}: {e}") from e
 
-    def _fetch_ohlcv_paged(self, symbol: str, timeframe: str, want: int) -> list:
-        """Accumulate `want` candles, oldest-first, across as many requests as
-        the venue needs. Returns whatever it managed to get."""
+    @staticmethod
+    def _contiguous_tail(rows: list, step: int) -> list:
+        """The longest run of evenly spaced bars ending at the NEWEST one.
+
+        A page that comes back truncated leaves a hole in the middle of the
+        history. Splicing across that hole would hand the indicators a series
+        whose bars are not the interval they claim to be, so the hole is cut
+        away instead and only the unbroken recent run is kept. Short but honest
+        beats long but wrong, and the depth check downstream sees the shortfall.
+        """
+        if len(rows) < 2:
+            return rows
+        cut = 0
+        for i in range(len(rows) - 1, 0, -1):
+            if rows[i][0] - rows[i - 1][0] != step:
+                cut = i
+                break
+        return rows[cut:]
+
+    def _fetch_ohlcv_paged(self, symbol: str, timeframe: str, want: int,
+                           since_ms: int | None = None) -> list:
+        """Accumulate `want` closed candles plus the in-progress one, oldest-first.
+
+        WHY THE FIRST REQUEST CARRIES NO `since`
+        ----------------------------------------
+        CCXT truncates from the WRONG END when `since` and `limit` are both
+        given. `Exchange.filter_by_since_limit` sets
+        `shouldFilterFromStart = not tail and sinceIsDefined`, and
+        `filter_by_limit` then returns `array[0:limit]` -- the OLDEST `limit`
+        rows of the response, discarding the newest. With `since` absent it
+        returns `array[-limit:]` instead: the newest.
+
+        The previous implementation reached back `(want + 2)` bars "for safety"
+        and passed `limit=page`. On Kraken, which returns every bar from `since`
+        to the present, that produced `want + 2` rows which CCXT cut to the
+        oldest `want`. The two rows discarded were the in-progress candle AND
+        THE MOST RECENTLY CLOSED ONE, so the freshest candle the strategy could
+        ever see was a full bar behind reality -- 118 minutes stale on a 1h
+        series, 298 on a 4h series, with no error raised anywhere. The safety
+        margin was taken off the end that mattered.
+
+        Binance hid it: it honours `limit` server-side and returns exactly
+        `limit` rows, so the slice was a no-op there.
+
+        So: the newest page is fetched FIRST and WITHOUT `since`, which every
+        venue answers with its most recent bars. Older history is then walked
+        backwards in spans no wider than the venue will actually return, and
+        `_contiguous_tail` guarantees the result has no holes.
+        """
         step = tf_ms(timeframe)
         want = max(1, int(want))
-        page = max(1, int(self.page_limit))
-        # Reach back a little further than needed: venues round `since` to their
-        # own bar boundaries and some drop the first partial bar.
-        since = now_ms() - (want + 2) * step
+        page = max(2, int(self.page_limit))
+        now = now_ms()
+        # Two extra bars. One covers the candle currently in progress, which is
+        # fetched and then discarded by the caller's drop_unclosed(). The second
+        # covers the close BUFFER: for the ~20s after a candle closes it is not
+        # yet trusted, and without the margin the usable depth dips one bar
+        # below the requirement on every single bar boundary -- briefly
+        # un-tradable for a reason that has nothing to do with the market.
+        need = want + 2
+        oldest_wanted = (since_ms if since_ms is not None
+                         else now - need * step)
+
         by_open: dict[int, list] = {}
         pages = 0
-        max_pages = max(1, math.ceil(want / page) + 3)
+        dropped_malformed = 0
+        max_pages = max(1, math.ceil(need / (page - 1)) + 3)
+        # What the venue will actually put in one response. Starts optimistic
+        # and is lowered to whatever the venue demonstrates it will return, so
+        # later spans never ask for more than fits and get head-truncated.
+        capacity = page
+        anchor: int | None = None          # None == "the present"
 
         while pages < max_pages:
             pages += 1
+            since = None
+            if anchor is not None:
+                # A span of at most `capacity` bars ending at `anchor`, so
+                # CCXT's oldest-first slice has nothing to discard.
+                since = max(anchor - (capacity - 1) * step, oldest_wanted - step)
             try:
                 batch = self.client.fetch_ohlcv(symbol, timeframe=timeframe,
                                                 since=since, limit=page)
@@ -226,27 +383,41 @@ class CCXTFeed:
                     f"fetch_ohlcv {symbol} {timeframe} failed: {e}") from e
             if not batch:
                 break
+            if len(batch) < capacity:
+                # The venue caps responses lower than we assumed. Believe it.
+                capacity = max(2, len(batch))
 
             before = len(by_open)
             for row in batch:
-                if row and len(row) >= 6 and row[0] is not None:
+                if _row_ok(row):
                     by_open[int(row[0])] = row
-            # No NEW bars means the venue has nothing further; stop rather than
-            # spin. This is the guard that makes the loop always terminate.
+                else:
+                    dropped_malformed += 1
+            # No NEW bars means the venue has nothing further -- it has hit its
+            # own history cap. Stop rather than spin: this is the guard that
+            # makes the loop always terminate.
             if len(by_open) == before:
                 break
-            newest = max(by_open)
-            if len(by_open) >= want or newest + step >= now_ms():
+
+            usable = self._contiguous_tail([by_open[k] for k in sorted(by_open)], step)
+            if usable[0][0] <= oldest_wanted or len(usable) >= need:
                 break
-            since = newest + step
+            anchor = usable[0][0] - step
             self._sleep()
 
-        ordered = [by_open[k] for k in sorted(by_open)]
-        if len(ordered) < want:
+        if dropped_malformed:
+            log_event("data", "WARNING", "dropped malformed OHLCV rows",
+                      symbol=symbol, timeframe=timeframe,
+                      dropped=dropped_malformed, kept=len(by_open))
+        # Malformed rows are removed BEFORE the contiguity cut, so a single bad
+        # row is treated as the hole it really is rather than being spliced over.
+        ordered = self._contiguous_tail(
+            [by_open[k] for k in sorted(by_open)], step)
+        if len(ordered) < need:
             log_event("data", "DEBUG", "venue supplied less history than requested",
                       symbol=symbol, timeframe=timeframe,
                       wanted=want, got=len(ordered), pages=pages)
-        return ordered[-want:]
+        return ordered[-need:]
 
     def fetch_quote(self, symbol: str) -> Quote | None:
         try:
@@ -315,6 +486,11 @@ def _resolve_quote_ts(raw) -> tuple[int, str]:
     if abs(now - ts) > 86_400_000:
         return now, TS_LOCAL
     return ts, TS_VENUE
+
+
+def _row_ok(row) -> bool:
+    """One definition of a usable OHLCV row, used everywhere it matters."""
+    return bool(row) and len(row) >= 6 and all(v is not None for v in row[:6])
 
 
 def _num(v) -> float:
