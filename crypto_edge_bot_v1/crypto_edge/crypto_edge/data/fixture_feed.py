@@ -32,8 +32,8 @@ class FixtureFeed:
             return self._markets
         out = {}
         for (sym, _tf) in self._series:
-            base = sym.split("/")[0]
-            out[sym] = MarketMeta(sym, base, "USDT", True, 6, 4, 0.0, 10.0)
+            base, _, quote = sym.partition("/")
+            out[sym] = MarketMeta(sym, base, quote or "USDT", True, 6, 4, 0.0, 10.0)
         self._markets = out
         return out
 

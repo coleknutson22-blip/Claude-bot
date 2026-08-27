@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 from .config import Config, load_config
+from .data.feed import DataUnavailable
 from .logging_setup import log_event, setup_logging
 from .notify.telegram import TelegramNotifier
 from .performance import PerformanceCalculator
@@ -63,9 +64,14 @@ def _warn_if_venue_changed(cfg: Config, repo: Repo) -> None:
     except Exception:
         return
     if changed:
-        print(f"  !! THIS DATABASE WAS LAST USED WITH {previous}, NOW "
+        prev_venue, _, prev_quote = previous.partition("/")
+        what = "QUOTE CURRENCY" if prev_venue == cfg.exchange.name else "EXCHANGE"
+        print(f"  !! {what} CHANGED: last used with {previous}, now "
               f"{cfg.exchange_label()}")
         print(f"  !! Its positions and history came from {previous}.")
+        if prev_quote and prev_quote != cfg.quote_currency:
+            print(f"  !! Equity and fills below are denominated in {prev_quote}, "
+                  f"NOT {cfg.quote_currency}.")
 
 
 def _broad_service(cfg: Config, repo: Repo):
@@ -478,6 +484,75 @@ def _force_utf8_output() -> None:
             pass          # very old Python or an unusual stream; not fatal
 
 
+def _network_error_types() -> tuple:
+    """Exception types that mean 'could not reach the venue', not 'bug'.
+
+    Deliberately narrow. A programming error must still surface as a traceback
+    -- swallowing those would hide real defects behind a friendly message.
+    """
+    types: list[type] = [OSError]          # covers socket / TLS handshake failures
+    try:
+        import ccxt
+        types.append(ccxt.NetworkError)
+    except Exception:
+        pass
+    try:
+        import requests
+        types.append(requests.exceptions.RequestException)
+    except Exception:
+        pass
+    return tuple(types)
+
+
+def _caused_by_network(exc: BaseException) -> bool:
+    """Walk the cause chain: was a data failure really a connectivity failure?
+
+    DataUnavailable is raised both for 'the socket never opened' and for
+    'the venue answered, but the answer was not usable'. Telling an operator to
+    check their firewall when the venue simply had no candles would send them
+    chasing the wrong problem, so the distinction is made from the cause chain
+    rather than guessed from the message text.
+    """
+    net = _network_error_types()
+    seen, cur = set(), exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, net):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _report_unreachable(cmd: str, exc: BaseException) -> None:
+    """What a non-developer needs: what failed, and what to try."""
+    detail = str(exc).strip() or exc.__class__.__name__
+    if len(detail) > 300:
+        detail = detail[:300] + "..."
+    network = _caused_by_network(exc)
+    headline = ("COULD NOT REACH THE EXCHANGE" if network
+                else "COULD NOT GET USABLE MARKET DATA")
+    print()
+    print("=" * 72)
+    print(f"{headline} -- '{cmd}' did not complete")
+    print("=" * 72)
+    print(f"  {detail}")
+    print()
+    print("  This is a data failure, not a result. Nothing above should be")
+    print("  read as a finding about the market.")
+    print()
+    if network:
+        print("  Common causes, in the order worth checking:")
+        print("    1. No internet connection on this machine.")
+        print("    2. A corporate VPN, firewall or proxy blocking the venue.")
+        print("    3. The exchange is unreachable from your country.")
+        print("    4. The venue is having an outage -- try again shortly.")
+    else:
+        print("  The venue was reachable but did not return data this run.")
+        print("  Re-run the command; if it repeats, the detail line above")
+        print("  names the request that failed.")
+    print("=" * 72)
+
+
 def main(argv=None) -> int:
     _force_utf8_output()
     args = build_parser().parse_args(argv)
@@ -485,7 +560,17 @@ def main(argv=None) -> int:
         os.environ["CRYPTO_EDGE_EXCHANGE"] = args.exchange
     if getattr(args, "quote", None):
         os.environ["CRYPTO_EDGE_QUOTE"] = args.quote
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\n  stopped")
+        return 130
+    except _network_error_types() as exc:
+        _report_unreachable(getattr(args, "cmd", "command"), exc)
+        return 2
+    except DataUnavailable as exc:
+        _report_unreachable(getattr(args, "cmd", "command"), exc)
+        return 2
 
 
 if __name__ == "__main__":

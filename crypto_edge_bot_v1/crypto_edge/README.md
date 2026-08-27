@@ -230,11 +230,32 @@ python -m crypto_edge.cli verify-live --cycle
 python -m crypto_edge.cli verify-restart
 ```
 
-Switching venue never requires editing a file — pass `--exchange` (or set
-`CRYPTO_EDGE_EXCHANGE`):
+Switching venue never requires editing a file — pass `--exchange` and
+`--quote` (or set `CRYPTO_EDGE_EXCHANGE` / `CRYPTO_EDGE_QUOTE`):
 
 ```bash
-python -m crypto_edge.cli --exchange kraken verify-live --cycle
+python -m crypto_edge.cli --exchange kraken --quote USD verify-live --cycle
+```
+
+**Quote currency is part of the venue, not a detail.** `kraken/USD` and
+`kraken/USDT` are different markets with different liquidity: on Kraken the USD
+book is the deep one, and no USDT pair cleared the $5M 24h floor in an August
+2026 snapshot. `exchange.quote` is the single source of truth — the BTC regime
+reference (`BTC/USD` vs `BTC/USDT`), the always-included markets, every symbol
+built for a ranked asset, and the units of the 24h volume floor are all derived
+from it. Pinning `strategy.btc_symbol` or `universe.always_include` to a
+different currency is a startup error, not a silent mismatch.
+
+The 24h volume floor is **notional traded in the selected quote currency**, so
+`$5,000,000` means 5,000,000 USD on `kraken/USD` and 5,000,000 USDT on
+`kraken/USDT`. Changing quote currency on an existing database prints a loud
+warning: the stored equity, fills and history are still denominated in the
+*old* currency, and the bot will not silently mix the two.
+
+To see exactly which markets survive each gate and why:
+
+```bash
+python -m crypto_edge.cli --exchange kraken --quote USD diagnose
 ```
 
 `verify-live` opens no positions and contains no order code. It reports the
@@ -248,7 +269,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 527 automated tests, all passing
+### VERIFIED OFFLINE — 563 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -326,7 +347,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               527 tests
+tests/               563 tests
 ```
 
 ## Safety notes

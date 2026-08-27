@@ -107,7 +107,9 @@ class Backtester:
         n_bars = min(len(series_1h[s]) for s in symbols)
         res.bars = n_bars
         bar_ms = tf_ms(cfg.strategy.entry_timeframe)
-        meta = MarketMeta("x", "X", "USDT", True, 8, 8, 0.0, 0.0)
+        # Synthetic sizing metadata. The quote currency follows the config so a
+        # backtest of a USD venue is not silently labelled USDT.
+        meta = MarketMeta("x", "X", cfg.exchange.quote, True, 8, 8, 0.0, 0.0)
         warm = cfg.strategy.warmup_bars
 
         # precompute ATR per symbol on the FULL series; index i only ever reads

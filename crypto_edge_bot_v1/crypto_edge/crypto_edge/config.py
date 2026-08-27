@@ -77,7 +77,13 @@ class UniverseCfg:
     wrapped_markers: list[str] = field(default_factory=lambda: [
         "WBTC", "WETH", "WBETH", "STETH", "WSTETH", "CBETH", "RETH", "BETH",
         "SAVAX", "STSOL", "MSOL", "JITOSOL"])
-    always_include: list[str] = field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
+    # Configured as BASE assets, not pairs: the pair is base + whatever quote
+    # currency this venue is being operated in. Hardcoding "BTC/USDT" here made
+    # the whole always-include list silently wrong on a USD venue.
+    always_include_bases: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
+    # Derived from always_include_bases + the effective quote at load time.
+    # Setting it explicitly in the TOML overrides that, and is validated.
+    always_include: list[str] = field(default_factory=list)
     blacklist: list[str] = field(default_factory=list)
     # --- broad (venue-independent) asset universe ------------------------
     # "Top 200" means the top ~200 legitimate crypto ASSETS by market cap,
@@ -135,7 +141,12 @@ class StrategyCfg:
     time_stop_bars: int = 96
     time_stop_min_r: float = 0.5        # exit if we haven't made this much by then
     regime_ema: int = 50
-    btc_symbol: str = "BTC/USDT"
+    # The reference asset for the market-regime read, as a BASE. The pair is
+    # completed with the effective quote currency at load time, so operating
+    # kraken/USD uses BTC/USD rather than a USDT pair the venue may not even
+    # list -- which would silently disable the regime filter.
+    btc_base: str = "BTC"
+    btc_symbol: str = ""        # derived; see Config.resolve_symbols()
     warmup_bars: int = 250
 
 
@@ -245,6 +256,11 @@ class Config:
     engine: EngineCfg = field(default_factory=EngineCfg)
     intel: IntelCfg = field(default_factory=IntelCfg)
 
+    def __post_init__(self) -> None:
+        # A Config built directly (tests, the smoke test) must be as coherent as
+        # one loaded from disk, or the two disagree about which market is BTC.
+        self.resolve_symbols()
+
     # --- secrets, populated from the environment only -------------------
     telegram_token: str = ""
     telegram_chat_id: str = ""
@@ -277,6 +293,19 @@ class Config:
             errs.append("strategy.warmup_bars must exceed ema_trend by a margin")
         if self.universe.max_tradable > self.universe.top_n:
             errs.append("universe.max_tradable cannot exceed top_n")
+        q = self.quote_currency
+        if not q or "/" in q:
+            errs.append(f"exchange.quote must be a bare currency code, got {q!r}")
+        if not self.strategy.btc_symbol.endswith(f"/{q}"):
+            errs.append(
+                f"strategy.btc_symbol ({self.strategy.btc_symbol}) is not quoted in "
+                f"{q}; the market-regime reference must trade in the same currency "
+                f"as everything else or the regime filter reads a different market")
+        mismatched = [s for s in self.universe.always_include
+                      if not s.endswith(f"/{q}")]
+        if mismatched:
+            errs.append(f"universe.always_include contains symbols not quoted in "
+                        f"{q}: {mismatched}")
         if self.universe.broad_source not in ("coingecko", "static", "none"):
             errs.append("universe.broad_source must be coingecko, static or none")
         if self.universe.broad_source == "static" and not self.universe.broad_static_assets:
@@ -347,6 +376,30 @@ class Config:
         """
         return max(self.universe.min_candles_1h, self.strategy.warmup_bars) + 5
 
+    @property
+    def quote_currency(self) -> str:
+        """THE quote currency. Every pair in the system is built from this."""
+        return self.exchange.quote
+
+    def market_for(self, base: str) -> str:
+        """The market symbol for a base asset on this venue, e.g. BTC -> BTC/USD."""
+        return f"{base.upper()}/{self.quote_currency}"
+
+    def resolve_symbols(self, explicit: set[str] | None = None) -> None:
+        """Complete every configured BASE into a pair using the effective quote.
+
+        Called after the TOML and any --exchange/--quote override are applied,
+        so the quote currency has exactly one chance to be decided and every
+        symbol in the system is built from that one decision. Anything the
+        operator wrote explicitly is left alone and checked by validate().
+        """
+        explicit = explicit or set()
+        if "btc_symbol" not in explicit or not self.strategy.btc_symbol:
+            self.strategy.btc_symbol = self.market_for(self.strategy.btc_base)
+        if "always_include" not in explicit or not self.universe.always_include:
+            self.universe.always_include = [
+                self.market_for(b) for b in self.universe.always_include_bases]
+
     def exchange_label(self) -> str:
         """The single string every surface should show for "which venue"."""
         return f"{self.exchange.name}/{self.exchange.quote}"
@@ -375,6 +428,7 @@ def load_config(path: str | Path = "config/config.toml",
                 env_path: str | Path = ".env") -> Config:
     load_dotenv(env_path)
     cfg = Config()
+    explicit: set[str] = set()
     p = Path(path)
     if p.exists():
         raw = tomllib.loads(p.read_text(encoding=TEXT_ENCODING))
@@ -382,6 +436,7 @@ def load_config(path: str | Path = "config/config.toml",
             if not hasattr(cfg, name):
                 raise ConfigError(f"unknown config section: [{name}]")
             _apply(getattr(cfg, name), data)
+            explicit.update(data.keys())
     # Operational overrides. Switching venue is the single most common thing an
     # operator needs to do (geo-blocks, outages), so it must not require editing
     # a config file -- a mistyped TOML line is a worse failure than a wrong venue.
@@ -399,6 +454,11 @@ def load_config(path: str | Path = "config/config.toml",
     cfg.telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if os.environ.get("TELEGRAM_ENABLED", "").lower() in ("0", "false", "no"):
         cfg.telegram.enabled = False
+    # Every pair in the system is completed here, AFTER the quote currency has
+    # been finally decided by the TOML plus any override. One decision, one
+    # place, so nothing can be left pointing at a different currency's market.
+    cfg.resolve_symbols(explicit)
+
     # Belt and braces: the environment can never switch on live trading.
     cfg.safety.mode = "PAPER"
     cfg.safety.live_trading_enabled = False

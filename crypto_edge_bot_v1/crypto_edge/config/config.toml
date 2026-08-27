@@ -9,6 +9,11 @@
 
 [exchange]
 name = "binance"          # any ccxt-supported venue; public endpoints only
+# THE quote currency. Every market symbol in the system is built from this one
+# value -- the BTC regime reference, always_include, the universe, sizing,
+# reporting. Override per run with --quote / CRYPTO_EDGE_QUOTE; the effective
+# venue is then displayed everywhere as e.g. "kraken/USD".
+# Kraken's deep spot books are USD, not USDT.
 quote = "USDT"
 rate_limit_ms = 250
 # Candles per REQUEST -- a paging hint, not the total history fetched. Venues
@@ -68,6 +73,9 @@ require_broad_universe = true
 top_n = 200               # keep the top 200 of the broad asset ranking
 max_tradable = 40         # then hand at most 40 to the strategy each cycle
 refresh_minutes = 360
+# 24h NOTIONAL VOLUME IN THE SELECTED QUOTE CURRENCY (so USD notional on a USD
+# venue, USDT notional on a USDT venue). Not converted to dollars -- the quote
+# currency IS the unit of account for everything else here too.
 min_dollar_volume_24h = 5_000_000.0
 max_spread_bps = 15.0     # a wide book eats the edge before the trade starts
 min_candles_1h = 400      # need history for a 200-EMA plus warm-up
@@ -77,7 +85,9 @@ max_atr_pct = 25.0        # too wild: stop distance makes position size meaningl
 exclude_stablecoins = true
 exclude_leveraged = true  # 3L/3S/UP/DOWN tokens decay; they are not the asset
 exclude_wrapped = true    # WBTC/stETH duplicate exposure you may already hold
-always_include = ["BTC/USDT", "ETH/USDT"]
+# BASE assets, not pairs. Each is completed with the quote currency above, so
+# switching to USD yields BTC/USD and ETH/USD automatically.
+always_include_bases = ["BTC", "ETH"]
 blacklist = []
 
 [strategy]
@@ -104,7 +114,10 @@ breakeven_offset_r = 0.1
 time_stop_bars = 96       # 4 days on 1h: if it has not worked, release the capital
 time_stop_min_r = 0.5
 regime_ema = 50
-btc_symbol = "BTC/USDT"
+# The market-regime reference as a BASE asset; the pair is completed with the
+# quote currency, so kraken/USD reads BTC/USD rather than a USDT pair the venue
+# may not even list -- which would silently disable the regime filter.
+btc_base = "BTC"
 warmup_bars = 250
 
 [risk]

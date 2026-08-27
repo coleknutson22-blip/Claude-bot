@@ -498,14 +498,24 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
     print("=" * 72)
     print(f"UNIVERSE DIAGNOSTIC -- {cfg.exchange_label()}")
     print("=" * 72)
-    print(f"required 1h history (indicators only) : "
-          f"{cfg.required_history_bars(cfg.strategy.entry_timeframe)} bars")
-    print(f"required {cfg.strategy.regime_timeframe} history                    "
-          f": {cfg.required_history_bars(cfg.strategy.regime_timeframe)} bars")
-    print(f"market-age method                    : {cfg.universe.age_probe_bars} x "
-          f"{cfg.universe.age_probe_timeframe} probe "
-          f"({cfg.universe.age_probe_bars * tf_ms(cfg.universe.age_probe_timeframe) / 86_400_000:.0f} "
-          f"days of reach) vs a {cfg.universe.min_market_age_days}-day gate")
+    reach_days = (cfg.universe.age_probe_bars
+                  * tf_ms(cfg.universe.age_probe_timeframe) / 86_400_000)
+    rows = [
+        (f"required {cfg.strategy.entry_timeframe} history (indicators only)",
+         f"{cfg.required_history_bars(cfg.strategy.entry_timeframe)} bars"),
+        (f"required {cfg.strategy.regime_timeframe} history (indicators only)",
+         f"{cfg.required_history_bars(cfg.strategy.regime_timeframe)} bars"),
+        ("market-age method",
+         f"{cfg.universe.age_probe_bars} x {cfg.universe.age_probe_timeframe} probe "
+         f"({reach_days:.0f} days of reach) vs a "
+         f"{cfg.universe.min_market_age_days}-day gate"),
+        ("24h volume floor",
+         f"{cfg.universe.min_dollar_volume_24h:,.0f} {cfg.quote_currency} of "
+         f"notional traded"),
+    ]
+    width = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        print(f"{label.ljust(width)} : {value}")
 
     markets = feed.load_markets()
     tickers = feed.fetch_tickers()
@@ -514,7 +524,7 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
         print("NO BROAD UNIVERSE -- entries are suspended; nothing to diagnose.")
         return {"error": "no broad universe"}
 
-    print(f"venue markets ({cfg.exchange.quote} spot) : {len(markets)}")
+    print(f"venue markets ({cfg.quote_currency} spot)              : {len(markets)}")
     print(f"broad universe assets                     : {len(broad)} "
           f"({broad.source}, scanned {broad.scanned})")
 
@@ -532,10 +542,11 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
 
     # ---- the 24h volume audit, every intersecting market, raw fields -----
     print(NEWLINE + "--- 24H VOLUME AUDIT (all intersecting markets) " + "-" * 24)
-    print(f"    threshold: ${cfg.universe.min_dollar_volume_24h:,.0f} in "
-          f"{cfg.exchange.quote}")
+    print(f"    threshold: {cfg.universe.min_dollar_volume_24h:,.0f} "
+          f"{cfg.quote_currency} of 24h notional (in the SELECTED quote currency)")
     print(f"    {'symbol':16} {'baseVolume':>16} {'quoteVolume':>16} "
-          f"{'vwap':>12} {'last':>12} {'-> notional':>16}  {'via':<18} R")
+          f"{'vwap':>12} {'last':>12} {('-> ' + cfg.quote_currency):>16}  "
+          f"{'via':<18} R")
     vol_rows = []
     for sym in sorted(intersect):
         t = tickers.get(sym) or {}
@@ -588,7 +599,7 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
         probe_bars=cfg.universe.age_probe_bars,
         cache_hours=cfg.universe.age_cache_hours)
     stage2_reasons: dict[str, list] = {}
-    survivors, bar_counts = [], []
+    survivors, bar_counts, atr_only = [], [], []
     want_1h = cfg.required_history_bars(cfg.strategy.entry_timeframe)
     want_htf = cfg.required_history_bars(cfg.strategy.regime_timeframe)
     print(f"    requesting {want_1h} x {cfg.strategy.entry_timeframe} and "
@@ -631,6 +642,17 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
               f"  {reason or 'ELIGIBLE'}")
         if reason:
             stage2_reasons.setdefault(_bucket(reason), []).append(sym)
+            # Would this market be eligible if the ATR floor alone were lifted?
+            # Recorded so the threshold can be evaluated against data later
+            # rather than adjusted during an infrastructure fix.
+            if reason.startswith("too quiet"):
+                without_atr = builder.filter_by_history(sym, series, None,
+                                                        requested_bars=want_1h)
+                age_ok = (cfg.universe.min_market_age_days <= 0
+                          or not verdict.reason_if_blocked(
+                              cfg.universe.min_market_age_days))
+                if not without_atr and age_ok:
+                    atr_only.append((sym, atr_pct))
         else:
             survivors.append(sym)
 
@@ -649,6 +671,13 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
     for reason, syms in sorted(stage2_reasons.items(), key=lambda kv: -len(kv[1])):
         print(f"  {len(syms):5}  stage 2: {reason}")
     print(f"  {len(survivors):5}  ELIGIBLE FOR SIGNAL EVALUATION")
+    if atr_only:
+        print(NEWLINE + f"  ATR FLOOR OBSERVATION: {len(atr_only)} market(s) pass "
+              f"EVERY other gate and fail only the {cfg.universe.min_atr_pct}% "
+              f"ATR minimum.")
+        print("  (reported, not acted on -- evaluate the threshold with data)")
+        for sym, a in sorted(atr_only, key=lambda x: -(x[1] or 0))[:15]:
+            print(f"      {sym:16} ATR {a:.3f}%")
     if survivors:
         print(f"         {', '.join(survivors)}")
 
@@ -671,7 +700,8 @@ def diagnose_universe(cfg: Config, repo, broad_service, feed,
 
     return {"markets": len(markets), "intersecting": len(intersect),
             "stage1_kept": len(keep), "tradable": len(tradable),
-            "eligible": len(survivors), "stage1_reasons": stage1_reasons,
+            "eligible": len(survivors), "atr_only": atr_only,
+            "stage1_reasons": stage1_reasons,
             "stage2_reasons": stage2_reasons, "bar_counts": bar_counts,
             "requested_1h": want_1h}
 

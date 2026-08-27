@@ -103,11 +103,22 @@ def run_selfcheck(cfg: Config, repo: Repo | None, feed, notifier,
     try:
         changed, previous = repo.record_exchange(cfg.exchange_label())
         if changed:
+            prev_venue, _, prev_quote = previous.partition("/")
+            what = ("QUOTE CURRENCY" if prev_venue == cfg.exchange.name
+                    else "EXCHANGE")
+            extra = ""
+            if prev_quote and prev_quote != cfg.quote_currency:
+                # Prices, volumes, equity and every stored fill are denominated
+                # in the quote currency. Mixing two of them in one account is
+                # not a reporting nuisance, it is a wrong P&L.
+                extra = (f" Account equity and every recorded fill are "
+                         f"denominated in {prev_quote}, not {cfg.quote_currency}.")
             rep.add("exchange unchanged since last run", False, WARNING,
-                    f"THIS DATABASE WAS LAST USED WITH {previous} AND IS NOW "
-                    f"{cfg.exchange_label()} -- positions, processed candles and "
-                    f"journal rows in it came from {previous}. Use a separate "
-                    f"engine.db_path per venue unless this is deliberate.")
+                    f"{what} CHANGED: this database was last used with "
+                    f"{previous} and is now {cfg.exchange_label()} -- positions, "
+                    f"processed candles and journal rows in it came from "
+                    f"{previous}.{extra} Use a separate engine.db_path per "
+                    f"venue/quote unless this is deliberate.")
         else:
             rep.add("exchange unchanged since last run", True, WARNING,
                     f"database belongs to {cfg.exchange_label()}")

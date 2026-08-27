@@ -186,8 +186,11 @@ class UniverseBuilder:
                 audit.append(row)
                 continue
             if qv < c.min_dollar_volume_24h and sym not in c.always_include:
-                row["reject_reason"] = (f"24h volume ${qv:,.0f} < "
-                                        f"${c.min_dollar_volume_24h:,.0f}")
+                # Name the unit. The threshold is notional in the SELECTED quote
+                # currency, so a "$" on a EUR or USD venue would be misleading.
+                unit = meta.quote or ""
+                row["reject_reason"] = (f"24h volume {qv:,.0f} {unit} < "
+                                        f"{c.min_dollar_volume_24h:,.0f} {unit}")
                 audit.append(row)
                 continue
             sp = self.spread_bps(tickers.get(sym) or {})

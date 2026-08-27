@@ -20,14 +20,18 @@ DEFECTS UNDER TEST
    most common operational change (geo-blocks, outages) and a mistyped TOML
    line is a worse failure than a wrong venue.
 """
+import contextlib
 import io
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import helpers  # noqa: F401  -- silences the engine's log handlers
+from crypto_edge import cli
 from crypto_edge.config import load_config, load_dotenv
+from crypto_edge.data.feed import DataUnavailable
 
 TOKEN_KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
               "CRYPTO_EDGE_EXCHANGE", "CRYPTO_EDGE_QUOTE", "TELEGRAM_ENABLED")
@@ -195,6 +199,91 @@ class TestOutputEncoding(unittest.TestCase):
             _force_utf8_output()            # must swallow the AttributeError
         finally:
             sys.stdout, sys.stderr = saved_out, saved_err
+
+
+
+class TestUnreachableVenueIsReadable(unittest.TestCase):
+    """A blocked venue must read as a connectivity problem, not a crash.
+
+    DEFECT: `diagnose` on a machine behind a corporate firewall printed a
+    ~40-line Python traceback ending in `DataUnavailable`. For a non-developer
+    that is indistinguishable from the bot being broken, and it buries the one
+    fact that matters -- the exchange was never reached. Worse, the traceback
+    followed a partial diagnostic header, so the run could be mistaken for a
+    completed diagnostic that found nothing.
+    """
+
+    def run_cli(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.main(list(argv))
+        return code, buf.getvalue()
+
+    def test_a_network_failure_is_explained_not_dumped(self):
+        with mock.patch.object(cli, "cmd_status",
+                               side_effect=OSError("connection refused")):
+            code, out = self.run_cli("status")
+        self.assertEqual(code, 2, "a failed run must not report success")
+        self.assertIn("COULD NOT REACH THE EXCHANGE", out)
+        self.assertIn("connection refused", out)
+        self.assertIn("firewall", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_the_failing_command_is_named(self):
+        with mock.patch.object(cli, "cmd_status", side_effect=OSError("boom")):
+            _, out = self.run_cli("status")
+        self.assertIn("'status'", out)
+
+    def test_output_is_not_mistaken_for_a_result(self):
+        """The header prints before the fetch; say plainly that it means nothing."""
+        with mock.patch.object(cli, "cmd_status", side_effect=OSError("boom")):
+            _, out = self.run_cli("status")
+        self.assertIn("not a result", out)
+
+    def test_a_wrapped_network_error_is_still_recognised(self):
+        """The feed wraps ccxt errors in DataUnavailable; the cause chain decides."""
+        try:
+            raise OSError("tls handshake failed")
+        except OSError as root:
+            wrapped = DataUnavailable("load_markets failed: kraken GET ...")
+            wrapped.__cause__ = root
+        with mock.patch.object(cli, "cmd_status", side_effect=wrapped):
+            code, out = self.run_cli("status")
+        self.assertEqual(code, 2)
+        self.assertIn("COULD NOT REACH THE EXCHANGE", out)
+
+    def test_a_data_refusal_does_not_blame_the_operators_firewall(self):
+        """'The venue answered, but with nothing usable' is a different problem.
+
+        Sending someone to check their VPN when the venue simply had no candles
+        would send them chasing a fault that is not theirs.
+        """
+        with mock.patch.object(cli, "cmd_status",
+                               side_effect=DataUnavailable("no candles returned")):
+            code, out = self.run_cli("status")
+        self.assertEqual(code, 2)
+        self.assertIn("COULD NOT GET USABLE MARKET DATA", out)
+        self.assertNotIn("firewall", out)
+        self.assertIn("reachable but did not return data", out)
+
+    def test_a_programming_error_still_raises(self):
+        """Friendly messages must not swallow real bugs."""
+        with mock.patch.object(cli, "cmd_status",
+                               side_effect=AttributeError("typo")):
+            with self.assertRaises(AttributeError):
+                self.run_cli("status")
+
+    def test_an_enormous_error_message_is_truncated(self):
+        with mock.patch.object(cli, "cmd_status", side_effect=OSError("x" * 5000)):
+            _, out = self.run_cli("status")
+        self.assertLess(len(out), 2000, "an operator must not be buried in text")
+        self.assertIn("...", out)
+
+    def test_ctrl_c_is_not_an_error_report(self):
+        with mock.patch.object(cli, "cmd_status", side_effect=KeyboardInterrupt):
+            code, out = self.run_cli("status")
+        self.assertEqual(code, 130)
+        self.assertNotIn("COULD NOT", out)
 
 
 if __name__ == "__main__":

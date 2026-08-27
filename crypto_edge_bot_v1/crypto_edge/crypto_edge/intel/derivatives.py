@@ -78,6 +78,8 @@ class CCXTDerivativesProvider:
     name = "ccxt_perp"
 
     def __init__(self, exchange: str = "binance", quote: str = "USDT") -> None:
+        """`quote` must be passed from Config.quote_currency by any caller that
+        wires this up; the default exists only so the class is constructible."""
         import ccxt
         self.client = getattr(ccxt, exchange)({
             "enableRateLimit": True, "options": {"defaultType": "swap"}})
