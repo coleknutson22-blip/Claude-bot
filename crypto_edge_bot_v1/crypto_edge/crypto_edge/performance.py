@@ -41,20 +41,42 @@ class PerformanceReport:
 
 
 class PerformanceCalculator:
-    def __init__(self, repo: Repo) -> None:
+    """Reports on ONE strategy's ledger.
+
+    `strategy` may be left unset only while a single sub-account exists; once a
+    second strategy has a ledger the caller must say which one it means, rather
+    than silently reporting whichever row sorted first.
+    """
+
+    def __init__(self, repo: Repo, strategy: str | None = None) -> None:
         self.repo = repo
+        self.strategy = strategy
+
+    def _resolve(self, strategy: str | None) -> str:
+        if strategy:
+            return strategy
+        if self.strategy:
+            return self.strategy
+        names = [a["strategy"] for a in self.repo.all_accounts()]
+        if len(names) == 1:
+            return names[0]
+        raise ValueError(
+            f"which strategy? {len(names)} sub-accounts exist: {names}")
 
     # ------------------------------------------------------------- helpers
-    def _open_rows(self, marks: dict[str, float]) -> list[dict]:
+    def _open_rows(self, marks: dict[str, float],
+                   strategy: str | None = None) -> list[dict]:
         rows = []
-        for p in self.repo.get_positions():
+        for p in self.repo.get_positions(strategy):
             px = marks.get(p.symbol, p.entry_fill_price)
             rows.append({
                 "symbol": p.symbol, "qty": p.qty, "entry": p.entry_fill_price,
                 "current": px, "value": p.mark_value(px),
+                "collateral": p.collateral_value(px),
+                "side": p.side,
                 "unrealized": p.unrealized(px),
                 "unrealized_pct": _safe_div((px - p.entry_fill_price),
-                                            p.entry_fill_price) * 100.0,
+                                            p.entry_fill_price) * 100.0 * p.direction,
                 "stop": p.current_stop, "initial_stop": p.initial_stop,
                 "risk_amount": p.risk_amount, "score": p.signal_score,
                 "held": fmt_duration((now_ms() - p.entry_ms) / 1000.0),
@@ -66,14 +88,18 @@ class PerformanceCalculator:
                strategy: str | None = None,
                version: str | None = None) -> PerformanceReport:
         marks = marks or {}
-        acct = self.repo.get_account()
-        trades = self.repo.get_trades(strategy, version)
-        open_rows = self._open_rows(marks)
+        name = self._resolve(strategy)
+        acct = self.repo.get_account(name)
+        trades = self.repo.get_trades(name, version)
+        open_rows = self._open_rows(marks, name)
 
         cash = float(acct["cash"])
-        deployed = sum(r["value"] for r in open_rows)
+        deployed = sum(r["value"] for r in open_rows)          # gross exposure
         unrealized = sum(r["unrealized"] for r in open_rows)
-        equity = cash + deployed
+        # Equity uses COLLATERAL, not gross exposure: a short contributes the
+        # capital reserved against it plus its P&L, not the market value of
+        # stock it does not own.
+        equity = cash + sum(r["collateral"] for r in open_rows)
         start = float(acct["starting_equity"])
         realized = float(acct["realized_pnl"])
 

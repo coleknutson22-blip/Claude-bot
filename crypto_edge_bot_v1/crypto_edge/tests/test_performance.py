@@ -8,7 +8,7 @@ import unittest
 from crypto_edge.models import ClosedTrade
 from crypto_edge.performance import (MIN_DAYS_FOR_RATIOS, MIN_TRADES_FOR_RATIOS,
                                      PerformanceCalculator)
-from helpers import open_repo, temp_repo
+from helpers import STRATEGY, open_repo, temp_repo
 
 DAY = 86_400_000
 T0 = 1_760_000_000_000
@@ -37,7 +37,7 @@ def trade(repo, i, net, *, gross=None, fees=1.0, slip=0.5, symbol="SOL/USDT",
 class TestTradingStatistics(unittest.TestCase):
     def setUp(self):
         self.repo, self.path = temp_repo()
-        self.repo.ensure_account(10_000.0)
+        self.repo.ensure_account(STRATEGY, 10_000.0)
         self.calc = PerformanceCalculator(self.repo)
 
     def test_win_rate(self):
@@ -103,7 +103,7 @@ class TestTradingStatistics(unittest.TestCase):
 class TestCostAccounting(unittest.TestCase):
     def setUp(self):
         self.repo, _ = temp_repo()
-        self.repo.ensure_account(10_000.0)
+        self.repo.ensure_account(STRATEGY, 10_000.0)
         self.calc = PerformanceCalculator(self.repo)
 
     def test_fees_and_slippage_are_reported_separately(self):
@@ -132,17 +132,17 @@ class TestCostAccounting(unittest.TestCase):
 class TestDrawdownAndRisk(unittest.TestCase):
     def setUp(self):
         self.repo, _ = temp_repo()
-        self.repo.ensure_account(10_000.0)
+        self.repo.ensure_account(STRATEGY, 10_000.0)
         self.calc = PerformanceCalculator(self.repo)
 
     def test_current_drawdown_from_peak(self):
-        self.repo.update_account(peak_equity=12_000.0, cash=9_600.0)
+        self.repo.update_account(STRATEGY, peak_equity=12_000.0, cash=9_600.0)
         rep = self.calc.report()
         # (12000 - 9600) / 12000 = 20%
         self.assertAlmostEqual(rep.risk["current_drawdown_pct"], 20.0)
 
     def test_no_drawdown_at_a_new_high(self):
-        self.repo.update_account(peak_equity=10_000.0, cash=11_000.0)
+        self.repo.update_account(STRATEGY, peak_equity=10_000.0, cash=11_000.0)
         self.assertAlmostEqual(
             self.calc.report().risk["current_drawdown_pct"], 0.0)
         self.assertAlmostEqual(
@@ -164,7 +164,7 @@ class TestDrawdownAndRisk(unittest.TestCase):
                        highest_price=100.0, lowest_price=100.0,
                        risk_amount=50.0, candle_id="SOL/USDT|1h|1", journal={})
         self.repo.add_position(pos)
-        self.repo.update_account(cash=9_000.0)
+        self.repo.update_account(STRATEGY, cash=9_000.0)
         rep = self.calc.report(marks={"SOL/USDT": 110.0})
         self.assertAlmostEqual(rep.account["unrealized_pnl"], 100.0)
         self.assertAlmostEqual(rep.account["capital_deployed"], 1_100.0)
@@ -177,7 +177,7 @@ class TestSampleSizeHonesty(unittest.TestCase):
 
     def setUp(self):
         self.repo, _ = temp_repo()
-        self.repo.ensure_account(10_000.0)
+        self.repo.ensure_account(STRATEGY, 10_000.0)
         self.calc = PerformanceCalculator(self.repo)
 
     def test_tiny_sample_is_flagged_unreliable(self):
@@ -219,7 +219,7 @@ class TestSampleSizeHonesty(unittest.TestCase):
 class TestPersistence(unittest.TestCase):
     def test_report_is_identical_after_restart(self):
         repo, path = temp_repo()
-        repo.ensure_account(10_000.0)
+        repo.ensure_account(STRATEGY, 10_000.0)
         for i, net in enumerate([100.0, -40.0, 25.0]):
             trade(repo, i, net)
         before = PerformanceCalculator(repo).report().as_dict()

@@ -23,7 +23,9 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+from ..timeutils import now_ms
+
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -31,8 +33,11 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS account (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
+-- One independent paper ledger PER STRATEGY. Two strategies sharing a cash
+-- balance cannot be compared: each one's position sizes would depend on what
+-- the other happened to be holding at the time.
+CREATE TABLE IF NOT EXISTS sub_accounts (
+    strategy TEXT PRIMARY KEY,
     starting_equity REAL NOT NULL,
     cash REAL NOT NULL,
     peak_equity REAL NOT NULL,
@@ -41,6 +46,7 @@ CREATE TABLE IF NOT EXISTS account (
     realized_pnl REAL NOT NULL DEFAULT 0,
     total_fees REAL NOT NULL DEFAULT 0,
     total_slippage REAL NOT NULL DEFAULT 0,
+    total_financing REAL NOT NULL DEFAULT 0,
     halted INTEGER NOT NULL DEFAULT 0,
     halt_reason TEXT NOT NULL DEFAULT '',
     halt_ms INTEGER NOT NULL DEFAULT 0,
@@ -65,13 +71,19 @@ CREATE TABLE IF NOT EXISTS positions (
     highest_price REAL NOT NULL,
     lowest_price REAL NOT NULL,
     risk_amount REAL NOT NULL,
-    candle_id TEXT NOT NULL UNIQUE,
+    candle_id TEXT NOT NULL,
     signal_score REAL NOT NULL DEFAULT 0,
     mfe REAL NOT NULL DEFAULT 0,
     mae REAL NOT NULL DEFAULT 0,
-    journal TEXT NOT NULL DEFAULT '{}'
+    margin_held REAL NOT NULL DEFAULT 0,
+    journal TEXT NOT NULL DEFAULT '{}',
+    -- SCOPED BY STRATEGY. A bare UNIQUE(candle_id) let whichever strategy
+    -- reached a candle first lock every other strategy out of it.
+    UNIQUE (candle_id, strategy)
 );
 CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_open
+    ON positions(strategy, symbol);
 
 CREATE TABLE IF NOT EXISTS trades (
     id TEXT PRIMARY KEY,
@@ -79,6 +91,7 @@ CREATE TABLE IF NOT EXISTS trades (
     symbol TEXT NOT NULL,
     strategy TEXT NOT NULL,
     strategy_version TEXT NOT NULL,
+    side TEXT NOT NULL DEFAULT 'long',
     qty REAL NOT NULL,
     entry_ref_price REAL NOT NULL,
     entry_fill_price REAL NOT NULL,
@@ -125,9 +138,14 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     fees REAL NOT NULL DEFAULT 0
 );
 
+-- Claiming a candle is per STRATEGY. With a bare candle_id primary key the
+-- first strategy to claim a bar silently prevented every other strategy from
+-- ever evaluating it -- no error, just a symbol that never traded.
 CREATE TABLE IF NOT EXISTS processed_candles (
-    candle_id TEXT PRIMARY KEY,
-    processed_ms INTEGER NOT NULL
+    candle_id TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    processed_ms INTEGER NOT NULL,
+    PRIMARY KEY (candle_id, strategy)
 );
 
 CREATE TABLE IF NOT EXISTS observations (
@@ -317,7 +335,160 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
     return
 
 
-MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3}
+def _legacy_strategy_name(conn: sqlite3.Connection) -> str:
+    """Which strategy owns the pre-v4 single-account history.
+
+    Derived from the data rather than from configuration, because the config
+    can be edited between runs and the migration has to be correct for the rows
+    that actually exist. Positions and trades carry a strategy column already;
+    if they agree, that is the answer.
+    """
+    names: list[str] = []
+    for table in ("positions", "trades"):
+        if not _columns(conn, table):
+            continue
+        names += [r[0] for r in conn.execute(
+            f"SELECT DISTINCT strategy FROM {table}").fetchall() if r[0]]
+    distinct = sorted(set(names))
+    if len(distinct) == 1:
+        return distinct[0]
+    if _columns(conn, "strategy_versions"):
+        row = conn.execute(
+            "SELECT strategy FROM strategy_versions ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        if row and row[0]:
+            return str(row[0])
+    if distinct:
+        # More than one strategy already traded on a single shared ledger. That
+        # ledger cannot be split after the fact, so refuse rather than guess.
+        raise RuntimeError(
+            "cannot migrate to schema v4: the pre-v4 account was shared by "
+            f"strategies {distinct}. A shared ledger cannot be attributed "
+            "retroactively; restore a backup or start a fresh database.")
+    return "trend_breakout"
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """Single account -> per-strategy sub-accounts, and strategy-scoped claims.
+
+    Nothing is discarded. The old `account` row is copied into `sub_accounts`
+    under the strategy that actually traded it, and the original table is kept
+    as `account_pre_v4` so the migration can be audited against the source.
+    """
+    owner = _legacy_strategy_name(conn)
+    ts = now_ms()
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sub_accounts (
+            strategy TEXT PRIMARY KEY,
+            starting_equity REAL NOT NULL,
+            cash REAL NOT NULL,
+            peak_equity REAL NOT NULL,
+            daily_start_equity REAL NOT NULL,
+            daily_date TEXT NOT NULL,
+            realized_pnl REAL NOT NULL DEFAULT 0,
+            total_fees REAL NOT NULL DEFAULT 0,
+            total_slippage REAL NOT NULL DEFAULT 0,
+            total_financing REAL NOT NULL DEFAULT 0,
+            halted INTEGER NOT NULL DEFAULT 0,
+            halt_reason TEXT NOT NULL DEFAULT '',
+            halt_ms INTEGER NOT NULL DEFAULT 0,
+            created_ms INTEGER NOT NULL,
+            updated_ms INTEGER NOT NULL
+        );
+    """)
+
+    if _columns(conn, "account"):
+        row = conn.execute("SELECT * FROM account WHERE id=1").fetchone()
+        if row is not None:
+            d = dict(row)
+            conn.execute(
+                """INSERT OR IGNORE INTO sub_accounts(
+                       strategy, starting_equity, cash, peak_equity,
+                       daily_start_equity, daily_date, realized_pnl, total_fees,
+                       total_slippage, total_financing, halted, halt_reason,
+                       halt_ms, created_ms, updated_ms)
+                   VALUES(?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)""",
+                (owner, d["starting_equity"], d["cash"], d["peak_equity"],
+                 d["daily_start_equity"], d["daily_date"], d["realized_pnl"],
+                 d["total_fees"], d["total_slippage"], d["halted"],
+                 d["halt_reason"], d["halt_ms"], d["created_ms"], ts))
+        # Kept, not dropped: the source of truth for verifying this migration.
+        conn.execute("ALTER TABLE account RENAME TO account_pre_v4")
+
+    # --- processed_candles: (candle_id) -> (candle_id, strategy) -------------
+    pc_cols = _columns(conn, "processed_candles")
+    if pc_cols and "strategy" not in pc_cols:
+        conn.executescript(f"""
+            ALTER TABLE processed_candles RENAME TO processed_candles_pre_v4;
+            CREATE TABLE processed_candles (
+                candle_id TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                processed_ms INTEGER NOT NULL,
+                PRIMARY KEY (candle_id, strategy)
+            );
+            INSERT INTO processed_candles(candle_id, strategy, processed_ms)
+                SELECT candle_id, '{owner}', processed_ms
+                  FROM processed_candles_pre_v4;
+            DROP TABLE processed_candles_pre_v4;
+        """)
+
+    # --- positions: drop UNIQUE(candle_id), add margin_held -----------------
+    pos_cols = _columns(conn, "positions")
+    if pos_cols and "margin_held" not in pos_cols:
+        conn.executescript("""
+            ALTER TABLE positions RENAME TO positions_pre_v4;
+            CREATE TABLE positions (
+                id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                entry_ref_price REAL NOT NULL,
+                entry_fill_price REAL NOT NULL,
+                entry_ms INTEGER NOT NULL,
+                entry_fee REAL NOT NULL,
+                entry_slippage REAL NOT NULL,
+                initial_stop REAL NOT NULL,
+                current_stop REAL NOT NULL,
+                highest_price REAL NOT NULL,
+                lowest_price REAL NOT NULL,
+                risk_amount REAL NOT NULL,
+                candle_id TEXT NOT NULL,
+                signal_score REAL NOT NULL DEFAULT 0,
+                mfe REAL NOT NULL DEFAULT 0,
+                mae REAL NOT NULL DEFAULT 0,
+                margin_held REAL NOT NULL DEFAULT 0,
+                journal TEXT NOT NULL DEFAULT '{}',
+                UNIQUE (candle_id, strategy)
+            );
+            INSERT INTO positions(
+                id, symbol, strategy, strategy_version, side, qty,
+                entry_ref_price, entry_fill_price, entry_ms, entry_fee,
+                entry_slippage, initial_stop, current_stop, highest_price,
+                lowest_price, risk_amount, candle_id, signal_score, mfe, mae,
+                margin_held, journal)
+            SELECT
+                id, symbol, strategy, strategy_version, side, qty,
+                entry_ref_price, entry_fill_price, entry_ms, entry_fee,
+                entry_slippage, initial_stop, current_stop, highest_price,
+                lowest_price, risk_amount, candle_id, signal_score, mfe, mae,
+                -- a pre-v4 position is a 1x long, whose collateral IS its
+                -- entry notional; that identity is what keeps equity unchanged
+                qty * entry_fill_price, journal
+            FROM positions_pre_v4;
+            DROP TABLE positions_pre_v4;
+        """)
+
+    # --- trades: record which side the trade was -----------------------------
+    trade_cols = _columns(conn, "trades")
+    if trade_cols and "side" not in trade_cols:
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN side TEXT NOT NULL DEFAULT 'long'")
+
+
+MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4}
 
 
 def init_db(conn: sqlite3.Connection) -> None:

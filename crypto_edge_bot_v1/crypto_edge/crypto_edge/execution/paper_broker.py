@@ -149,20 +149,29 @@ class PaperBroker:
     def size_position(self, equity: float, cash: float, entry_price: float,
                       stop_price: float, risk_pct: float, max_position_pct: float,
                       current_exposure: float, max_exposure_pct: float,
-                      meta: MarketMeta, min_stop_distance_pct: float = 0.0) -> SizingResult:
-        """Size a long so that a stop-out costs at most `equity * risk_pct`.
+                      meta: MarketMeta, min_stop_distance_pct: float = 0.0,
+                      direction: int = 1) -> SizingResult:
+        """Size a position so that a stop-out costs at most `equity * risk_pct`.
 
         `entry_price` MUST be the price the order is expected to actually fill
         at (see `expected_entry_price`), not the signal candle's close. Sizing
         on the reference price while filling higher silently inflates risk by
         the full spread-plus-slippage gap.
         """
+        d = 1 if direction >= 0 else -1
         if entry_price <= 0 or not math.isfinite(entry_price):
             return SizingResult(0, 0, 0, 0, False, "invalid entry price")
-        if stop_price <= 0 or stop_price >= entry_price:
+        if stop_price <= 0 or not math.isfinite(stop_price):
+            return SizingResult(0, 0, 0, 0, False, "invalid stop price")
+        # A protective stop sits on the losing side of the entry: below for a
+        # long, ABOVE for a short. Getting this backwards would size against a
+        # negative distance and produce a negative -- or enormous -- quantity.
+        if d > 0 and stop_price >= entry_price:
             return SizingResult(0, 0, 0, 0, False, "stop must be below entry for a long")
+        if d < 0 and stop_price <= entry_price:
+            return SizingResult(0, 0, 0, 0, False, "stop must be above entry for a short")
 
-        stop_dist = entry_price - stop_price
+        stop_dist = (entry_price - stop_price) * d
         stop_pct = stop_dist / entry_price * 100.0
         if stop_pct < min_stop_distance_pct:
             return SizingResult(0, 0, 0, stop_dist, False,
@@ -202,7 +211,9 @@ class PaperBroker:
         # What a stop-out really costs: price risk, plus the fee paid getting
         # in, plus the fee and slippage paid getting out. Reported so the
         # journal shows the true worst case rather than the price-only figure.
-        exit_notional = qty * stop_price * (1.0 - self.stop_slippage_bps * BPS)
+        # A stop-out fills worse than the stop on BOTH sides: below it for a
+        # long, above it for a short.
+        exit_notional = qty * stop_price * (1.0 - self.stop_slippage_bps * BPS * d)
         est_cost_at_stop = (actual_risk + entry_fee + self.fee(exit_notional)
                             + qty * stop_price * self.stop_slippage_bps * BPS)
         return SizingResult(qty, notional, actual_risk, stop_dist, True,
@@ -212,7 +223,8 @@ class PaperBroker:
     # ------------------------------------------------ post-sizing revalidation
     def revalidate_risk(self, qty: float, fill_price: float, stop_price: float,
                         equity: float, risk_pct: float,
-                        tolerance_pct: float = 1.0) -> tuple[bool, str, float]:
+                        tolerance_pct: float = 1.0,
+                        direction: int = 1) -> tuple[bool, str, float]:
         """Last gate before a position is committed.
 
         Recomputes risk from the price the trade ACTUALLY filled at. Anything
@@ -224,10 +236,14 @@ class PaperBroker:
             return False, "non-positive quantity", 0.0
         if fill_price <= 0 or not math.isfinite(fill_price):
             return False, "invalid fill price", 0.0
-        if stop_price >= fill_price:
+        d = 1 if direction >= 0 else -1
+        if d > 0 and stop_price >= fill_price:
             return False, (f"stop ${stop_price:,.6g} is not below the simulated "
                            f"fill ${fill_price:,.6g}"), 0.0
-        actual_risk = qty * (fill_price - stop_price)
+        if d < 0 and stop_price <= fill_price:
+            return False, (f"stop ${stop_price:,.6g} is not above the simulated "
+                           f"fill ${fill_price:,.6g} for a short"), 0.0
+        actual_risk = qty * (fill_price - stop_price) * d
         budget = equity * risk_pct / 100.0
         allowed = budget * (1.0 + tolerance_pct / 100.0)
         if actual_risk > allowed:
@@ -272,8 +288,43 @@ class PaperBroker:
         return Fill(symbol, "sell", qty, ref_price, fill_price, fee, slip,
                     notional, ts_ms if ts_ms is not None else now_ms(), reason)
 
+    def entry_fill(self, symbol: str, qty: float, ref_price: float, direction: int,
+                   quote: Quote | None = None, meta: MarketMeta | None = None,
+                   ts_ms: int | None = None, reason: str = "entry") -> Fill:
+        """Open a position on either side. A long buys, a short sells.
+
+        Both cross the book AGAINST themselves -- the long lifts the ask, the
+        short hits the bid -- so slippage is a cost in both directions. There is
+        no side on which the spread is free.
+        """
+        if direction >= 0:
+            return self.buy(symbol, qty, ref_price, quote, meta, ts_ms, reason)
+        return self.sell(symbol, qty, ref_price, quote, meta, ts_ms, reason)
+
+    def exit_fill(self, symbol: str, qty: float, ref_price: float, direction: int,
+                  quote: Quote | None = None, meta: MarketMeta | None = None,
+                  ts_ms: int | None = None, reason: str = "exit",
+                  slippage_bps: float | None = None) -> Fill:
+        """Close a position on either side. A long sells, a short buys to cover."""
+        if direction >= 0:
+            return self.sell(symbol, qty, ref_price, quote, meta, ts_ms, reason,
+                             slippage_bps)
+        base = ref_price
+        if quote and self.use_book_spread and quote.ask > 0:
+            base = quote.ask
+        slip_bps = self.slippage_bps if slippage_bps is None else slippage_bps
+        fill_price = base * (1.0 + slip_bps * BPS)
+        if meta:
+            fill_price = round_price(fill_price, meta.price_precision, meta.price_step)
+        notional = qty * fill_price
+        fee = self.fee(notional)
+        slip = (fill_price - ref_price) * qty
+        return Fill(symbol, "buy", qty, ref_price, fill_price, fee, slip,
+                    notional, ts_ms if ts_ms is not None else now_ms(), reason)
+
     def stop_exit(self, symbol: str, qty: float, stop_price: float, candle: Candle,
-                  meta: MarketMeta | None = None, ts_ms: int | None = None) -> Fill | None:
+                  meta: MarketMeta | None = None, ts_ms: int | None = None,
+                  direction: int = 1) -> Fill | None:
         """Resolve a stop against a completed candle.
 
         Three cases, in order of severity:
@@ -284,22 +335,23 @@ class PaperBroker:
              stop-slippage.
           3. The stop was never touched -> no fill.
         """
-        if candle.low > stop_price:
+        d = 1 if direction >= 0 else -1
+        touched = candle.low <= stop_price if d > 0 else candle.high >= stop_price
+        if not touched:
             return None
-        if candle.open <= stop_price:
-            base = candle.open
-            reason = "stop_gap"
-        else:
-            base = stop_price
-            reason = "stop"
-        fill_price = base * (1.0 - self.stop_slippage_bps * BPS)
+        gapped = candle.open <= stop_price if d > 0 else candle.open >= stop_price
+        base = candle.open if gapped else stop_price
+        reason = "stop_gap" if gapped else "stop"
+        # Worse than the stop on both sides: lower for a long, higher for a short.
+        fill_price = base * (1.0 - self.stop_slippage_bps * BPS * d)
         if meta:
             fill_price = round_price(fill_price, meta.price_precision, meta.price_step)
         notional = qty * fill_price
         fee = self.fee(notional)
-        slip = (stop_price - fill_price) * qty
-        return Fill(symbol, "sell", qty, stop_price, fill_price, fee, slip,
-                    notional, ts_ms if ts_ms is not None else candle.open_ms, reason)
+        slip = (stop_price - fill_price) * qty * d
+        return Fill(symbol, "sell" if d > 0 else "buy", qty, stop_price, fill_price,
+                    fee, slip, notional,
+                    ts_ms if ts_ms is not None else candle.open_ms, reason)
 
     # ------------------------------------------------------------ checks
     def spread_acceptable(self, quote: Quote | None) -> tuple[bool, float]:
@@ -416,10 +468,19 @@ class PaperBroker:
 
 def realise_pnl(entry_ref: float, entry_fill: float, exit_ref: float,
                 exit_fill: float, qty: float, entry_fee: float,
-                exit_fee: float) -> dict:
-    """Single source of truth for trade P&L decomposition."""
-    gross = (exit_ref - entry_ref) * qty
-    slippage = (entry_fill - entry_ref) * qty + (exit_ref - exit_fill) * qty
+                exit_fee: float, direction: int = 1) -> dict:
+    """Single source of truth for trade P&L decomposition.
+
+    `direction` is +1 long, -1 short. Slippage is defined as a COST and stays
+    positive for both sides: a long fills above its reference and a short fills
+    below it, and both are adverse. Multiplying the raw difference by direction
+    is what keeps the sign honest instead of turning a short's worse fill into
+    a phantom profit.
+    """
+    d = 1 if direction >= 0 else -1
+    gross = (exit_ref - entry_ref) * qty * d
+    slippage = ((entry_fill - entry_ref) * qty * d
+                + (exit_ref - exit_fill) * qty * d)
     fees = entry_fee + exit_fee
     net = gross - slippage - fees
     return {"gross_pnl": gross, "slippage_cost": slippage, "fees": fees, "net_pnl": net}

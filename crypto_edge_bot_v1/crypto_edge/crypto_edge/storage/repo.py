@@ -59,35 +59,48 @@ class Repo:
             self.conn.execute("COMMIT")
 
     # -------------------------------------------------------------- account
-    def ensure_account(self, starting_equity: float) -> dict:
-        row = self.conn.execute("SELECT * FROM account WHERE id=1").fetchone()
+    def ensure_account(self, strategy: str, starting_equity: float) -> dict:
+        """The ledger for ONE strategy. Created once, never reset."""
+        row = self.conn.execute(
+            "SELECT * FROM sub_accounts WHERE strategy=?", (strategy,)).fetchone()
         if row:
             return dict(row)
         ts = now_ms()
         self.conn.execute(
-            """INSERT INTO account(id, starting_equity, cash, peak_equity,
-                   daily_start_equity, daily_date, created_ms, updated_ms)
-               VALUES(1,?,?,?,?,?,?,?)""",
-            (starting_equity, starting_equity, starting_equity, starting_equity,
-             utc_date(ts), ts, ts))
-        return dict(self.conn.execute("SELECT * FROM account WHERE id=1").fetchone())
+            """INSERT INTO sub_accounts(strategy, starting_equity, cash,
+                   peak_equity, daily_start_equity, daily_date,
+                   created_ms, updated_ms)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (strategy, starting_equity, starting_equity, starting_equity,
+             starting_equity, utc_date(ts), ts, ts))
+        return dict(self.conn.execute(
+            "SELECT * FROM sub_accounts WHERE strategy=?", (strategy,)).fetchone())
 
-    def get_account(self) -> dict:
-        row = self.conn.execute("SELECT * FROM account WHERE id=1").fetchone()
+    def get_account(self, strategy: str) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM sub_accounts WHERE strategy=?", (strategy,)).fetchone()
         if not row:
-            raise RuntimeError("account row missing -- state is not trustworthy")
+            raise RuntimeError(
+                f"sub-account for '{strategy}' missing -- state is not trustworthy")
         return dict(row)
 
-    def update_account(self, **fields) -> None:
+    def all_accounts(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM sub_accounts ORDER BY strategy").fetchall()]
+
+    def update_account(self, strategy: str, **fields) -> None:
         if not fields:
             return
         fields["updated_ms"] = now_ms()
         sets = ", ".join(f"{k}=?" for k in fields)
-        self.conn.execute(f"UPDATE account SET {sets} WHERE id=1", tuple(fields.values()))
+        self.conn.execute(f"UPDATE sub_accounts SET {sets} WHERE strategy=?",
+                          tuple(fields.values()) + (strategy,))
 
-    def set_halt(self, halted: bool, reason: str = "") -> None:
-        self.update_account(halted=1 if halted else 0, halt_reason=reason,
-                            halt_ms=now_ms() if halted else 0)
+    def set_halt(self, strategy: str, halted: bool, reason: str = "") -> None:
+        """Halts ONE strategy. A halt is never inferred across ledgers: a daily
+        loss limit is a property of the account that breached it."""
+        self.update_account(strategy, halted=1 if halted else 0,
+                            halt_reason=reason, halt_ms=now_ms() if halted else 0)
 
     # ------------------------------------------------------------ positions
     def add_position(self, pos: Position) -> None:
@@ -107,12 +120,24 @@ class Repo:
     def remove_position(self, pos_id: str) -> None:
         self.conn.execute("DELETE FROM positions WHERE id=?", (pos_id,))
 
-    def get_positions(self) -> list[Position]:
-        rows = self.conn.execute("SELECT * FROM positions ORDER BY entry_ms").fetchall()
+    def get_positions(self, strategy: str | None = None) -> list[Position]:
+        """Open positions. `strategy=None` means EVERY strategy -- use it only
+        for whole-portfolio views, never for a sizing or duplicate decision."""
+        if strategy is None:
+            rows = self.conn.execute(
+                "SELECT * FROM positions ORDER BY entry_ms").fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM positions WHERE strategy=? ORDER BY entry_ms",
+                (strategy,)).fetchall()
         return [self._row_to_position(r) for r in rows]
 
-    def get_position_by_symbol(self, symbol: str) -> Position | None:
-        r = self.conn.execute("SELECT * FROM positions WHERE symbol=?", (symbol,)).fetchone()
+    def get_position(self, strategy: str, symbol: str) -> Position | None:
+        """Scoped by strategy: one strategy holding a symbol must not stop
+        another from trading it. This is the duplicate-entry guard."""
+        r = self.conn.execute(
+            "SELECT * FROM positions WHERE strategy=? AND symbol=?",
+            (strategy, symbol)).fetchone()
         return self._row_to_position(r) if r else None
 
     @staticmethod
@@ -148,17 +173,21 @@ class Repo:
         return out
 
     # ------------------------------------------------- duplicate protection
-    def is_candle_processed(self, cid: str) -> bool:
+    def is_candle_processed(self, cid: str, strategy: str) -> bool:
         return self.conn.execute(
-            "SELECT 1 FROM processed_candles WHERE candle_id=?", (cid,)).fetchone() is not None
+            "SELECT 1 FROM processed_candles WHERE candle_id=? AND strategy=?",
+            (cid, strategy)).fetchone() is not None
 
-    def mark_candle_processed(self, cid: str) -> bool:
-        """Returns True if this call claimed the candle, False if already taken.
-        Atomic, so two code paths cannot both act on one candle."""
+    def mark_candle_processed(self, cid: str, strategy: str) -> bool:
+        """Returns True if this call claimed the candle FOR THIS STRATEGY.
+
+        Atomic, so two code paths cannot both act on one candle -- but scoped,
+        so two strategies can each act on it once.
+        """
         try:
             self.conn.execute(
-                "INSERT INTO processed_candles(candle_id, processed_ms) VALUES(?,?)",
-                (cid, now_ms()))
+                "INSERT INTO processed_candles(candle_id, strategy, processed_ms)"
+                " VALUES(?,?,?)", (cid, strategy, now_ms()))
             return True
         except sqlite3.IntegrityError:
             return False

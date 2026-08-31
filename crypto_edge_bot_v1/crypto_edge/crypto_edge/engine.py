@@ -96,11 +96,13 @@ class TradingEngine:
             cfg.execution.taker_fee_bps, cfg.execution.slippage_bps,
             cfg.execution.stop_slippage_bps, cfg.execution.use_book_spread,
             cfg.execution.max_spread_bps_entry)
-        self.account = PaperAccount(repo, self.broker, cfg.execution.starting_equity)
+        self.account = PaperAccount(repo, self.broker,
+                                    cfg.starting_equity_for(cfg.strategy.name),
+                                    cfg.strategy.name)
         self.risk = RiskManager(cfg.risk)
         self.strategy = TrendBreakoutStrategy(cfg.strategy)
         self.journal = ResearchJournal(repo)
-        self.perf = PerformanceCalculator(repo)
+        self.perf = PerformanceCalculator(repo, cfg.strategy.name)
         self.universe_builder = UniverseBuilder(cfg.universe)
         self.market_age = MarketAgeService(
             repo, probe_timeframe=cfg.universe.age_probe_timeframe,
@@ -122,8 +124,10 @@ class TradingEngine:
             repo, cfg.engine.counterfactual_horizons_h)
         self.status = EngineStatus(started_ms=now_ms())
         self._markets: dict = {}
-        self._series_1h: dict[str, Series] = {}
-        self._series_htf: dict[str, Series] = {}
+        # Candles keyed by TIMEFRAME then symbol. A second strategy needs its
+        # own timeframes (5m/15m/1h rather than 1h/4h), and the engine fetches
+        # the union once so a shared symbol is not downloaded twice.
+        self._series: dict[str, dict[str, Series]] = {}
         self._tickers: dict[str, dict] = {}
         # bars asked of the venue per (symbol, timeframe); lets stage 2 separate
         # "the venue has no more history" from "this market is genuinely new"
@@ -255,8 +259,8 @@ class TradingEngine:
         now = now_ms()
         ok = 0
         for sym in needed:
-            for tf, store in ((c.strategy.entry_timeframe, self._series_1h),
-                              (c.strategy.regime_timeframe, self._series_htf)):
+            for tf in self.timeframes():
+                store = self._series.setdefault(tf, {})
                 # Ask for the history the universe filters actually require, not
                 # a fixed page size. Fetching less does not make the filters
                 # stricter, it makes them unsatisfiable.
@@ -278,6 +282,29 @@ class TradingEngine:
                 ok += 1
         if ok:
             self.status.last_data_ms = now
+
+    def timeframes(self) -> list[str]:
+        """Every timeframe this engine must fetch, in a stable order.
+
+        Today it is one strategy's entry and regime timeframes. It is a list, and
+        a set union, so adding a strategy that wants 5m and 15m costs one more
+        fetch per symbol rather than a second engine.
+        """
+        c = self.cfg
+        return list(dict.fromkeys(
+            [c.strategy.entry_timeframe, c.strategy.regime_timeframe]))
+
+    def series_for(self, timeframe: str) -> dict[str, Series]:
+        return self._series.setdefault(timeframe, {})
+
+    @property
+    def _series_1h(self) -> dict[str, Series]:
+        """The entry timeframe's candles, whatever that timeframe is named."""
+        return self.series_for(self.cfg.strategy.entry_timeframe)
+
+    @property
+    def _series_htf(self) -> dict[str, Series]:
+        return self.series_for(self.cfg.strategy.regime_timeframe)
 
     def data_is_stale(self) -> tuple[bool, str]:
         """Refuse to trade on old data. Fail closed."""
@@ -440,7 +467,7 @@ class TradingEngine:
             if s is None or len(s) == 0:
                 continue
             cid = candle_id(sym, c.strategy.entry_timeframe, int(s.open_ms[-1]))
-            if self.repo.is_candle_processed(cid):
+            if self.repo.is_candle_processed(cid, c.strategy.name):
                 continue          # already acted on this bar, even across restarts
 
             htf = self._series_htf.get(sym)
@@ -650,7 +677,7 @@ class TradingEngine:
         cs = self.risk.check_circuit_breakers(
             equity, float(acct["peak_equity"]), float(acct["daily_start_equity"]))
         if cs.halted:
-            self.repo.set_halt(True, cs.reason)
+            self.repo.set_halt(self.cfg.strategy.name, True, cs.reason)
             self.status.halted = True
             self.status.halt_reason = cs.reason
             kind = ("MAX DRAWDOWN" if "DRAWDOWN" in cs.reason.upper() else "DAILY LOSS")
@@ -672,7 +699,7 @@ class TradingEngine:
             # a new day clears the DAILY loss halt, but never the drawdown halt
             acct = self.account.state
             if int(acct["halted"]) and "DAILY LOSS" in acct["halt_reason"].upper():
-                self.repo.set_halt(False, "")
+                self.repo.set_halt(self.cfg.strategy.name, False, "")
                 self.status.halted = False
                 self.status.halt_reason = ""
                 log_event("performance", "INFO", "daily loss halt cleared by rollover")

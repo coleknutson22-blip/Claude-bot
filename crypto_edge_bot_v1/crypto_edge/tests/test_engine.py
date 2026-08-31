@@ -11,7 +11,7 @@ from crypto_edge.data.fixture_feed import FixtureFeed, make_series
 from crypto_edge.engine import TradingEngine
 from crypto_edge.notify.telegram import TelegramNotifier
 from crypto_edge.timeutils import now_ms, tf_ms
-from helpers import (breakout_closes, default_meta, engine_config, open_repo,
+from helpers import (STRATEGY, breakout_closes, default_meta, engine_config, open_repo,
                      recent_start_ms, temp_repo, trend_closes)
 
 HOUR = 3_600_000
@@ -226,7 +226,7 @@ class TestEngineSafety(unittest.TestCase):
         closes = {"BTC/USDT": trend_closes(400, seed=4),
                   "SOL/USDT": breakout_closes(400, seed=11)}
         engine, feed, transport, repo = build_engine(closes)
-        repo.set_halt(True, "MAX DRAWDOWN kill switch: manual test")
+        repo.set_halt(STRATEGY, True, "MAX DRAWDOWN kill switch: manual test")
         engine.cycle()
         self.assertEqual(len(engine.account.positions()), 0,
                          "entries must be suppressed while halted")
@@ -236,10 +236,10 @@ class TestEngineSafety(unittest.TestCase):
                   "SOL/USDT": breakout_closes(400, seed=11)}
         engine, feed, transport, repo = build_engine(closes)
         # simulate a catastrophic loss of capital
-        repo.update_account(cash=7_000.0, peak_equity=10_000.0,
+        repo.update_account(STRATEGY, cash=7_000.0, peak_equity=10_000.0,
                             daily_start_equity=7_000.0)
         engine.cycle()
-        acct = repo.get_account()
+        acct = repo.get_account(STRATEGY)
         self.assertTrue(int(acct["halted"]))
         self.assertIn("DRAWDOWN", acct["halt_reason"])
         self.assertTrue(any("CIRCUIT BREAKER" in m for m in transport.sent))

@@ -271,6 +271,16 @@ a cycle makes zero OHLCV requests; a bar close costs one request per series. The
 candle in progress is never cached, and if the refresh fails the fetch fails
 closed rather than serving what it already has.
 
+**Per-strategy ledgers.** Each strategy has its own independent paper
+sub-account: its own cash, peak equity, daily loss halt and trade history. One
+strategy's open positions can never change another's available cash, which is
+what makes two strategies comparable. `--strategy` picks which ledger a report
+reads; it defaults to the configured strategy, so every existing command means
+what it always did. Databases from before this change migrate automatically —
+the existing account becomes the sub-account of the strategy that traded it,
+with its history intact, and the pre-migration table is kept as
+`account_pre_v4` so the migration can be audited against its source.
+
 To see exactly which markets survive each gate and why:
 
 ```bash
@@ -288,7 +298,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 633 automated tests, all passing
+### VERIFIED OFFLINE — 685 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -366,7 +376,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               633 tests
+tests/               685 tests
 ```
 
 ## Safety notes

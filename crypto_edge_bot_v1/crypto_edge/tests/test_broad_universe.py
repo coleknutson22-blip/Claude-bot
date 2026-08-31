@@ -32,7 +32,7 @@ from crypto_edge.data.broad_universe import (NON_ASSET_BASES, BroadUniverse,
 from crypto_edge.data.universe import UniverseBuilder
 from crypto_edge.models import MarketMeta
 from crypto_edge.timeutils import now_ms
-from helpers import (breakout_closes, engine_config, temp_repo, test_config,
+from helpers import (STRATEGY, breakout_closes, engine_config, temp_repo, test_config,
                      trend_closes)
 from test_engine import build_engine
 
@@ -400,10 +400,10 @@ class TestEngineFailsClosedWithoutAUniverse(unittest.TestCase):
         halt has to trip and persist even on a cycle that could not have
         entered anything anyway."""
         engine, feed, transport, repo = self._engine(source="none")
-        repo.update_account(cash=7_000.0, peak_equity=10_000.0,
+        repo.update_account(STRATEGY, cash=7_000.0, peak_equity=10_000.0,
                             daily_start_equity=7_000.0)
         engine.cycle()
-        acct = repo.get_account()
+        acct = repo.get_account(STRATEGY)
         self.assertTrue(int(acct["halted"]),
                         "the drawdown breaker must still trip")
         self.assertIn("DRAWDOWN", acct["halt_reason"])

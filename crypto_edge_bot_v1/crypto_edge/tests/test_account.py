@@ -4,14 +4,14 @@ import unittest
 from crypto_edge.execution.paper_broker import PaperBroker
 from crypto_edge.models import Candle
 from crypto_edge.portfolio.account import PaperAccount
-from helpers import default_meta, open_repo, temp_repo
+from helpers import STRATEGY, default_meta, open_repo, temp_repo
 
 
 class AccountTestBase(unittest.TestCase):
     def setUp(self):
         self.repo, self.path = temp_repo()
         self.broker = PaperBroker(10.0, 5.0, 10.0, use_book_spread=False)
-        self.acct = PaperAccount(self.repo, self.broker, 10_000.0)
+        self.acct = PaperAccount(self.repo, self.broker, 10_000.0, STRATEGY)
         self.meta = default_meta()
 
     def _open(self, symbol="SOL/USDT", price=100.0, qty=10.0, stop=90.0,
@@ -98,8 +98,8 @@ class TestDuplicateProtection(AccountTestBase):
         self.assertEqual(len(self.repo.get_trades()), 1)
 
     def test_candle_claim_is_atomic(self):
-        self.assertTrue(self.repo.mark_candle_processed("X|1h|1"))
-        self.assertFalse(self.repo.mark_candle_processed("X|1h|1"))
+        self.assertTrue(self.repo.mark_candle_processed("X|1h|1", STRATEGY))
+        self.assertFalse(self.repo.mark_candle_processed("X|1h|1", STRATEGY))
 
     def test_insufficient_cash_refused_and_candle_not_consumed_wrongly(self):
         pos, _ = self._open(qty=95.0)          # ~$9,500 of $10,000
@@ -119,7 +119,7 @@ class TestRestartPersistence(AccountTestBase):
         # simulate process death and cold start from the same file
         self.repo.conn.close()
         repo2 = open_repo(self.path)
-        acct2 = PaperAccount(repo2, self.broker, 10_000.0)
+        acct2 = PaperAccount(repo2, self.broker, 10_000.0, STRATEGY)
 
         self.assertAlmostEqual(acct2.cash(), cash_before, places=9)
         self.assertAlmostEqual(acct2.equity({"SOL/USDT": 115.0}), equity_before, places=9)
@@ -137,8 +137,8 @@ class TestRestartPersistence(AccountTestBase):
         self._open(candle_id="SOL/USDT|1h|1000")
         self.repo.conn.close()
         repo2 = open_repo(self.path)
-        self.assertTrue(repo2.is_candle_processed("SOL/USDT|1h|1000"))
-        self.assertFalse(repo2.mark_candle_processed("SOL/USDT|1h|1000"))
+        self.assertTrue(repo2.is_candle_processed("SOL/USDT|1h|1000", STRATEGY))
+        self.assertFalse(repo2.mark_candle_processed("SOL/USDT|1h|1000", STRATEGY))
 
     def test_closed_trades_survive_restart(self):
         pos, _ = self._open()

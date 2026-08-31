@@ -9,7 +9,7 @@ import logging
 import unittest
 
 from crypto_edge.selfcheck import CRITICAL, WARNING, SelfCheckReport, run_selfcheck
-from helpers import default_meta, temp_repo, test_config
+from helpers import STRATEGY, default_meta, temp_repo, test_config
 
 
 class NullNotifier:
@@ -55,7 +55,7 @@ class TestReportSemantics(unittest.TestCase):
 class TestOfflineSelfCheck(unittest.TestCase):
     def setUp(self):
         self.repo, _ = temp_repo()
-        self.repo.ensure_account(10_000.0)
+        self.repo.ensure_account(STRATEGY, 10_000.0)
 
     def test_offline_run_skips_network_checks_and_passes(self):
         cfg = test_config()
@@ -117,7 +117,7 @@ class TestSelfCheckLogging(unittest.TestCase):
 
     def test_warning_severity_failure_logs_as_warning_not_error(self):
         repo, _ = temp_repo()
-        repo.ensure_account(10_000.0)
+        repo.ensure_account(STRATEGY, 10_000.0)
         cfg = test_config()
         cfg.telegram.enabled = False
 
@@ -136,7 +136,7 @@ class TestSelfCheckLogging(unittest.TestCase):
 
     def test_critical_failure_logs_as_error(self):
         repo, _ = temp_repo()
-        repo.ensure_account(10_000.0)
+        repo.ensure_account(STRATEGY, 10_000.0)
         cfg = test_config()
         cfg.telegram.enabled = True
         cfg.telegram_token = ""
@@ -149,7 +149,7 @@ class TestSelfCheckLogging(unittest.TestCase):
 
     def test_log_message_does_not_read_as_a_success_claim(self):
         repo, _ = temp_repo()
-        repo.ensure_account(10_000.0)
+        repo.ensure_account(STRATEGY, 10_000.0)
         cfg = test_config()
         cfg.telegram.enabled = True
         cfg.telegram_token = ""

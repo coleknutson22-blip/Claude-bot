@@ -202,17 +202,48 @@ class Position:
     signal_score: float = 0.0
     mfe: float = 0.0             # max favourable excursion, price terms
     mae: float = 0.0             # max adverse excursion, price terms
+    # Capital reserved against this position. At 1x on a long it equals the
+    # entry notional, which is what makes the collateral account model below
+    # arithmetically identical to the old cash model -- see PaperAccount.
+    margin_held: float = 0.0
     journal: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # An open position ALWAYS has capital reserved against it. Zero is never
+        # a legitimate value -- it would contribute only its P&L to equity and
+        # silently vaporise the capital behind it -- so an unset margin means
+        # "fully collateralised", which is what 1x is.
+        if not self.margin_held or self.margin_held <= 0:
+            self.margin_held = self.qty * self.entry_fill_price
+
+    @property
+    def direction(self) -> int:
+        """+1 long, -1 short. The single place the sign of a trade is decided."""
+        return -1 if str(self.side).lower() == "short" else 1
+
+    @property
+    def is_short(self) -> bool:
+        return self.direction < 0
 
     @property
     def entry_notional(self) -> float:
         return self.qty * self.entry_fill_price
 
     def mark_value(self, price: float) -> float:
+        """GROSS exposure, always positive.
+
+        Exposure limits ask "how much market am I facing", not "what is my net
+        delta". Signing this would let a long and a short net to zero and report
+        an account holding two full positions as holding none.
+        """
         return self.qty * price
 
     def unrealized(self, price: float) -> float:
-        return (price - self.entry_fill_price) * self.qty
+        return (price - self.entry_fill_price) * self.qty * self.direction
+
+    def collateral_value(self, price: float) -> float:
+        """What this position contributes to equity: capital held + P&L on it."""
+        return self.margin_held + self.unrealized(price)
 
     def to_row(self) -> dict:
         d = asdict(self)
@@ -247,4 +278,7 @@ class ClosedTrade:
     mae: float
     duration_s: float
     equity_after: float
+    # Defaulted so a long -- the only side that existed before -- reads the same
+    # as it always did. close_position() always passes it explicitly.
+    side: str = "long"
     journal: dict[str, Any] = field(default_factory=dict)

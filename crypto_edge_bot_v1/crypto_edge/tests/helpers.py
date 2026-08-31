@@ -22,6 +22,11 @@ from crypto_edge.models import MarketMeta
 from crypto_edge.storage import db
 from crypto_edge.storage.repo import Repo
 
+# The strategy every fixture ledger belongs to. Sub-accounts are keyed by
+# strategy, so a test that opens a position and a test that reads the balance
+# have to be talking about the same one.
+STRATEGY = "trend_breakout"
+
 START_MS = 1_700_000_000_000  # 2023-11-14T22:13:20Z, aligned to the hour below
 HOUR = 3_600_000
 ALIGNED = (START_MS // HOUR) * HOUR

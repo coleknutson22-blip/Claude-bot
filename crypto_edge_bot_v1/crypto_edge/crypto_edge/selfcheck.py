@@ -72,7 +72,8 @@ def run_selfcheck(cfg: Config, repo: Repo | None, feed, notifier,
         rep.add("database integrity", False, CRITICAL, str(e))
 
     try:
-        acct = repo.ensure_account(cfg.execution.starting_equity)
+        acct = repo.ensure_account(cfg.strategy.name,
+                                   cfg.starting_equity_for(cfg.strategy.name))
         equity_ok = float(acct["cash"]) >= 0
         rep.add("account state", equity_ok, CRITICAL,
                 f"cash ${float(acct['cash']):,.2f}, "
@@ -84,7 +85,7 @@ def run_selfcheck(cfg: Config, repo: Repo | None, feed, notifier,
         return rep
 
     try:
-        positions = repo.get_positions()
+        positions = repo.get_positions(cfg.strategy.name)
         detail = f"{len(positions)} open position(s)"
         if positions:
             detail += ": " + ", ".join(

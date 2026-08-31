@@ -171,6 +171,11 @@ class RiskCfg:
 @dataclass
 class ExecutionCfg:
     starting_equity: float = 10_000.0
+    # Per-strategy opening balance, by strategy name. Every strategy gets an
+    # INDEPENDENT ledger seeded from here, so one strategy's open positions can
+    # never shrink another's available cash -- which would make the two
+    # incomparable. Unlisted strategies use `starting_equity`.
+    per_strategy_equity: dict = field(default_factory=dict)
     taker_fee_bps: float = 7.5          # 0.075%
     maker_fee_bps: float = 7.5
     slippage_bps: float = 6.0           # market-order slippage assumption
@@ -407,6 +412,11 @@ class Config:
         if "always_include" not in explicit or not self.universe.always_include:
             self.universe.always_include = [
                 self.market_for(b) for b in self.universe.always_include_bases]
+
+    def starting_equity_for(self, strategy: str) -> float:
+        """The opening balance for one strategy's sub-account."""
+        return float(self.execution.per_strategy_equity.get(
+            strategy, self.execution.starting_equity))
 
     def exchange_label(self) -> str:
         """The single string every surface should show for "which venue"."""

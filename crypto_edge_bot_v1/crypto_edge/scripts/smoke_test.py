@@ -255,7 +255,8 @@ def main() -> int:
     held_fill = engine4.broker.buy("SOL/USDT", 1.0, float(new_sol[-1]), None,
                                    feed2.load_markets()["SOL/USDT"], ts_ms=now_ms())
     engine4.account.open_position(
-        symbol="SOL/USDT", strategy="smoke", strategy_version="0",
+        symbol="SOL/USDT", strategy=engine4.cfg.strategy.name,
+        strategy_version="0",
         qty=1.0, ref_price=float(new_sol[-1]), fill=held_fill,
         initial_stop=float(new_sol[-1]) * 0.5, risk_amount=1.0,
         candle_id="smoke-outage-candle", signal_score=0.0, journal={})

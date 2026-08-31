@@ -59,6 +59,16 @@ def _bootstrap(args, need_feed: bool = True):
     return cfg, repo, feed, notifier
 
 
+def _strategy_arg(args, cfg: Config) -> str:
+    """Which ledger a read-only command is reporting on.
+
+    Sub-accounts are per strategy, so every report has to name one. The
+    configured strategy is the default, which keeps every existing invocation
+    meaning exactly what it meant before.
+    """
+    return getattr(args, "strategy", None) or cfg.strategy.name
+
+
 def _warn_if_venue_changed(cfg: Config, repo: Repo) -> None:
     """Say so, loudly, if this database was last used with a different venue."""
     try:
@@ -139,13 +149,15 @@ def cmd_status(args) -> int:
     # A database that has never run the engine has no account row yet; reporting
     # a clean starting balance is far more useful to an operator than a
     # traceback about missing state.
-    repo.ensure_account(cfg.execution.starting_equity)
-    perf = PerformanceCalculator(repo)
+    strategy = _strategy_arg(args, cfg)
+    repo.ensure_account(strategy, cfg.starting_equity_for(strategy))
+    perf = PerformanceCalculator(repo, strategy)
     rep = perf.report().as_dict()
     a, r, t = rep["account"], rep["risk"], rep["trading"]
-    acct = repo.get_account()
+    acct = repo.get_account(strategy)
     print("=" * 62)
     print(f"  CRYPTO EDGE — {cfg.safety.mode} MODE ({cfg.exchange_label()})")
+    print(f"  Strategy: {strategy}")
     print(f"  Exchange from: {cfg.exchange_source}")
     _warn_if_venue_changed(cfg, repo)
     print("=" * 62)
@@ -182,7 +194,7 @@ def cmd_status(args) -> int:
 def cmd_positions(args) -> int:
     cfg, repo, _, _ = _bootstrap(args, need_feed=False)
     print(f"# exchange: {cfg.exchange_label()} (from {cfg.exchange_source})")
-    positions = repo.get_positions()
+    positions = repo.get_positions(_strategy_arg(args, cfg))
     if not positions:
         print("No open positions.")
         return 0
@@ -194,8 +206,8 @@ def cmd_positions(args) -> int:
 
 
 def cmd_performance(args) -> int:
-    _, repo, _, _ = _bootstrap(args, need_feed=False)
-    perf = PerformanceCalculator(repo)
+    cfg, repo, _, _ = _bootstrap(args, need_feed=False)
+    perf = PerformanceCalculator(repo, _strategy_arg(args, cfg))
     rep = perf.report().as_dict()
     if args.json:
         print(json.dumps(rep, indent=2, default=str))
@@ -338,8 +350,10 @@ def cmd_verify_restart(args) -> int:
     import sqlite3
 
     cfg, repo, _, _ = _bootstrap(args, need_feed=False)
-    acct = repo.get_account()
-    positions = repo.get_positions()
+    strategy = _strategy_arg(args, cfg)
+    repo.ensure_account(strategy, cfg.starting_equity_for(strategy))
+    acct = repo.get_account(strategy)
+    positions = repo.get_positions(strategy)
     broad = repo.latest_broad_universe()
     outbox = repo.telegram_outbox_counts()
     candles = repo.conn.execute(
@@ -350,8 +364,8 @@ def cmd_verify_restart(args) -> int:
     conn2 = db.connect(cfg.engine.db_path)
     db.init_db(conn2)
     repo2 = Repo(conn2)
-    acct2 = repo2.get_account()
-    positions2 = repo2.get_positions()
+    acct2 = repo2.get_account(strategy)
+    positions2 = repo2.get_positions(strategy)
     broad2 = repo2.latest_broad_universe()
     outbox2 = repo2.telegram_outbox_counts()
     candles2 = repo2.conn.execute(
@@ -413,6 +427,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "coinbase, kucoin, okx) without editing any file")
     p.add_argument("--quote", default=None,
                    help="override the quote currency (e.g. USD instead of USDT)")
+    p.add_argument("--strategy", default=None,
+                   help="which strategy ledger to report on; each strategy has "
+                        "its own independent paper sub-account")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("selfcheck", help="run startup checks and exit")
