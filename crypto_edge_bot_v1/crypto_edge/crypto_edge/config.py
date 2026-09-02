@@ -155,6 +155,56 @@ class StrategyCfg:
 
 
 @dataclass
+class AggressiveCfg:
+    """Strategy B: fast rank-first LONG/SHORT momentum.
+
+    Every threshold here is separate from StrategyCfg. Strategy A's numbers are
+    not touched by anything in this block, and no value here feeds back into it.
+    """
+    enabled: bool = True
+    name: str = "aggressive_momentum_v2"
+    version: str = "0.1.0"
+    timeframes: list[str] = field(default_factory=lambda: ["5m", "15m", "1h"])
+    rank_timeframe: str = "1h"          # the cheap pass, already in memory
+
+    # --- shortlist: the bound on deep-analysis cost ----------------------
+    shortlist_size: int = 12            # 10-15; deep fetches never exceed this
+    rank_atr_band_lo: float = 0.3       # ATR% below this is untradable
+    rank_atr_band_hi: float = 6.0       # above this cannot be sized sanely
+
+    # --- directional agreement -------------------------------------------
+    min_momentum_agree: int = 3         # of 30m/1h/2h/3h/6h pointing the same way
+    # A window only VOTES if the move is big enough to mean something. Without
+    # a magnitude floor, a flat market's noise still has a sign, three of five
+    # windows agree by chance, and chop reads as a directional setup.
+    min_vote_atr: float = 0.15
+    min_ema_struct_15m: float = 0.5     # 15m stack must be constructive
+    max_hostile_ema_1h: float = -0.5    # 1h may be neutral, not hostile
+    min_trend_r2: float = 0.10          # some order, not pure noise
+    min_rel_volume: float = 0.9         # participation floor (A uses 1.2)
+    min_atr_pct: float = 0.25           # the move must be worth costs
+    # Each timeframe's last closed bar ends at a different instant, so their
+    # closes differ legitimately. A large gap means the frames are NOT the same
+    # market at the same time -- a stale or mismatched fetch -- and every
+    # cross-frame feature built from them is meaningless. Fail closed.
+    max_frame_price_spread_pct: float = 25.0
+
+    # --- exhaustion -------------------------------------------------------
+    max_extension_atr: float = 4.0      # ATRs beyond the swing level
+    max_move_atr_1h: float = 6.0        # a 1h move this large is already done
+
+    # --- regime vetoes ----------------------------------------------------
+    veto_longs_in_btc_bear: bool = True
+    veto_shorts_in_btc_bull: bool = True
+    min_breadth_for_long: float = 25.0
+    max_breadth_for_short: float = 75.0
+
+    # --- scoring ----------------------------------------------------------
+    min_setup_score: float = 50.0       # below this is NO_TRADE, not a small trade
+    stop_atr_mult: float = 1.8
+
+
+@dataclass
 class RiskCfg:
     risk_per_trade_pct: float = 0.5
     max_position_pct: float = 15.0      # max allocation to one position
@@ -262,6 +312,7 @@ class Config:
     exchange: ExchangeCfg = field(default_factory=ExchangeCfg)
     universe: UniverseCfg = field(default_factory=UniverseCfg)
     strategy: StrategyCfg = field(default_factory=StrategyCfg)
+    aggressive: AggressiveCfg = field(default_factory=AggressiveCfg)
     risk: RiskCfg = field(default_factory=RiskCfg)
     execution: ExecutionCfg = field(default_factory=ExecutionCfg)
     safety: SafetyCfg = field(default_factory=SafetyCfg)

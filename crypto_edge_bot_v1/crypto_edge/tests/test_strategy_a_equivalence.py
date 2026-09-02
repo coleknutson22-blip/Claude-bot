@@ -236,7 +236,9 @@ class TestTheV3MigrationPreservesEverything(unittest.TestCase):
         row = self.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()
         self.assertEqual(int(row["value"]), db.SCHEMA_VERSION)
-        self.assertEqual(db.SCHEMA_VERSION, 4)
+        self.assertGreaterEqual(db.SCHEMA_VERSION, 4,
+                                "the v3 database must migrate past the "
+                                "sub-accounts version, whatever comes after")
 
     def test_the_account_becomes_a_sub_account_owned_by_strategy_a(self):
         acct = self.repo.get_account("trend_breakout")
@@ -318,7 +320,9 @@ class TestAFreshDatabaseNeedsNoMigration(unittest.TestCase):
         repo, path = temp_repo()
         row = repo.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        self.assertEqual(int(row["value"]), 4)
+        self.assertEqual(int(row["value"]), db.SCHEMA_VERSION,
+                         "a fresh database is created at the current version, "
+                         "not migrated up to it")
 
     def test_a_new_database_has_no_legacy_account_table(self):
         repo, path = temp_repo()

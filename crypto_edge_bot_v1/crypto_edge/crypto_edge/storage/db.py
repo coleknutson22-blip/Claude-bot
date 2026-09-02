@@ -25,7 +25,7 @@ from pathlib import Path
 
 from ..timeutils import now_ms
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -157,6 +157,9 @@ CREATE TABLE IF NOT EXISTS observations (
     strategy_version TEXT NOT NULL,
     decision TEXT NOT NULL,
     reject_reason TEXT NOT NULL DEFAULT '',
+    -- A real column, not a JSON key: "are shorts stronger than longs?" is a
+    -- GROUP BY, and it is one of the four questions this database exists for.
+    side TEXT NOT NULL DEFAULT 'long',
     score REAL,
     rank INTEGER,
     price REAL,
@@ -488,7 +491,16 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
             "ALTER TABLE trades ADD COLUMN side TEXT NOT NULL DEFAULT 'long'")
 
 
-MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4}
+def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    """Record which SIDE each observation was. Pre-v5 rows were all longs."""
+    cols = _columns(conn, "observations")
+    if cols and "side" not in cols:
+        conn.execute(
+            "ALTER TABLE observations ADD COLUMN side TEXT NOT NULL DEFAULT 'long'")
+
+
+MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4,
+              4: _migrate_v4_to_v5}
 
 
 def init_db(conn: sqlite3.Connection) -> None:

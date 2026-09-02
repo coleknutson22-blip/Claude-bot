@@ -31,6 +31,9 @@ class MarketContext:
     blocked_symbols: dict[str, str] = field(default_factory=dict)
 
 
+LONG, SHORT, NO_TRADE = "long", "short", "none"
+
+
 @dataclass
 class Signal:
     symbol: str
@@ -44,13 +47,20 @@ class Signal:
     score: float
     passed: bool
     reject_reason: str = ""
+    # Which way. Defaulted to LONG so every existing single-sided strategy and
+    # every existing test reads exactly as it did before.
+    side: str = LONG
     components: dict[str, float] = field(default_factory=dict)
     features: dict[str, Any] = field(default_factory=dict)
     returns: np.ndarray | None = None     # for correlation checks
 
     @property
     def is_entry(self) -> bool:
-        return self.passed and self.score > 0
+        return self.passed and self.score > 0 and self.side in (LONG, SHORT)
+
+    @property
+    def direction(self) -> int:
+        return -1 if self.side == SHORT else 1
 
 
 class Strategy(Protocol):

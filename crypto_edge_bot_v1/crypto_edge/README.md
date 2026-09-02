@@ -281,6 +281,32 @@ the existing account becomes the sub-account of the strategy that traded it,
 with its history intact, and the pre-migration table is kept as
 `account_pre_v4` so the migration can be audited against its source.
 
+**Two strategies.** `trend_breakout` is the slow one: a 1h/4h Donchian
+breakout with trend, ADX and volume confirmation, long only.
+`aggressive_momentum_v2` is the fast one: 5m/15m/1h momentum, long **or**
+short, ranked before it is analysed. They run on separate ledgers and are
+reported separately.
+
+Strategy B replaces the binary breakout trigger with graded agreement across
+timeframes, which is what makes it willing to trade much more often — on 60
+synthetic markets it took 33 entries where `trend_breakout` took 1, split
+across both sides. The gates that protect the account are unchanged: data
+sanity, the ATR floor, liquidity, exhaustion and regime hostility are all still
+hard vetoes.
+
+Ranking is direction-agnostic and deterministic — a collapse is as interesting
+as a rally, and ties break on symbol name so the same inputs always give the
+same order. Only the top `shortlist_size` (12) candidates are deepened with 5m
+and 15m data, so deep-analysis cost is bounded by configuration rather than by
+how many markets qualify. With the candle cache warm, a 12-symbol scan makes
+**zero** requests between bar closes.
+
+To see what Strategy B makes of the live market without trading anything:
+
+```bash
+python -m crypto_edge.cli --exchange kraken --quote USD scan
+```
+
 To see exactly which markets survive each gate and why:
 
 ```bash
@@ -298,7 +324,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 685 automated tests, all passing
+### VERIFIED OFFLINE — 766 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -376,7 +402,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               685 tests
+tests/               766 tests
 ```
 
 ## Safety notes

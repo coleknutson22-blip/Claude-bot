@@ -341,6 +341,86 @@ def cmd_diagnose(args) -> int:
     return 0
 
 
+def cmd_scan(args) -> int:
+    """Rank the live universe and show what Strategy B would do. NO TRADING.
+
+    Stage 2 is signal generation: this ranks, deepens the shortlist and prints
+    a side and a score per candidate. Nothing is sized and no position is
+    opened -- that is Stage 3.
+    """
+    from .research.journal import ResearchJournal
+    from .scan import scan
+    from .strategy.base import MarketContext
+    from .strategy.regime import btc_regime, market_breadth
+
+    from .data.universe import UniverseBuilder
+    from .engine import TradingEngine
+
+    cfg, repo, feed, notifier = _bootstrap(args, need_feed=True)
+    a = cfg.aggressive
+    engine = TradingEngine(cfg, repo, feed, notifier)
+    engine.refresh_universe(force=True)
+    symbols = list(engine.status.universe)
+    if not symbols:
+        print(f"No candidates: {engine.status.broad_universe_reason}")
+        return 1
+    engine.fetch_data(symbols)
+
+    hourly = {s: engine.series_for(a.rank_timeframe).get(s) for s in symbols}
+    hourly = {k: v for k, v in hourly.items() if v is not None}
+    btc_1h = engine.series_for(a.rank_timeframe).get(cfg.strategy.btc_symbol)
+    label, score = btc_regime(engine.series_for(cfg.strategy.regime_timeframe).get(
+        cfg.strategy.btc_symbol), cfg.strategy.regime_ema)
+    ctx = MarketContext(
+        ts_ms=now_ms(), btc_regime=label, btc_regime_score=score,
+        breadth_pct=market_breadth(hourly, cfg.strategy.regime_ema),
+        n_candidates=len(hourly), blocked_symbols=repo.blocked_symbols(now_ms()))
+
+    tickers = getattr(engine, "_tickers", {}) or {}
+    meta = {}
+    for sym in hourly:
+        t = tickers.get(sym) or {}
+        qv, _how = UniverseBuilder.quote_volume(t)
+        meta[sym] = {"dollar_volume": qv,
+                     "spread_bps": UniverseBuilder.spread_bps(t)}
+
+    t0 = time.time()
+    res = scan(cfg, feed, ctx, rank_series=hourly, btc_1h=btc_1h,
+               meta_by_symbol=meta, now_ms=now_ms(),
+               buffer_ms=cfg.safety.candle_close_buffer_s * 1000)
+    elapsed = time.time() - t0
+
+    print("=" * 78)
+    print(f"OPPORTUNITY SCAN -- {cfg.exchange_label()} -- {a.name} v{a.version}")
+    print("=" * 78)
+    print(f"  BTC regime {label} ({score:.0f})   breadth {ctx.breadth_pct:.0f}%   "
+          f"candidates {len(res.ranked)}   shortlist {len(res.shortlist)}")
+    print(f"  deep fetches {res.deep_fetches} (bounded by shortlist_size="
+          f"{a.shortlist_size})   scan took {elapsed:.1f}s")
+    print("-" * 78)
+    print(f"  {'#':>2} {'SYMBOL':<14} {'RANK':>5} {'SIDE':<6} {'SETUP':>6}  DETAIL")
+    journal = ResearchJournal(repo)
+    for sig in res.signals:
+        mark = "ENTRY" if sig.passed else ""
+        detail = mark or sig.reject_reason[:34]
+        print(f"  {sig.features['rank']:>2} {sig.symbol:<14} "
+              f"{sig.features['rank_score']:>5.1f} {sig.side:<6} "
+              f"{sig.score:>6.1f}  {detail}")
+        journal.record(sig, "ENTERED" if sig.passed else "REJECTED_STRATEGY",
+                       rank=sig.features["rank"])
+    repo.conn.commit()
+    print("-" * 78)
+    longs = len([s for s in res.entries if s.side == "long"])
+    shorts = len([s for s in res.entries if s.side == "short"])
+    print(f"  {len(res.entries)} tradable setup(s): {longs} long, {shorts} short "
+          f"-- RECORDED ONLY, nothing was traded")
+    if res.fetch_failures:
+        print(f"  {len(res.fetch_failures)} symbol(s) skipped on data: "
+              f"{', '.join(sorted(res.fetch_failures))}")
+    print("=" * 78)
+    return 0
+
+
 def cmd_verify_restart(args) -> int:
     """Prove that stopping and restarting loses nothing.
 
@@ -481,6 +561,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="probe at most N surviving symbols in stage 2 "
                         "(each costs one history fetch)")
     s.set_defaults(func=cmd_diagnose)
+
+    sub.add_parser("scan",
+                   help="rank the live universe and show what "
+                        "aggressive_momentum_v2 would do -- RECORDS ONLY, "
+                        "never trades"
+                   ).set_defaults(func=cmd_scan)
 
     sub.add_parser("verify-restart",
                    help="prove persisted state survives a restart"

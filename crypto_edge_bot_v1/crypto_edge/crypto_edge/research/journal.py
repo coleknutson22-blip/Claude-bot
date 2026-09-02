@@ -32,6 +32,7 @@ class ResearchJournal:
             "ts_ms": sig.ts_ms, "symbol": sig.symbol, "candle_id": sig.candle_id,
             "strategy": sig.strategy, "strategy_version": sig.version,
             "decision": decision, "reject_reason": reject_reason or sig.reject_reason,
+            "side": getattr(sig, "side", "long"),
             "score": sig.score, "rank": rank,
             "price": sig.ref_price if sig.ref_price > 0 else None,
             "features": _jsonable(features)})
