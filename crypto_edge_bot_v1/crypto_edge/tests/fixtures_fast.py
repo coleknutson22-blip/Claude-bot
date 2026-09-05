@@ -123,3 +123,48 @@ def mirror(fr: dict[str, Series]) -> dict[str, Series]:
     """
     pivot = float(fr["15m"].close[0])
     return {tf: mirror_series(s, pivot) for tf, s in fr.items()}
+
+
+def restamp_to_now(s: Series, now: int | None = None) -> Series:
+    """Same prices, shifted so the LAST bar has just closed relative to `now`.
+
+    The paths above are anchored to a fixed BASE_MS so they stay reproducible.
+    An engine-level test also has to satisfy the freshness guards, which are
+    about the clock rather than the prices, so the two concerns are separated:
+    build the market once, then move it to the present.
+    """
+    from crypto_edge.timeutils import floor_to_tf, now_ms as _now
+    step = tf_ms(s.timeframe)
+    now = now if now is not None else _now()
+    start = floor_to_tf(now, s.timeframe) - step - (len(s) - 1) * step
+    ms = np.array([start + i * step for i in range(len(s))], dtype=np.int64)
+    return Series(s.symbol, s.timeframe, ms, s.open, s.high, s.low,
+                  s.close, s.volume)
+
+
+def engine_feed(symbols: list[str], *, n_5m: int = 6000, seed: int = 700,
+                now: int | None = None):
+    """A FixtureFeed serving 5m, 15m, 1h AND 4h -- what a real venue serves.
+
+    `helpers.build_feed` holds only 1h and 4h, and `FixtureFeed._derive` can
+    only resample COARSER. So a 1h fixture cannot answer a 5m request at all,
+    and Strategy B run against one silently evaluates nothing: every deep fetch
+    raises DataUnavailable and lands in `fetch_failures`. That is a property of
+    the fixture, not of the wiring, and this builder is what tells the two
+    apart.
+    """
+    from crypto_edge.data.fixture_feed import FixtureFeed
+    from crypto_edge.models import MarketMeta
+
+    series, markets = {}, {}
+    for i, sym in enumerate(symbols):
+        # Spread the drift across the symbols so the shortlist has both sides
+        # to rank rather than one direction repeated.
+        fr = frames((i - 2) * 0.00035, seed=seed + i, symbol=sym,
+                    n_5m=n_5m, include_4h=True)
+        for tf, s in fr.items():
+            series[(sym, tf)] = restamp_to_now(s, now)
+        base, _, quote = sym.partition("/")
+        markets[sym] = MarketMeta(sym, base, quote or "USDT", True,
+                                  6, 6, 1e-6, 5.0)
+    return FixtureFeed(series, markets), markets

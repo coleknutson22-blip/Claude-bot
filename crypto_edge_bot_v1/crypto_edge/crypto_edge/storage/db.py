@@ -25,7 +25,7 @@ from pathlib import Path
 
 from ..timeutils import now_ms
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS trades (
     fees REAL NOT NULL,
     slippage_cost REAL NOT NULL,
     net_pnl REAL NOT NULL,
+    financing REAL NOT NULL DEFAULT 0,
     return_pct REAL NOT NULL,
     account_return_pct REAL NOT NULL,
     mfe REAL NOT NULL,
@@ -499,8 +500,17 @@ def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
             "ALTER TABLE observations ADD COLUMN side TEXT NOT NULL DEFAULT 'long'")
 
 
+def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    """Record simulated short financing per trade. Longs pay none, and every
+    pre-v6 trade was a long, so backfilling zero is exact rather than assumed."""
+    cols = _columns(conn, "trades")
+    if cols and "financing" not in cols:
+        conn.execute(
+            "ALTER TABLE trades ADD COLUMN financing REAL NOT NULL DEFAULT 0")
+
+
 MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4,
-              4: _migrate_v4_to_v5}
+              4: _migrate_v4_to_v5, 5: _migrate_v5_to_v6}
 
 
 def init_db(conn: sqlite3.Connection) -> None:

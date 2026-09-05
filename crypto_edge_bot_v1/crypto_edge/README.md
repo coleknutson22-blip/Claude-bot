@@ -301,6 +301,71 @@ and 15m data, so deep-analysis cost is bounded by configuration rather than by
 how many markets qualify. With the candle cache warm, a 12-symbol scan makes
 **zero** requests between bar closes.
 
+**How Strategy B sizes a trade.** Three position slots. Each takes a
+percentage of the cash still free when it opens — 50%, then 75% of what
+remains, then 100% — multiplied by a confidence allocation multiplier. Two
+consequences follow from the design rather than from a bug: at full confidence
+the account ends fully deployed, and when early slots are small a later slot
+can be *larger* than an earlier one (at the 40% multiplier the sequence is
+2,000 / 2,400 / 2,240 on a 10,000 balance).
+
+`setup_score` and `confidence` are kept as separate fields. In Phase 1 the
+transform between them is the identity, so the numbers are equal — but they
+mean different things, and the buckets below are a hypothesis being tested, not
+a calibration that has been measured. Nothing yet shows that an 85 wins more
+often than a 65; that is the experiment the journal exists to run.
+
+| Confidence | Allocation |
+|---|---|
+| below 60 | no trade |
+| 60–69 | 40% |
+| 70–79 | 60% |
+| 80–89 | 80% |
+| 90–94 | 90% |
+| 95+ | 100% |
+
+**The ladder proposes; risk disposes.** A percentage of cash says nothing about
+how much can be *lost* — the same allocation is a 0.5% or a 5% account risk
+depending on where the stop sits. So the ladder's number is only a ceiling, and
+the final size is the smallest of four independent limits:
+
+```
+notional = min(ladder x confidence,   <- what the ladder offers
+               max_loss / stop%,      <- what the loss ceiling permits
+               exposure room,         <- portfolio limit
+               affordable cash)       <- what is actually there
+
+max_loss = min(1% of equity, 60% of the REMAINING daily drawdown buffer)
+```
+
+Which limit actually bound is recorded on every trade as `binding_constraint`,
+so "is the risk cap doing anything, or is the ladder always the one that
+binds?" is a query rather than a reconstruction. The second term of `max_loss`
+matters on a bad day: a flat 1% of equity is the same size on a flat day as on
+one already down 2.5% of a 3% limit, and scaling to what is left means the last
+trade before a halt cannot be the one that causes it.
+
+Leverage is **1x** and configurable, and is deliberately not the same knob as
+confidence — confidence scales *allocation*, never borrowing.
+
+**Shorts are not free.** Kraken spot cannot be sold short at all; a real short
+needs the margin product and pays for it. Simulated borrow accrues at a
+configurable 15 bps/day, is journalled separately from P&L, and is charged
+against open equity rather than only at the close. A long cannot lose more than
+it paid — price stops at zero — but a short has no such floor, so a forced
+close fires at 80% of collateral consumed, standing in for the margin call a
+paper ledger does not have.
+
+**Every exit is arithmetic on a price and a clock.** The bot this strategy is
+modelled on delegated its time exit to a local LLM; when the model was
+unreachable the call returned `None`, no exit fired, and the position was held
+indefinitely with no error. An exit path that can fail open is not an exit
+path. So: initial hard stop, 2R profit target, breakeven at 1R, chandelier
+trail from 1.5R, momentum invalidation when 15m structure flips against the
+position, an 8h time stop (4h if the trade has not made 0.5R), hostile-regime
+exit, and the forced short close. No model, no network, no optional dependency
+participates in any of them.
+
 To see what Strategy B makes of the live market without trading anything:
 
 ```bash
@@ -324,7 +389,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 793 automated tests, all passing
+### VERIFIED OFFLINE — 915 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -393,16 +458,18 @@ crypto_edge/
   data/              feed protocol, ccxt feed, fixture feed, broad (market-cap)
                      asset universe, venue universe builder
   verify_live.py     live-network verification harness (cli verify-live)
-  strategy/          regime, scoring, trend_breakout
+  strategy/          regime, scoring, trend_breakout,
+                     aggressive_momentum (B), ranking, confidence
   execution/         paper broker: sizing, fills, fees, slippage, stops
-  portfolio/         account, risk manager, stop logic
+  portfolio/         account, risk manager, stop logic,
+                     capital ladder, Strategy B exits
   storage/           schema and repository
   intel/             news, token events, derivatives
   research/          decision journal, counterfactuals
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               793 tests
+tests/               915 tests
 ```
 
 ## Safety notes

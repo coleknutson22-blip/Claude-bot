@@ -211,6 +211,66 @@ class AggressiveCfg:
     min_setup_score: float = 50.0       # below this is NO_TRADE, not a small trade
     stop_atr_mult: float = 1.8
 
+    # ================================ STAGE 3: SIZING AND EXITS ============
+    # --- three-position capital ladder ------------------------------------
+    # Percentage of the strategy's REMAINING free cash available to each slot
+    # in turn. Slot 1 takes 50% of the cash on hand, slot 2 takes 75% of what
+    # is left after that, slot 3 all of the remainder -- so at full confidence
+    # the ladder deploys the whole balance across three positions.
+    max_open_positions: int = 3
+    ladder_ceilings_pct: list[float] = field(
+        default_factory=lambda: [50.0, 75.0, 100.0])
+
+    # --- confidence -> allocation ----------------------------------------
+    # setup_score and confidence are kept SEPARATE on purpose. In Phase 1 the
+    # transform is the identity, so confidence == setup_score; the field exists
+    # so a calibrated mapping can replace it later without touching sizing.
+    # NOT a probability -- see strategy/confidence.py.
+    confidence_is_identity: bool = True
+    min_confidence: float = 60.0        # below this is NO TRADE, not a small one
+    confidence_buckets: list = field(default_factory=lambda: [
+        {"min": 60.0, "mult": 0.40},
+        {"min": 70.0, "mult": 0.60},
+        {"min": 80.0, "mult": 0.80},
+        {"min": 90.0, "mult": 0.90},
+        {"min": 95.0, "mult": 1.00},
+    ])
+
+    # --- hard per-trade risk ceiling --------------------------------------
+    # max_loss = min(max_loss_pct of equity, daily_buffer_fraction of the
+    # REMAINING daily drawdown buffer). The second term tightens automatically
+    # as the day's losses accumulate, so the last trade before the daily halt
+    # cannot be the one that causes it.
+    max_loss_pct: float = 1.0
+    daily_buffer_fraction: float = 0.60
+    # Separate from confidence, and deliberately 1.0: Phase 1 is a test of
+    # whether the SIGNAL has an edge. Leverage multiplies whatever is there,
+    # including a negative number.
+    leverage: float = 1.0
+    max_exposure_pct: float = 100.0     # the ladder is designed to reach 100%
+
+    # --- paper shorts ------------------------------------------------------
+    # A short is not free money. Kraken spot cannot be sold short at all, so a
+    # real one needs the margin product and pays financing; charging nothing
+    # would make every short look better than it is and corrupt the one
+    # comparison this strategy exists to make.
+    short_borrow_bps_per_day: float = 15.0
+    # Force a close while collateral still covers the loss. A 1x short loses
+    # its whole collateral if price doubles, and unlike a long its downside is
+    # unbounded -- there is no "worth zero" floor to stop at.
+    short_force_close_at_loss_pct: float = 80.0
+
+    # --- deterministic exits ----------------------------------------------
+    target_r: float = 2.0               # profit target, in R
+    breakeven_at_r: float = 1.0
+    breakeven_offset_r: float = 0.1
+    trail_start_r: float = 1.5          # trail only once genuinely in profit
+    trail_atr_mult: float = 2.5
+    time_stop_hours: float = 8.0        # intraday: hours, not days
+    time_stop_early_hours: float = 4.0  # earlier exit if it has gone nowhere
+    time_stop_min_r: float = 0.5
+    exit_on_hostile_regime: bool = True
+
 
 @dataclass
 class RiskCfg:

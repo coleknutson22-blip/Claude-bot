@@ -38,11 +38,20 @@ class PaperAccount:
     """
 
     def __init__(self, repo: Repo, broker: PaperBroker, starting_equity: float,
-                 strategy: str) -> None:
+                 strategy: str, borrow_bps_per_day: float = 0.0) -> None:
         self.repo = repo
         self.broker = broker
         self.strategy = strategy
+        # Simulated short borrow. Zero for a long-only strategy, so Strategy A
+        # is untouched by its presence.
+        self.borrow_bps_per_day = float(borrow_bps_per_day)
         self.repo.ensure_account(strategy, starting_equity)
+
+    def financing(self, pos: Position, now: int | None = None) -> float:
+        """Borrow accrued on one position so far. Longs always zero."""
+        from .aggressive_exits import financing_cost
+        return financing_cost(pos, now if now is not None else now_ms(),
+                              self.borrow_bps_per_day)
 
     # ----------------------------------------------------------- state read
     @property
@@ -63,10 +72,18 @@ class PaperAccount:
         return total
 
     def position_value(self, marks: dict[str, float]) -> float:
-        """What the open positions contribute to equity."""
+        """What the open positions contribute to equity, financing deducted.
+
+        Accrued borrow is subtracted while the position is still OPEN. Charging
+        it only at exit would let a short's equity read high for as long as it
+        stayed open and then drop on close -- the cost would be real but
+        invisible until it was too late to act on.
+        """
         total = 0.0
+        now = now_ms()
         for p in self.positions():
             total += p.collateral_value(marks.get(p.symbol, p.entry_fill_price))
+            total -= self.financing(p, now)
         return total
 
     def equity(self, marks: dict[str, float]) -> float:
@@ -153,7 +170,10 @@ class PaperAccount:
         # this is identical to the old `notional - fee`:
         #   margin + (exit-entry)*qty - fee  ==  qty*exit - fee
         gross_move = (fill.fill_price - pos.entry_fill_price) * pos.qty * pos.direction
-        proceeds = pos.margin_held + gross_move - fill.fee
+        borrow = self.financing(pos, fill.ts_ms)
+        proceeds = pos.margin_held + gross_move - fill.fee - borrow
+        pnl["net_pnl"] -= borrow
+        pnl["financing"] = borrow
 
         try:
             with self.repo.tx():
@@ -187,6 +207,7 @@ class PaperAccount:
                     initial_stop=pos.initial_stop, final_stop=pos.current_stop,
                     gross_pnl=pnl["gross_pnl"], fees=pnl["fees"],
                     slippage_cost=pnl["slippage_cost"], net_pnl=pnl["net_pnl"],
+                    financing=borrow,
                     return_pct=(pnl["net_pnl"] / entry_notional * 100.0) if entry_notional else 0.0,
                     account_return_pct=(pnl["net_pnl"] / equity_after * 100.0) if equity_after else 0.0,
                     mfe=pos.mfe, mae=pos.mae,
@@ -217,9 +238,9 @@ class PaperAccount:
             return None
 
         log_event("trades", "INFO", "EXIT", symbol=pos.symbol, reason=exit_reason,
-                  gross=pnl["gross_pnl"], fees=pnl["fees"],
-                  slippage=pnl["slippage_cost"], net=pnl["net_pnl"],
-                  trade_id=trade.id)
+                  side=pos.side, gross=pnl["gross_pnl"], fees=pnl["fees"],
+                  slippage=pnl["slippage_cost"], financing=borrow,
+                  net=pnl["net_pnl"], trade_id=trade.id)
         return trade
 
     # ------------------------------------------------------ mark to market

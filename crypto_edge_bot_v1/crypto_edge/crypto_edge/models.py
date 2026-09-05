@@ -281,4 +281,7 @@ class ClosedTrade:
     # Defaulted so a long -- the only side that existed before -- reads the same
     # as it always did. close_position() always passes it explicitly.
     side: str = "long"
+    # Simulated borrow paid on a short. Zero for a long, which is exact rather
+    # than a default: a long borrows nothing.
+    financing: float = 0.0
     journal: dict[str, Any] = field(default_factory=dict)

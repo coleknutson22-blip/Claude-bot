@@ -115,7 +115,9 @@ def build_feed(closes_by_symbol, spike_last=True) -> FixtureFeed:
 
 def show(engine, label):
     marks = {p.symbol: p.entry_fill_price for p in engine.account.positions()}
-    rep = PerformanceCalculator(engine.repo).report(marks=marks)
+    # Two sub-accounts now exist, so a report has to name its ledger.
+    rep = PerformanceCalculator(engine.repo,
+                                engine.cfg.strategy.name).report(marks=marks)
     a = rep.account
     print(f"    {label}: equity ${a['current_equity']:,.2f}  "
           f"cash ${a['cash']:,.2f}  open {rep.risk['open_positions']}  "

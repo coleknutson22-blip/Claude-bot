@@ -103,6 +103,14 @@ class TradingEngine:
         self.strategy = TrendBreakoutStrategy(cfg.strategy)
         self.journal = ResearchJournal(repo)
         self.perf = PerformanceCalculator(repo, cfg.strategy.name)
+        # Strategy B rides along on the SAME data: same feed, same candle
+        # cache, same universe, same context. It owns its own ledger, entries
+        # and exits, so nothing here touches Strategy A's execution path.
+        self.aggressive = None
+        if getattr(cfg, "aggressive", None) and cfg.aggressive.enabled:
+            from .aggressive_runtime import AggressiveRuntime
+            self.aggressive = AggressiveRuntime(cfg, repo, feed, notifier,
+                                                self.broker, self.journal)
         self.universe_builder = UniverseBuilder(cfg.universe)
         self.market_age = MarketAgeService(
             repo, probe_timeframe=cfg.universe.age_probe_timeframe,
@@ -291,8 +299,13 @@ class TradingEngine:
         fetch per symbol rather than a second engine.
         """
         c = self.cfg
-        return list(dict.fromkeys(
-            [c.strategy.entry_timeframe, c.strategy.regime_timeframe]))
+        tfs = [c.strategy.entry_timeframe, c.strategy.regime_timeframe]
+        if self.aggressive is not None:
+            # Only the RANKING timeframe. The 5m and 15m frames are fetched by
+            # the scan for the shortlist alone -- pulling them for the whole
+            # universe here is exactly the cost the two-phase scan avoids.
+            tfs.append(c.aggressive.rank_timeframe)
+        return list(dict.fromkeys(tfs))
 
     def series_for(self, timeframe: str) -> dict[str, Series]:
         return self._series.setdefault(timeframe, {})
@@ -822,7 +835,58 @@ class TradingEngine:
         else:
             signals = self.evaluate_signals(ctx)
             self.rank_and_enter(signals, ctx)
+        self._run_aggressive(ctx, entries_allowed=bool(safe and universe_ok))
         self.bookkeeping()
+
+    def _run_aggressive(self, ctx: MarketContext, *, entries_allowed: bool) -> None:
+        """One Strategy B pass. Never raises into Strategy A's cycle.
+
+        B is an experiment running beside a strategy with real recorded
+        history. A fault in the experiment must not stop the incumbent from
+        managing its own positions, so the whole pass is contained: it is
+        logged and the cycle continues.
+        """
+        rt = self.aggressive
+        if rt is None:
+            return
+        a = self.cfg.aggressive
+        try:
+            rank_series = dict(self.series_for(a.rank_timeframe))
+            held = {p.symbol for p in rt.account.positions()}
+            frames_by_symbol = {
+                sym: {tf: self.series_for(tf).get(sym) for tf in a.timeframes}
+                for sym in held}
+            # A held symbol's fast frames are not in the engine's store, so
+            # fetch them here: an open position must always be manageable.
+            for sym in held:
+                for tf in a.timeframes:
+                    if frames_by_symbol[sym].get(tf) is None:
+                        try:
+                            raw = self.feed.fetch_ohlcv(
+                                sym, tf, self.cfg.required_history_bars(tf))
+                            frames_by_symbol[sym][tf] = raw.drop_unclosed(
+                                now_ms(), self.buffer_ms)
+                        except DataUnavailable as e:
+                            log_event("data", "WARNING",
+                                      "no data for open Strategy B position",
+                                      symbol=sym, timeframe=tf, error=str(e))
+            rt.manage(ctx, frames_by_symbol, self._markets)
+            series_5m = {s: fr.get("5m") for s, fr in frames_by_symbol.items()}
+            if not rt.check_safety(series_5m):
+                return
+            meta_by = {}
+            for sym in rank_series:
+                t = (self._tickers or {}).get(sym) or {}
+                qv, _ = self.universe_builder.quote_volume(t)
+                meta_by[sym] = {"dollar_volume": qv,
+                                "spread_bps": self.universe_builder.spread_bps(t)}
+            rt.scan_and_enter(ctx, rank_series=rank_series,
+                              btc_1h=rank_series.get(self.cfg.strategy.btc_symbol),
+                              meta_by_symbol=meta_by, markets=self._markets,
+                              entries_allowed=entries_allowed)
+        except Exception as e:
+            log_event("app", "ERROR", "Strategy B pass failed",
+                      strategy=a.name, error=str(e))
 
     def pause_after_cycle(self, elapsed: float) -> float:
         """Seconds to wait before starting the next cycle. NEVER ZERO.

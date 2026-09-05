@@ -8,7 +8,7 @@ Environment: Python 3.12.3, numpy 2.4.4, SQLite 3.45.1, **no outbound network**
 ## WHAT YOU CHANGED
 
 Built from scratch. Nothing from the previous bots was reused, per your
-instruction. 38 modules, ~7,900 lines including tests.
+instruction. 51 modules, ~22,700 lines including tests.
 
 **Foundation.** UTC millisecond epochs everywhere, with a deterministic
 `candle_id(symbol, timeframe, open_ms)` that is the backbone of duplicate
@@ -98,7 +98,7 @@ message text (defect 2 above), not a wrong severity.
 
 ## TEST RESULTS
 
-**793 tests, all passing.** Run: `python -m crypto_edge.cli test`
+**915 tests, all passing.** Run: `python -m crypto_edge.cli test`
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -132,6 +132,8 @@ message text (defect 2 above), not a wrong severity.
 | `test_strategy_isolation.py` | 27 | Two strategies cannot collide on candles, positions, cash, halts or reporting |
 | `test_cycle_pacing.py` | 33 | Cycles never overlap, no backlog, no zero-pause hot loop, closed-candle cache correctness and fail-closed |
 | `test_quote_currency.py` | 28 | Quote currency as one source of truth: BTC reference, always-include, volume units, provenance on change, no threshold moved |
+| `test_ladder_sizing.py` | 43 | The 50/75/100 ladder, every confidence-bucket boundary, the risk cap overruling the ladder, the daily-buffer taper, long/short sizing symmetry, leverage kept separate from confidence |
+| `test_aggressive_execution.py` | 79 | Direction-signed R, stops that only ratchet, all seven deterministic exits, short borrow accrual, forced close before a collateral breach, restart with three open positions, and Strategy B inside a real engine cycle |
 
 The tests worth singling out, because they are the ones that would catch a real
 loss of money:
@@ -308,7 +310,7 @@ live but query tables no production code writes to. **A news event cannot
 currently stop a trade, and no funding or open-interest data is being
 recorded.** See the status table in the README.
 
-**7. Synthetic test data is a limited proxy.** 793 passing tests prove the
+**7. Synthetic test data is a limited proxy.** 915 passing tests prove the
 system is internally consistent and behaves correctly against data I generated.
 They cannot prove it behaves correctly against data reality generates.
 
