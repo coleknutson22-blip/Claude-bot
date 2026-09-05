@@ -98,7 +98,7 @@ message text (defect 2 above), not a wrong severity.
 
 ## TEST RESULTS
 
-**780 tests, all passing.** Run: `python -m crypto_edge.cli test`
+**793 tests, all passing.** Run: `python -m crypto_edge.cli test`
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -126,7 +126,7 @@ message text (defect 2 above), not a wrong severity.
 | `test_volume_semantics.py` | 18 | Quote-currency derivation, missing-is-not-zero, threshold unchanged |
 | `test_candle_freshness.py` | 30 | Freshness measured from the close, the CCXT head-truncation regression, boundary cases, genuinely stale data, incomplete-candle removal |
 | `test_cli_runtime_imports.py` | 14 | Every CLI command RUNS, not just parses; every module resolves its global names |
-| `test_aggressive_momentum.py` | 53 | Strategy B: causal features, long/short symmetry, regime vetoes, exhaustion, determinism, Strategy A untouched |
+| `test_aggressive_momentum.py` | 66 | Strategy B: causal features, long/short symmetry, regime vetoes, exhaustion, determinism, Strategy A untouched |
 | `test_opportunity_ranking.py` | 28 | Deterministic ranking, shortlist cutoff, no randomness in the path, bounded deep-fetch cost |
 | `test_strategy_a_equivalence.py` | 25 | Strategy A is bit-identical after the multi-strategy refactor; v3→v4 migration preserves the ledger |
 | `test_strategy_isolation.py` | 27 | Two strategies cannot collide on candles, positions, cash, halts or reporting |
@@ -308,7 +308,7 @@ live but query tables no production code writes to. **A news event cannot
 currently stop a trade, and no funding or open-interest data is being
 recorded.** See the status table in the README.
 
-**7. Synthetic test data is a limited proxy.** 780 passing tests prove the
+**7. Synthetic test data is a limited proxy.** 793 passing tests prove the
 system is internally consistent and behaves correctly against data I generated.
 They cannot prove it behaves correctly against data reality generates.
 

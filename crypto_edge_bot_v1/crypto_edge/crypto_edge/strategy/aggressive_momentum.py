@@ -165,6 +165,34 @@ class AggressiveMomentumStrategy:
                           for k, w in WEIGHTS.items()) / total)
 
     # ------------------------------------------------------------ direction
+    def _blockers(self, f: dict, side: str) -> list[str]:
+        """Every condition standing between this symbol and a trade on `side`.
+
+        Returned as a list rather than a first-failure string so a rejection can
+        say "momentum agreement 2/5 < 3; 1h structure -1.00 hostile" instead of
+        naming whichever check happened to be written first.
+        """
+        c = self.cfg
+        d = 1 if side == LONG else -1
+        m_atr = f.get("momentum_atr", {})
+        struct15 = f.get("ema_struct_15m", NAN)
+        struct1h = f.get("ema_struct_1h", NAN)
+        out: list[str] = []
+
+        votes = momentum_votes(m_atr, d, c.min_vote_atr)
+        if votes < c.min_momentum_agree:
+            out.append(f"momentum agreement {votes}/{len(VOTING_WINDOWS)} "
+                       f"< {c.min_momentum_agree}")
+        if not np.isfinite(struct15):
+            out.append("15m structure unavailable")
+        elif struct15 * d < c.min_ema_struct_15m:
+            want = "bullish" if d > 0 else "bearish"
+            out.append(f"15m structure {struct15:+.2f} not {want} enough "
+                       f"(need {c.min_ema_struct_15m * d:+.2f})")
+        if np.isfinite(struct1h) and struct1h * d <= c.max_hostile_ema_1h:
+            out.append(f"1h structure {struct1h:+.2f} hostile to a {side}")
+        return out
+
     def choose_side(self, f: dict, ctx: MarketContext) -> tuple[str, str]:
         """Pick a side, or explain why neither is available.
 
@@ -174,28 +202,24 @@ class AggressiveMomentumStrategy:
         """
         c = self.cfg
         m_atr = f.get("momentum_atr", {})
-        long_votes = momentum_votes(m_atr, 1, c.min_vote_atr)
-        short_votes = momentum_votes(m_atr, -1, c.min_vote_atr)
         struct15 = f.get("ema_struct_15m", NAN)
         struct1h = f.get("ema_struct_1h", NAN)
 
         if not np.isfinite(struct15):
             return NO_TRADE, "15m EMA structure unavailable"
 
-        long_ok = (long_votes >= c.min_momentum_agree
-                   and struct15 >= c.min_ema_struct_15m
-                   and (not np.isfinite(struct1h) or struct1h > c.max_hostile_ema_1h))
-        short_ok = (short_votes >= c.min_momentum_agree
-                    and struct15 <= -c.min_ema_struct_15m
-                    and (not np.isfinite(struct1h) or -struct1h > c.max_hostile_ema_1h))
+        blockers = {LONG: self._blockers(f, LONG), SHORT: self._blockers(f, SHORT)}
+        long_ok, short_ok = not blockers[LONG], not blockers[SHORT]
 
         if long_ok and short_ok:            # cannot happen, but never guess
             return NO_TRADE, "contradictory long and short conditions"
         if not long_ok and not short_ok:
-            if max(long_votes, short_votes) < c.min_momentum_agree:
-                return NO_TRADE, (f"momentum agreement {max(long_votes, short_votes)}"
-                                  f"/{len(VOTING_WINDOWS)} < {c.min_momentum_agree}")
-            return NO_TRADE, f"15m structure {struct15:+.2f} not decisive"
+            # Report the side that came CLOSEST, and name the conditions that
+            # actually blocked it. Reporting one fixed condition made a 1h-
+            # hostility rejection read as a 15m structure problem, which sent
+            # calibration after the wrong threshold.
+            near = min((LONG, SHORT), key=lambda sd: (len(blockers[sd]), sd))
+            return NO_TRADE, f"no {near}: " + "; ".join(blockers[near])
 
         side = LONG if long_ok else SHORT
         d = 1 if side == LONG else -1
@@ -263,7 +287,8 @@ class AggressiveMomentumStrategy:
 
         f = feat.compute(frames, btc=btc_frames,
                          breadth_pct=ctx.breadth_pct, btc_regime=ctx.btc_regime,
-                         btc_regime_score=ctx.btc_regime_score, meta=meta)
+                         btc_regime_score=ctx.btc_regime_score, meta=meta,
+                         rel_volume_bars=c.rel_volume_bars)
 
         required = ("price", "atr", "atr_pct", "ema_struct_15m", "rel_volume")
         missing = [k for k in required if not np.isfinite(f.get(k, NAN))]

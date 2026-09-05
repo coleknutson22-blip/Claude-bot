@@ -182,6 +182,14 @@ class AggressiveCfg:
     max_hostile_ema_1h: float = -0.5    # 1h may be neutral, not hostile
     min_trend_r2: float = 0.10          # some order, not pure noise
     min_rel_volume: float = 0.9         # participation floor (A uses 1.2)
+    # Bars averaged before comparing against the 24-bar baseline. ONE 15m bar
+    # is far too small a sample to gate on: against volume that is normal by
+    # construction, a single-bar measure falls below 0.9 about half the time,
+    # so the gate rejects healthy symbols at random. Four bars (one hour) cuts
+    # the standard deviation by ~2.2x. This is variance reduction, not a
+    # loosening -- a lone spike bar among three dead ones now fails where it
+    # used to pass.
+    rel_volume_bars: int = 4
     min_atr_pct: float = 0.25           # the move must be worth costs
     # Each timeframe's last closed bar ends at a different instant, so their
     # closes differ legitimately. A large gap means the frames are NOT the same

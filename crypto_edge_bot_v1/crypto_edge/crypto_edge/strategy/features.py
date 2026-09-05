@@ -27,7 +27,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..indicators import (atr, donchian, ema, last_valid, realized_vol,
-                          rel_volume)
+                          rel_volume, sma)
 from ..models import Series
 from ..timeutils import tf_ms
 
@@ -154,6 +154,25 @@ def swing_proximity(high: np.ndarray, low: np.ndarray, close: np.ndarray,
     return ((hi - price) / atr_value, (price - lo) / atr_value)
 
 
+def participation(volume: np.ndarray, bars: int = 4, period: int = 24) -> float:
+    """Recent volume against its own baseline, averaged over `bars`.
+
+    The question is "is there participation behind this move", which is a
+    property of the last while -- not of whichever single bar happened to close
+    last. See AggressiveCfg.rel_volume_bars for the measured noise.
+    """
+    bars = max(1, int(bars))
+    if len(volume) <= period + bars:
+        return NAN
+    base = last_valid(sma(volume, period)[:-bars] if bars else sma(volume, period))
+    if not _finite(base) or base <= 0:
+        return NAN
+    recent = np.asarray(volume[-bars:], dtype=float)
+    if recent.size == 0 or not np.all(np.isfinite(recent)):
+        return NAN
+    return float(recent.mean() / base)
+
+
 def momentum_set(frames: dict[str, Series]) -> dict[str, float]:
     """Every configured momentum window, as a percentage return."""
     out: dict[str, float] = {}
@@ -169,7 +188,8 @@ def momentum_set(frames: dict[str, Series]) -> dict[str, float]:
 
 def compute(frames: dict[str, Series], *, btc: dict[str, Series] | None = None,
             breadth_pct: float = 50.0, btc_regime: str = "unknown",
-            btc_regime_score: float = 50.0, meta: dict | None = None) -> dict:
+            btc_regime_score: float = 50.0, meta: dict | None = None,
+            rel_volume_bars: int = 4) -> dict:
     """The full feature vector for one symbol.
 
     `frames` maps timeframe -> closed-candle Series ("5m", "15m", "1h").
@@ -222,8 +242,13 @@ def compute(frames: dict[str, Series], *, btc: dict[str, Series] | None = None,
     out["slope_1h_pct"], out["trend_r2_1h"] = slope1h, r2_1h
 
     # --- participation ----------------------------------------------------
-    out["rel_volume"] = (last_valid(rel_volume(f15.volume, 24))
-                         if f15 is not None and len(f15) > 25 else NAN)
+    if f15 is not None and len(f15) > 25 + rel_volume_bars:
+        out["rel_volume"] = participation(f15.volume, rel_volume_bars, 24)
+        # The single-bar figure is still recorded: it is what the gate used to
+        # read, so keeping it makes the change measurable after the fact.
+        out["rel_volume_last_bar"] = last_valid(rel_volume(f15.volume, 24))
+    else:
+        out["rel_volume"] = out["rel_volume_last_bar"] = NAN
 
     # --- swing structure --------------------------------------------------
     if f15 is not None and len(f15) > 30 and _finite(out["atr"]):

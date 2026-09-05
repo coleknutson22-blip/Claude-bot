@@ -266,6 +266,143 @@ class TestLongShortSymmetry(unittest.TestCase):
         self.assertEqual(s.evaluate_frames(DOWN, NEUTRAL).direction, -1)
 
 
+class TestParticipationIsMeasuredOverAWindow(unittest.TestCase):
+    """A single 15m bar is too small a sample to gate on.
+
+    FOUND LIVE: four of twelve Kraken/USD candidates were rejected for
+    `relative volume < 0.9`. Against volume that is NORMAL BY CONSTRUCTION, the
+    single-bar measure falls below 0.9 roughly half the time -- the gate was
+    rejecting healthy symbols at random, on the toss of whichever bar closed
+    last. Averaging four bars cuts the standard deviation by ~2.2x.
+
+    This is variance reduction, not a loosening: a lone spike bar among three
+    dead ones now FAILS where it used to pass, which the last test here pins.
+    """
+
+    def volumes(self, pattern):
+        return np.array([1000.0] * 40 + list(pattern), dtype=float)
+
+    def test_one_quiet_bar_among_strong_ones_no_longer_disqualifies(self):
+        v = self.volumes([1400, 1400, 1400, 200])
+        self.assertLess(F.rel_volume(v, 24)[-1], 0.9, "the last bar alone is weak")
+        self.assertGreater(F.participation(v, 4, 24), 0.9,
+                           "but the hour as a whole is not")
+
+    def test_a_genuinely_quiet_hour_is_still_rejected(self):
+        v = self.volumes([300, 250, 280, 260])
+        self.assertLess(F.participation(v, 4, 24), 0.9)
+
+    def test_a_lone_spike_no_longer_passes_the_gate(self):
+        """The trade the change makes: one big bar is not participation."""
+        v = self.volumes([200, 200, 200, 2000])
+        self.assertGreater(F.rel_volume(v, 24)[-1], 0.9,
+                           "the single-bar measure would have let this through")
+        self.assertLess(F.participation(v, 4, 24), 0.9,
+                        "four bars see three dead ones")
+
+    def test_the_windowed_measure_is_markedly_less_noisy(self):
+        """Quantified, not asserted: same true participation, less variance."""
+        rng = np.random.default_rng(7)
+        single, windowed = [], []
+        for _ in range(1500):
+            v = np.exp(rng.normal(0, 0.55, 60))
+            single.append(F.rel_volume(v, 24)[-1])
+            windowed.append(F.participation(v, 4, 24))
+        s = np.array([x for x in single if np.isfinite(x)])
+        w = np.array([x for x in windowed if np.isfinite(x)])
+        self.assertLess(w.std(), s.std() / 1.7,
+                        f"single sd {s.std():.2f} vs windowed {w.std():.2f}")
+        self.assertLess(abs(w.mean() - 1.0), 0.1, "and still centred on truth")
+
+    def test_the_strategy_uses_the_windowed_figure(self):
+        f = F.compute(UP, rel_volume_bars=4)
+        self.assertIn("rel_volume_last_bar", f,
+                      "the old measure is kept so the change stays measurable")
+        self.assertNotEqual(f["rel_volume"], f["rel_volume_last_bar"])
+
+    def test_the_window_size_is_configurable(self):
+        self.assertEqual(AggressiveCfg().rel_volume_bars, 4)
+        a = F.compute(UP, rel_volume_bars=1)["rel_volume"]
+        b = F.compute(UP, rel_volume_bars=8)["rel_volume"]
+        self.assertNotEqual(a, b)
+
+
+class TestRejectionsNameTheBindingCondition(unittest.TestCase):
+    """A rejection message is calibration data. A wrong one misdirects tuning.
+
+    FOUND LIVE: TAO/USD was rejected as "15m structure +0.50 not decisive" when
+    +0.50 actually SATISFIED the 15m threshold -- the real blocker was
+    elsewhere. Reporting one fixed condition sent the diagnosis after a
+    threshold that was not the problem.
+    """
+
+    def features(self, **over):
+        f = dict(F.compute(UP))
+        f.update(over)
+        return f
+
+    def test_a_hostile_1h_says_so_rather_than_blaming_the_15m(self):
+        s = strat()
+        f = self.features(ema_struct_15m=1.0, ema_struct_1h=-1.0)
+        side, why = s.choose_side(f, NEUTRAL)
+        self.assertEqual(side, NO_TRADE)
+        self.assertIn("1h structure", why)
+        self.assertIn("hostile", why)
+        self.assertNotIn("not bullish enough", why,
+                         "the 15m stack was fine; do not blame it")
+
+    def test_a_real_15m_problem_is_still_named(self):
+        s = strat()
+        side, why = s.choose_side(self.features(ema_struct_15m=0.0), NEUTRAL)
+        self.assertEqual(side, NO_TRADE)
+        self.assertIn("15m structure", why)
+
+    def test_a_momentum_shortfall_is_named_with_its_count(self):
+        s = strat()
+        flat = {w: 0.0 for w in VOTING_WINDOWS}
+        side, why = s.choose_side(self.features(momentum_atr=flat), NEUTRAL)
+        self.assertEqual(side, NO_TRADE)
+        self.assertIn("momentum agreement", why)
+        self.assertIn(f"/{len(VOTING_WINDOWS)}", why)
+
+    def test_several_blockers_are_all_reported(self):
+        s = strat()
+        flat = {w: 0.0 for w in VOTING_WINDOWS}
+        f = self.features(momentum_atr=flat, ema_struct_15m=0.0,
+                          ema_struct_1h=-1.0)
+        blocked = s._blockers(f, LONG)
+        self.assertEqual(len(blocked), 3, blocked)
+        joined = "; ".join(blocked)
+        self.assertIn("momentum agreement", joined)
+        self.assertIn("15m structure", joined)
+        self.assertIn("1h structure", joined)
+
+    def test_the_reported_side_is_the_one_that_came_closest(self):
+        """A 1h structure hostile to a LONG is favourable to a SHORT.
+
+        So with a bearish 1h the short has fewer blockers, and reporting the
+        short -- with no 1h complaint -- is correct, not a missed condition.
+        """
+        s = strat()
+        flat = {w: 0.0 for w in VOTING_WINDOWS}
+        f = self.features(momentum_atr=flat, ema_struct_15m=0.0,
+                          ema_struct_1h=-1.0)
+        self.assertEqual(len(s._blockers(f, SHORT)), 2)
+        _, why = s.choose_side(f, NEUTRAL)
+        self.assertTrue(why.startswith("no short:"), why)
+        self.assertNotIn("1h structure", why)
+
+    def test_the_message_says_which_side_it_is_talking_about(self):
+        s = strat()
+        _, why = s.choose_side(self.features(ema_struct_15m=0.0), NEUTRAL)
+        self.assertTrue(why.startswith("no long:") or why.startswith("no short:"),
+                        why)
+
+    def test_a_tradable_setup_has_no_blockers(self):
+        s = strat()
+        self.assertEqual(s._blockers(F.compute(UP), LONG), [])
+
+
 class TestRegimeVetoes(unittest.TestCase):
     def test_a_long_is_vetoed_in_a_bear_btc_regime(self):
         sig = strat().evaluate_frames(UP, ctx(regime="bear"))
