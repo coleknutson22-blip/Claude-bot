@@ -56,6 +56,11 @@ class AggressiveStatus:
     halt_reason: str = ""
     deep_fetches: int = 0
     binding: dict = field(default_factory=dict)
+    # The funnel, kept because the interesting question during a forward test
+    # is not "how many trades" but "where did everything else go".
+    candidates: int = 0     # markets that survived ranking's own filters
+    shortlist: int = 0      # of those, the ones deepened with 5m/15m data
+    started_ms: int = 0
 
 
 class AggressiveRuntime:
@@ -176,15 +181,17 @@ class AggressiveRuntime:
         self.status.exits += 1
         equity = self.account.equity(marks)
         self.notifier.send(
-            fmt.exit_trade(
-                symbol=trade.symbol, entry_price=trade.entry_fill_price,
-                exit_price=trade.exit_fill_price,
-                position_value=trade.qty * trade.entry_fill_price,
-                held_s=trade.duration_s, gross=trade.gross_pnl, fees=trade.fees,
+            fmt.aggressive_exit(
+                strategy=self.name, symbol=trade.symbol, side=trade.side,
+                exit_reason=trade.exit_reason,
+                entry_price=trade.entry_fill_price,
+                exit_price=trade.exit_fill_price, qty=trade.qty,
+                held_s=trade.duration_s, gross=trade.gross_pnl,
+                financing=trade.financing, fees=trade.fees,
                 slippage=trade.slippage_cost, net=trade.net_pnl,
-                return_pct=trade.return_pct,
-                account_return_pct=trade.account_return_pct,
-                exit_reason=f"{trade.exit_reason} ({trade.side})", equity=equity,
+                return_pct=trade.return_pct, equity=equity,
+                open_positions=len(self.account.positions()),
+                max_positions=self.cfg.aggressive.max_open_positions,
                 total_pnl=float(self.account.state["realized_pnl"])),
             dedupe_key=f"exitB:{trade.id}", kind="exit")
 
@@ -207,21 +214,41 @@ class AggressiveRuntime:
                    buffer_ms=self.cfg.safety.candle_close_buffer_s * 1000)
         self.status.deep_fetches = res.deep_fetches
         self.status.evaluated = len(res.signals)
+        self.status.candidates = len(res.ranked)
+        self.status.shortlist = len(res.shortlist)
         self.status.last_scan_ms = now_ms()
 
         series_5m = {}
+        # Signals that FAILED the strategy are settled here and now. Signals
+        # that passed are NOT: whether they were actually entered is decided
+        # below, and the observations table holds one row per candle per
+        # strategy, so a row written now can never be corrected afterwards.
+        # Pre-labelling every passing signal ENTERED recorded trades that were
+        # then refused by the ladder, the quote gate or the risk cap as if they
+        # had been taken -- and silently dropped the REJECTED_RISK row that
+        # said why. That is the exact population this journal exists to study.
         for sig in res.signals:
-            self.journal.record(
-                sig, ENTERED if sig.passed else REJECTED_STRATEGY,
-                rank=sig.features.get("rank"))
+            if not sig.passed:
+                self.journal.record(sig, REJECTED_STRATEGY,
+                                    rank=sig.features.get("rank"))
 
         if not entries_allowed or self.status.halted:
+            reason = (self.status.halt_reason if self.status.halted
+                      else "entries disabled for this run")
+            for sig in res.entries:
+                self.journal.record(sig, REJECTED_RISK, reason,
+                                    rank=sig.features.get("rank"))
             return 0
 
         taken = 0
         for sig in res.entries:
             if taken >= self.cfg.risk.max_new_entries_per_cycle:
-                break
+                self.journal.record(
+                    sig, REJECTED_RISK,
+                    f"max new entries per cycle reached "
+                    f"({self.cfg.risk.max_new_entries_per_cycle})",
+                    rank=sig.features.get("rank"))
+                continue
             if self._enter(sig, ctx, markets, series_5m):
                 taken += 1
         return taken
@@ -334,21 +361,26 @@ class AggressiveRuntime:
 
         self.status.entries += 1
         self.journal.record(sig, ENTERED, "", rank=rank, extra=journal)
+        open_now = self.account.positions()
         self.notifier.send(
-            fmt.entry(
-                symbol=sym, side=sig.side, entry_price=fill.fill_price, qty=qty,
-                position_value=fill.notional,
-                pct_of_account=fill.notional / equity * 100.0 if equity else 0.0,
-                stop=sig.stop_price, dollar_risk=loss_at_stop,
-                pct_risk=loss_at_stop / equity * 100.0 if equity else 0.0,
-                score=sig.score, htf_regime=f"slot {plan.slot} x{mult:.2f}",
-                btc_regime=ctx.btc_regime, breadth=ctx.breadth_pct,
-                reasons=[f"setup {sig.score:.1f} -> confidence {confidence:.1f} "
-                         f"(bucket {bucket})",
-                         f"ladder slot {plan.slot}: ceiling "
-                         f"${plan.ceiling_cash:,.0f} x {mult:.2f}",
-                         f"limited by {plan.binding_constraint}"],
-                equity=self.account.equity(self.marks(series_5m))),
+            fmt.aggressive_entry(
+                strategy=self.name, symbol=sym, side=sig.side,
+                setup_score=sig.score, confidence=confidence, bucket=bucket,
+                multiplier=mult, slot=plan.slot,
+                ceiling_cash=plan.ceiling_cash,
+                target_notional=plan.target_notional, notional=fill.notional,
+                binding_constraint=plan.binding_constraint,
+                entry_price=fill.fill_price, qty=qty, stop=sig.stop_price,
+                target=ex.target_price(pos, a.target_r),
+                stop_distance_pct=stop_pct * 100.0,
+                expected_loss=loss_at_stop,
+                expected_loss_pct=loss_at_stop / equity * 100.0 if equity else 0.0,
+                leverage=a.leverage,
+                equity=self.account.equity(self.marks(series_5m)),
+                free_cash_after=self.account.cash(),
+                open_positions=len(open_now),
+                max_positions=a.max_open_positions,
+                btc_regime=ctx.btc_regime, breadth=ctx.breadth_pct),
             dedupe_key=f"entryB:{sig.candle_id}", kind="entry")
         return True
 
@@ -392,6 +424,54 @@ class AggressiveRuntime:
             "rel_volume": f.get("rel_volume"),
             "rel_strength": f.get("rel_strength"),
         }
+
+    # =========================================================== heartbeat
+    def heartbeat_fields(self, series_5m: dict, ctx: MarketContext | None = None,
+                         uptime_s: float = 0.0) -> dict:
+        """Everything the Strategy B heartbeat reports, computed in one place.
+
+        Returned as a dict rather than sent from here so the numbers can be
+        asserted directly by a test without going anywhere near a notifier.
+        """
+        a = self.cfg.aggressive
+        acct = self.account.state
+        equity = self.equity(series_5m)
+        positions = self.account.positions()
+        start = float(acct["starting_equity"])
+        peak = float(acct["peak_equity"]) or start
+        return {
+            "strategy": self.name,
+            "uptime_s": uptime_s,
+            "equity": equity,
+            "today_pnl": equity - float(acct["daily_start_equity"]),
+            "total_pnl": equity - start,
+            "open_positions": len(positions),
+            "max_positions": a.max_open_positions,
+            "longs": sum(1 for p in positions if p.direction > 0),
+            "shorts": sum(1 for p in positions if p.direction < 0),
+            "btc_regime": ctx.btc_regime if ctx else "unknown",
+            "breadth": ctx.breadth_pct if ctx else 0.0,
+            "candidates": self.status.candidates,
+            "shortlist": self.status.shortlist,
+            "evaluated": self.status.evaluated,
+            "entries": self.status.entries,
+            "exits": self.status.exits,
+            # Drawdown from the high-water mark, which is what the circuit
+            # breaker actually measures -- not from the starting balance.
+            "drawdown_pct": max(0.0, (peak - equity) / peak * 100.0) if peak else 0.0,
+            "daily_buffer_remaining": self.daily_buffer(equity),
+            "halted": bool(self.status.halted),
+            "halt_reason": self.status.halt_reason,
+            "entries_enabled": bool(a.enabled),
+            "last_scan_ms": self.status.last_scan_ms,
+        }
+
+    def send_heartbeat(self, series_5m: dict, ctx: MarketContext | None = None,
+                       uptime_s: float = 0.0) -> None:
+        self.notifier.send(
+            fmt.aggressive_heartbeat(
+                **self.heartbeat_fields(series_5m, ctx, uptime_s)),
+            kind="heartbeat")
 
     # ============================================================== safety
     def check_safety(self, series_5m: dict) -> bool:

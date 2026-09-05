@@ -242,12 +242,15 @@ class Repo:
         return obs["id"]
 
     def get_observations(self, decision: str | None = None,
-                         since_ms: int | None = None) -> list[dict]:
+                         since_ms: int | None = None,
+                         strategy: str | None = None) -> list[dict]:
         q, args, conds = "SELECT * FROM observations", [], []
         if decision:
             conds.append("decision=?"); args.append(decision)
         if since_ms is not None:
             conds.append("ts_ms >= ?"); args.append(since_ms)
+        if strategy:
+            conds.append("strategy=?"); args.append(strategy)
         if conds:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY ts_ms"

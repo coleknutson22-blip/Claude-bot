@@ -121,6 +121,11 @@ class UniverseCfg:
 
 @dataclass
 class StrategyCfg:
+    # Whether this strategy may open NEW positions. Turning it off does not
+    # abandon what it already holds: open positions keep being managed to their
+    # exits, exactly as under a circuit-breaker halt. A stop that stops being
+    # watched is worse than the trade it was protecting.
+    enabled: bool = True
     name: str = "trend_breakout"
     version: str = "1.0.0"
     entry_timeframe: str = "1h"
@@ -161,6 +166,8 @@ class AggressiveCfg:
     Every threshold here is separate from StrategyCfg. Strategy A's numbers are
     not touched by anything in this block, and no value here feeds back into it.
     """
+    # As with StrategyCfg.enabled: this gates NEW positions, not management.
+    # The runtime is still attached while the ledger holds anything open.
     enabled: bool = True
     name: str = "aggressive_momentum_v2"
     version: str = "0.1.0"
@@ -531,6 +538,44 @@ class Config:
         if "always_include" not in explicit or not self.universe.always_include:
             self.universe.always_include = [
                 self.market_for(b) for b in self.universe.always_include_bases]
+
+    # Which strategies may open positions this run. "a" is the incumbent
+    # trend_breakout, "b" the aggressive_momentum_v2 experiment.
+    RUNTIME_MODES = ("a", "b", "both")
+
+    def apply_runtime_mode(self, mode: str) -> str:
+        """Turn on the strategies this run is for, and turn the others off.
+
+        Disabling a strategy suppresses its NEW ENTRIES only. Whatever it
+        already holds keeps being managed to its exit -- a position whose stop
+        has stopped being watched is a worse outcome than any entry it might
+        have taken, and the same rule already governs a circuit-breaker halt.
+        """
+        m = (mode or "both").strip().lower()
+        aliases = {"a": "a", "b": "b", "both": "both", "all": "both",
+                   self.strategy.name: "a", self.aggressive.name: "b"}
+        if m not in aliases:
+            raise ValueError(
+                f"unknown runtime mode {mode!r}; expected one of "
+                f"{', '.join(self.RUNTIME_MODES)} (or a strategy name)")
+        m = aliases[m]
+        self.strategy.enabled = m in ("a", "both")
+        self.aggressive.enabled = m in ("b", "both")
+        return m
+
+    def runtime_mode(self) -> str:
+        """The mode the current flags describe. Inverse of apply_runtime_mode."""
+        a, b = self.strategy.enabled, self.aggressive.enabled
+        return {(True, True): "both", (True, False): "a",
+                (False, True): "b", (False, False): "none"}[(a, b)]
+
+    def enabled_strategies(self) -> list[str]:
+        out = []
+        if self.strategy.enabled:
+            out.append(self.strategy.name)
+        if self.aggressive.enabled:
+            out.append(self.aggressive.name)
+        return out
 
     def starting_equity_for(self, strategy: str) -> float:
         """The opening balance for one strategy's sub-account."""

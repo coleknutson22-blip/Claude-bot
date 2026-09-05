@@ -366,6 +366,82 @@ position, an 8h time stop (4h if the trade has not made 0.5R), hostile-regime
 exit, and the forced short close. No model, no network, no optional dependency
 participates in any of them.
 
+## Running a forward test
+
+**Which strategies trade is a runtime choice**, not an edit to a config file:
+
+```bash
+python -m crypto_edge.cli --strategies b    start     # Strategy B only
+python -m crypto_edge.cli --strategies a    start     # Strategy A only
+python -m crypto_edge.cli --strategies both start     # both
+```
+
+`--strategies` gates **new entries only**. A strategy that is off keeps
+managing the positions it already holds, right through to their exits — the
+same rule that governs a circuit-breaker halt. A stop that stops being watched
+is a worse outcome than any entry it might have taken, so there is no mode in
+which an open position goes unmanaged. The startup banner says which state each
+strategy is in, in words rather than a flag name.
+
+A strategy that is off **and holds nothing** is not attached at all: no scan,
+no deep fetches, no journal rows, no per-cycle cost.
+
+**Before starting, run the preflight.** It is one command rather than a
+checklist of four, because a readiness check people have to assemble by hand is
+one they will eventually assemble incompletely:
+
+```bash
+python -m crypto_edge.cli --exchange kraken --quote USD preflight
+```
+
+It verifies 5m, 15m and 1h data (on BTC *and* on a non-BTC market the strategy
+would actually rank, which is where thin history shows up), quotes, spreads,
+the universe, BTC regime, breadth, Telegram delivery, the schema version and
+migration, restart recovery through a second connection, and every parameter
+the forward test is defined by — checked against **literals**, so a config
+drift is caught before three weeks of results are collected under settings
+nobody intended. It exits non-zero and prints `NOT READY` if anything fails,
+and a step that could not run says `NOT RUN` rather than showing a dash that
+reads as "fine".
+
+**Reading the results:**
+
+```bash
+python -m crypto_edge.cli --strategy aggressive_momentum_v2 status
+python -m crypto_edge.cli --strategy aggressive_momentum_v2 positions
+python -m crypto_edge.cli performance --aggressive
+python -m crypto_edge.cli research --aggressive
+```
+
+`performance --aggressive` reports Strategy B's ledger alone — trades, win
+rate, average win and loss, expectancy, profit factor, gross and net P&L, fees,
+slippage, **financing**, max drawdown, long and short side by side, and results
+broken out by confidence bucket, ladder slot and binding constraint.
+
+`research --aggressive` is the one that answers whether the *filters* are
+right. Every gate is a hypothesis — that setups below the line are worse than
+setups above it — and a rejection count alone only says how often a filter
+fired, never whether it was right to fire. So each gate is paired with the
+counterfactual outcome of what it rejected, signed by the signal's own
+direction (a rejected short was right when price *fell*). That is what
+eventually answers whether relative volume at 0.9, ATR at 0.25% and a minimum
+setup score of 50 are too strict, whether 60–69 confidence loses money, and
+whether 90+ actually outperforms.
+
+Those counterfactuals are raw price moves over a fixed horizon: no stop, no
+target, no fees, no financing. A rejected setup showing +2% did not necessarily
+survive to collect it. They rank filters against each other; they are not
+forgone P&L.
+
+**Stopping and restarting.** Ctrl-C (or `SIGTERM`) finishes the current cycle
+and then stops — cycles never overlap and are never interrupted mid-write.
+Everything needed to resume is already on disk, so restarting with the same
+command picks up exactly where it left off: open positions, their stops, cash,
+peak equity, the daily anchor, the halt state, the claimed candles that stop a
+restart re-entering the same signal, and any undelivered Telegram message.
+`verify-restart` proves that by re-reading the state through a second
+connection and diffing it.
+
 To see what Strategy B makes of the live market without trading anything:
 
 ```bash
@@ -389,7 +465,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 915 automated tests, all passing
+### VERIFIED OFFLINE — 998 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -469,7 +545,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               915 tests
+tests/               998 tests
 ```
 
 ## Safety notes

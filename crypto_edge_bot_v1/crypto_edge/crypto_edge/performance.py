@@ -31,13 +31,14 @@ class PerformanceReport:
     trading: dict = field(default_factory=dict)
     risk: dict = field(default_factory=dict)
     advanced: dict = field(default_factory=dict)
+    sides: dict = field(default_factory=dict)
     open_positions: list[dict] = field(default_factory=list)
     sample: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {"account": self.account, "trading": self.trading, "risk": self.risk,
-                "advanced": self.advanced, "open_positions": self.open_positions,
-                "sample": self.sample}
+                "advanced": self.advanced, "sides": self.sides,
+                "open_positions": self.open_positions, "sample": self.sample}
 
 
 class PerformanceCalculator:
@@ -107,6 +108,10 @@ class PerformanceCalculator:
         fees = sum(t["fees"] for t in trades)
         slip = sum(t["slippage_cost"] for t in trades)
         net = sum(t["net_pnl"] for t in trades)
+        # Simulated short borrow. A separate line rather than folded into fees:
+        # the point of charging it is to see what it costs, and a cost that is
+        # invisible in the report might as well not have been charged.
+        financing = sum(t["financing"] for t in trades)
 
         peak = max(float(acct["peak_equity"]), equity)
         dd = _safe_div(peak - equity, peak) * 100.0
@@ -120,6 +125,7 @@ class PerformanceCalculator:
             "total_pnl": realized + unrealized,
             "gross_pnl": gross, "net_pnl": net,
             "total_fees": fees, "estimated_slippage_cost": slip,
+            "total_financing": financing,
             "account_return_pct": _safe_div(equity - start, start) * 100.0,
             "halted": bool(acct["halted"]), "halt_reason": acct["halt_reason"],
         }
@@ -156,8 +162,14 @@ class PerformanceCalculator:
         rep.risk = {
             "peak_equity": peak, "current_drawdown_pct": dd,
             "max_drawdown_pct": self._max_drawdown_pct(equity),
+            # Strategy A records this as `risk_amount`, Strategy B as
+            # `expected_loss_cash` -- the same quantity under each strategy's
+            # own vocabulary. Reading only the first name reported a flat zero
+            # for every Strategy B ledger.
             "average_risk_per_trade": _safe_div(
-                sum(t["journal"].get("risk_amount", 0.0) or 0.0 for t in trades), n),
+                sum(t["journal"].get("risk_amount")
+                    or t["journal"].get("expected_loss_cash") or 0.0
+                    for t in trades), n),
             "max_simultaneous_exposure_pct": self._max_exposure_pct(),
             "largest_daily_loss": min(daily_pnls, default=0.0),
             "largest_daily_gain": max(daily_pnls, default=0.0),
@@ -166,6 +178,8 @@ class PerformanceCalculator:
         }
 
         rep.advanced = self._advanced(trades, daily)
+        rep.sides = {s: _side_stats([t for t in trades if t["side"] == s])
+                     for s in ("long", "short")}
         rep.open_positions = open_rows
         rep.sample = {
             "closed_trades": n,
@@ -240,10 +254,17 @@ class PerformanceCalculator:
         return float(rows["m"]) if rows and rows["m"] is not None else 0.0
 
     # ---------------------------------------------------- category breakdown
-    def by_category(self, min_sample: int = 10) -> dict[str, list[dict]]:
+    def by_category(self, min_sample: int = 10,
+                    strategy: str | None = None) -> dict[str, list[dict]]:
         """Performance sliced by recorded context. Buckets below `min_sample`
-        are marked rather than shown as if meaningful (spec section 45)."""
-        trades = self.repo.get_trades()
+        are marked rather than shown as if meaningful (spec section 45).
+
+        Scoped to ONE ledger, like every other method here. It previously read
+        every trade in the database regardless of strategy, which was harmless
+        while one strategy existed and silently blends two the moment a second
+        one does -- the exact comparison these buckets are meant to support.
+        """
+        trades = self.repo.get_trades(self._resolve(strategy))
         out: dict[str, list[dict]] = {}
 
         def bucket(name: str, keyfn):
@@ -275,7 +296,43 @@ class PerformanceCalculator:
         bucket("rel_volume_bucket", lambda t: _bucket_num(t["journal"].get("rel_volume"), 1))
         bucket("day_of_week", lambda t: utc_date(t["entry_ms"]))
         bucket("holding_bucket", lambda t: _bucket_num(t["duration_s"] / 3600.0, 24))
+        # --- Strategy B's sizing model. Empty for a strategy that has none. --
+        # These three are the forward test's actual questions: do high
+        # confidence buckets outperform, does the ladder slot matter, and is
+        # the risk cap ever the thing that decided the size.
+        bucket("side", lambda t: t["side"])
+        bucket("conf_bucket", lambda t: t["journal"].get("conf_bucket"))
+        bucket("ladder_slot", lambda t: t["journal"].get("ladder_slot"))
+        bucket("binding_constraint", lambda t: t["journal"].get("binding_constraint"))
         return out
+
+
+def _side_stats(trades: list[dict]) -> dict:
+    """One side's results. Long and short are separate experiments.
+
+    Reported side by side because the whole point of adding shorts was to find
+    out whether they earn their borrow cost, and a blended figure cannot answer
+    that -- profitable longs would hide unprofitable shorts indefinitely.
+    """
+    n = len(trades)
+    wins = [t for t in trades if t["net_pnl"] > 0]
+    losses = [t for t in trades if t["net_pnl"] <= 0]
+    gp = sum(t["net_pnl"] for t in wins)
+    gl = abs(sum(t["net_pnl"] for t in losses))
+    wr = _safe_div(len(wins), n) * 100.0
+    avg_w, avg_l = _safe_div(gp, len(wins)), _safe_div(gl, len(losses))
+    return {
+        "trades": n, "wins": len(wins), "losses": len(losses),
+        "win_rate_pct": wr,
+        "average_winner": avg_w, "average_loser": -avg_l,
+        "expectancy_per_trade": (wr / 100.0) * avg_w - (1 - wr / 100.0) * avg_l,
+        "profit_factor": _safe_div(gp, gl, float("inf") if gp > 0 else 0.0),
+        "gross_pnl": sum(t["gross_pnl"] for t in trades),
+        "net_pnl": sum(t["net_pnl"] for t in trades),
+        "fees": sum(t["fees"] for t in trades),
+        "slippage": sum(t["slippage_cost"] for t in trades),
+        "financing": sum(t["financing"] for t in trades),
+    }
 
 
 def _bucket_num(v, width: float):

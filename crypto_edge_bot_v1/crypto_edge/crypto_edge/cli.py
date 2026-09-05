@@ -6,12 +6,22 @@
     python -m crypto_edge.cli positions
     python -m crypto_edge.cli performance
     python -m crypto_edge.cli export --out trades.csv
+    python -m crypto_edge.cli performance --aggressive
     python -m crypto_edge.cli research
+    python -m crypto_edge.cli research --aggressive
     python -m crypto_edge.cli resume
     python -m crypto_edge.cli test
     python -m crypto_edge.cli verify-live --cycle
     python -m crypto_edge.cli verify-restart
     python -m crypto_edge.cli diagnose
+    python -m crypto_edge.cli preflight
+
+Which strategies TRADE is chosen at the command line, not in a config file:
+
+    python -m crypto_edge.cli --strategies b start      # Strategy B only
+
+`--strategies` gates NEW ENTRIES only. A strategy that is off keeps managing
+what it already holds, right through to its exits.
 """
 from __future__ import annotations
 
@@ -36,6 +46,8 @@ from .timeutils import fmt_duration, iso, now_ms
 
 def _bootstrap(args, need_feed: bool = True):
     cfg = load_config(args.config, args.env)
+    if getattr(args, "strategies", None):
+        cfg.apply_runtime_mode(args.strategies)
     setup_logging(cfg.engine.log_dir, args.log_level)
     conn = db.connect(cfg.engine.db_path)
     db.init_db(conn)
@@ -68,6 +80,33 @@ def _strategy_arg(args, cfg: Config) -> str:
     meaning exactly what it meant before.
     """
     return getattr(args, "strategy", None) or cfg.strategy.name
+
+
+def _print_runtime_mode(cfg: Config, repo: Repo) -> None:
+    """Say plainly which strategies trade this run, and what the others do.
+
+    "Disabled" is the word most likely to be misread here, so the line spells
+    out the consequence instead: a strategy that is off opens nothing, and
+    still manages what it holds. An operator should never have to infer from a
+    flag name whether their open stops are still being watched.
+    """
+    print("=" * 62)
+    print(f"  RUNTIME MODE: {cfg.runtime_mode()}   ({cfg.exchange_label()})")
+    for name, on in ((cfg.strategy.name, cfg.strategy.enabled),
+                     (cfg.aggressive.name, cfg.aggressive.enabled)):
+        try:
+            held = len(repo.get_positions(name))
+        except Exception:
+            held = 0
+        if on:
+            state = "ENTRIES ON"
+        elif held:
+            state = f"entries OFF — still managing {held} open position(s)"
+        else:
+            state = "entries OFF — holds nothing"
+        equity = cfg.starting_equity_for(name)
+        print(f"    {name:<24} {state:<46} (${equity:,.0f} sub-account)")
+    print("=" * 62)
 
 
 def _warn_if_venue_changed(cfg: Config, repo: Repo) -> None:
@@ -116,6 +155,13 @@ def cmd_start(args) -> int:
     from .engine import TradingEngine
     from .selfcheck import run_selfcheck
     cfg, repo, feed, notifier = _bootstrap(args)
+
+    mode = cfg.runtime_mode()
+    if mode == "none":
+        print("No strategy is enabled — nothing would trade. Use --strategies "
+              "a|b|both.", file=sys.stderr)
+        return 1
+    _print_runtime_mode(cfg, repo)
 
     rep = run_selfcheck(cfg, repo, feed, notifier, check_network=True,
                         broad_service=_broad_service(cfg, repo))
@@ -208,26 +254,62 @@ def cmd_positions(args) -> int:
 
 def cmd_performance(args) -> int:
     cfg, repo, _, _ = _bootstrap(args, need_feed=False)
-    perf = PerformanceCalculator(repo, _strategy_arg(args, cfg))
+    strategy = cfg.aggressive.name if getattr(args, "aggressive", False) \
+        else _strategy_arg(args, cfg)
+    perf = PerformanceCalculator(repo, strategy)
     rep = perf.report().as_dict()
     if args.json:
         print(json.dumps(rep, indent=2, default=str))
         return 0
+    print(f"\nSTRATEGY  {strategy}   ({cfg.exchange_label()})")
     for section in ("account", "trading", "risk", "advanced"):
         print(f"\n{section.upper()}")
         for k, v in rep[section].items():
             print(f"  {k:<34} {v}")
+    _print_sides(rep["sides"])
     print(f"\nSAMPLE\n  {rep['sample']}")
-    if args.categories:
+    if args.categories or getattr(args, "aggressive", False):
+        cats = perf.by_category()
+        # The aggressive view leads with the three slices the forward test is
+        # actually asking about, then everything else.
+        order = (["conf_bucket", "ladder_slot", "binding_constraint", "side",
+                  "exit_reason"] if getattr(args, "aggressive", False) else [])
+        names = order + [k for k in cats if k not in order]
         print("\nBY CATEGORY (buckets below sample threshold are flagged)")
-        for name, rows in perf.by_category().items():
+        for name in names:
+            rows = cats.get(name) or []
+            if not rows:
+                continue
             shown = [r for r in rows if r["sufficient_sample"]]
-            print(f"\n  {name}: {len(rows)} bucket(s), {len(shown)} with sufficient sample")
+            print(f"\n  {name}: {len(rows)} bucket(s), "
+                  f"{len(shown)} with sufficient sample")
             for r in rows[:10]:
                 flag = "" if r["sufficient_sample"] else "  [SAMPLE TOO SMALL]"
-                print(f"    {r['bucket']:<24} n={r['n']:<4} net=${r['net_pnl']:>+9,.2f} "
+                print(f"    {r['bucket']:<24} n={r['n']:<4} "
+                      f"net=${r['net_pnl']:>+9,.2f} "
                       f"win={r['win_rate_pct']:.0f}%{flag}")
     return 0
+
+
+def _print_sides(sides: dict) -> None:
+    """Long and short side by side. Blank rows are still printed.
+
+    A side with zero trades is a RESULT during a forward test -- "the strategy
+    took no shorts in three weeks" is exactly the kind of thing that goes
+    unnoticed when the empty half is simply omitted.
+    """
+    if not sides:
+        return
+    print("\nBY SIDE")
+    cols = ["trades", "win_rate_pct", "average_winner", "average_loser",
+            "expectancy_per_trade", "profit_factor", "gross_pnl", "net_pnl",
+            "fees", "slippage", "financing"]
+    print(f"  {'':<22}{'LONG':>14}{'SHORT':>14}")
+    for c in cols:
+        lo, sh = sides.get("long", {}).get(c, 0), sides.get("short", {}).get(c, 0)
+        fmt_one = (lambda v: f"{v:>14,.0f}") if c == "trades" else \
+                  (lambda v: f"{v:>14,.2f}" if v != float("inf") else f"{'inf':>14}")
+        print(f"  {c:<22}{fmt_one(lo)}{fmt_one(sh)}")
 
 
 def cmd_export(args) -> int:
@@ -252,6 +334,10 @@ def cmd_export(args) -> int:
 def cmd_research(args) -> int:
     from .research.counterfactual import CounterfactualTracker
     cfg, repo, _, _ = _bootstrap(args, need_feed=False)
+    if getattr(args, "aggressive", False) or getattr(args, "strategy", None):
+        return _research_forward_test(
+            cfg, repo, cfg.aggressive.name if getattr(args, "aggressive", False)
+            else _strategy_arg(args, cfg), args)
     obs = repo.get_observations()
     counts: dict[str, int] = {}
     for o in obs:
@@ -276,6 +362,84 @@ def cmd_research(args) -> int:
             flag = "" if r["sufficient_sample"] else "  [SAMPLE TOO SMALL]"
             print(f"  {r['reason'][:46]:<46} {r['h']:>4}h  n={r['n']:<4} "
                   f"avg={r['avg_ret']:+.2f}%{flag}")
+    return 0
+
+
+def _research_forward_test(cfg, repo, strategy: str, args) -> int:
+    """The forward-test view of one strategy's journal."""
+    from .research.forward_test import ForwardTestReport
+    r = ForwardTestReport(repo, strategy, min_sample=args.min_sample)
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "strategy": strategy, "decisions": r.decisions(),
+            "by_side": r.by_side(),
+            "rejections": [vars(x) for x in r.rejection_counts()],
+            "score_buckets": [vars(x) for x in r.score_buckets()],
+            "gates": r.gate_sensitivity(),
+            "confidence_buckets": [vars(x) for x in r.confidence_buckets()],
+        }, indent=2, default=str))
+        return 0
+
+    def flag(n):
+        return "" if r.sufficient(n) else "  [SAMPLE TOO SMALL]"
+
+    print("=" * 74)
+    print(f"  RESEARCH — {strategy}   ({cfg.exchange_label()})")
+    print(f"  {len(r.obs)} observations, {len(r.trades)} closed trades")
+    print("=" * 74)
+
+    print("\nDECISIONS")
+    for k, v in sorted(r.decisions().items(), key=lambda kv: -kv[1]):
+        print(f"  {k:<22} {v:>6}")
+
+    print("\nLONG vs SHORT")
+    print(f"  {'':<12}{'evaluated':>11}{'entered':>9}{'rejected':>10}"
+          f"{'closed':>8}{'net P&L':>12}{'financing':>11}")
+    for side, d in r.by_side().items():
+        print(f"  {side:<12}{d['evaluated']:>11}{d['entered']:>9}"
+              f"{d['rejected']:>10}{d['closed_trades']:>8}"
+              f"{d['net_pnl']:>+12,.2f}{d['financing']:>11,.2f}")
+
+    print("\nFILTER REJECTION COUNTS")
+    print("  (avg move is HYPOTHETICAL / NOT EXECUTED, signed by signal side)")
+    for row in r.rejection_counts()[:20]:
+        seen = row.extra["with_outcome"]
+        tail = (f"  avg move {row.avg:+.2f}% over {seen}{flag(seen)}"
+                if seen else "  (no outcomes yet)")
+        print(f"  {row.n:>6}  {row.bucket[:44]:<44}{tail}")
+
+    print("\nIS EACH GATE EARNING ITS PLACE?")
+    print("  A gate is doing its job when what it rejected went on to move")
+    print("  BADLY in the signal's direction. Positive average = worth a look.")
+    for g in r.gate_sensitivity():
+        print(f"\n  {g['gate']}  ({g['config_key']})")
+        print(f"    {g['question']}")
+        med = g["measured_median"]
+        rng = (f"measured {g['measured_min']:.3g} .. {g['measured_max']:.3g} "
+               f"(median {med:.3g})" if med is not None else "no values recorded")
+        print(f"    rejected {g['rejected']}, outcomes {g['with_outcome']}; {rng}")
+        if g["with_outcome"]:
+            print(f"    avg move {g['avg_return_pct']:+.2f}%, "
+                  f"{g['win_rate_pct']:.0f}% moved the right way"
+                  f"{flag(g['with_outcome'])}")
+
+    print("\nSETUP SCORE BUCKETS  (does the score predict anything?)")
+    for row in r.score_buckets():
+        seen = row.extra["with_outcome"]
+        print(f"  score {row.bucket:<10} n={row.n:<5} entered={row.extra['entered']:<4} "
+              f"avg move {row.avg:+.2f}% over {seen}{flag(seen)}")
+
+    print("\nCONFIDENCE BUCKETS  (realised, from closed trades)")
+    rows = r.confidence_buckets()
+    if not rows:
+        print("  (no closed Strategy B trades yet)")
+    for row in rows:
+        print(f"  {row.bucket:<10} n={row.n:<5} win={row.win_rate:>5.1f}%  "
+              f"net={row.net:>+10,.2f}  avg={row.avg:>+9,.2f}  "
+              f"avg size ${row.extra['avg_notional']:>9,.0f}{flag(row.n)}")
+    print("\n  The confidence buckets are a HYPOTHESIS, not a calibration:")
+    print("  nothing yet shows an 85 wins more often than a 65. These rows are")
+    print("  the evidence that will eventually confirm or kill that.")
     return 0
 
 
@@ -329,6 +493,71 @@ def cmd_verify_live(args) -> int:
         verify_cycle(cfg, repo, feed, notifier, rep)
 
     print(rep.render_summary())
+    return 0 if rep.passed else 1
+
+
+def cmd_preflight(args) -> int:
+    """Everything that must be true before a live forward test starts.
+
+    One command rather than a checklist of four, because a readiness check
+    people have to remember to assemble is one they will eventually assemble
+    incompletely. Read-only with respect to trading: no orders exist anywhere
+    in this codebase, and nothing here can open a position.
+    """
+    from .execution.paper_broker import PaperBroker
+    from .verify_live import (VerifyReport, verify_fast_timeframes,
+                              verify_fast_timeframes_for, verify_exchange,
+                              verify_pending_first, verify_quotes,
+                              verify_regime_and_breadth, verify_restart_recovery,
+                              verify_schema, verify_strategy_b_contract,
+                              verify_telegram, verify_universe)
+
+    cfg, repo, feed, notifier = _bootstrap(args, need_feed=True)
+    if not args.strategies:
+        # The forward test is Strategy B. Say so unless told otherwise.
+        cfg.apply_runtime_mode("b")
+    rep = VerifyReport()
+    print("=" * 72)
+    print(f"FORWARD-TEST PREFLIGHT -- {cfg.exchange_label()}")
+    print("=" * 72)
+    print("Read-only with respect to trading. No orders exist in this codebase.")
+    rep.facts["mode"] = (f"{cfg.runtime_mode()} — entries: "
+                         f"{', '.join(cfg.enabled_strategies()) or 'NONE'}")
+    _print_runtime_mode(cfg, repo)
+
+    ex = verify_exchange(cfg, feed, rep)
+    verify_fast_timeframes(cfg, feed, rep)
+
+    broker = PaperBroker(cfg.execution.taker_fee_bps, cfg.execution.slippage_bps,
+                         cfg.execution.stop_slippage_bps,
+                         cfg.execution.use_book_spread,
+                         cfg.execution.max_spread_bps_entry)
+    verify_quotes(cfg, feed, broker, args.quote_samples, args.quote_interval, rep)
+
+    universe = []
+    if not args.skip_universe:
+        uni = verify_universe(cfg, repo, _broad_service(cfg, repo),
+                              ex.get("markets", {}), ex.get("tickers", {}), rep)
+        universe = uni.get("universe", [])
+        # The fast frames matter most on the markets B will actually rank, so
+        # check one that is NOT BTC.
+        alt = next((s for s in universe if s != cfg.strategy.btc_symbol), "")
+        verify_fast_timeframes_for(cfg, feed, alt, rep)
+        rep.facts["alt"] = (f"OK on {alt}" if alt and
+                            not rep.failures_for("alt") else
+                            (f"FAILED on {alt}" if alt else "no alt market"))
+        verify_regime_and_breadth(cfg, feed, repo, ex.get("markets", {}),
+                                  ex.get("tickers", {}), universe, rep)
+
+    if not args.skip_telegram:
+        verify_telegram(cfg, repo, notifier, rep)
+        verify_pending_first(notifier, repo, rep)
+
+    verify_schema(cfg, repo, rep)
+    verify_restart_recovery(cfg, repo, rep)
+    verify_strategy_b_contract(cfg, repo, rep)
+
+    print(rep.render_preflight(cfg))
     return 0 if rep.passed else 1
 
 
@@ -511,6 +740,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strategy", default=None,
                    help="which strategy ledger to report on; each strategy has "
                         "its own independent paper sub-account")
+    p.add_argument("--strategies", default=None, choices=Config.RUNTIME_MODES,
+                   help="which strategies may open NEW positions this run: "
+                        "'a' = trend_breakout only, 'b' = aggressive_momentum_v2 "
+                        "only, 'both'. A disabled strategy still manages the "
+                        "positions it already holds through to their exits")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("selfcheck", help="run startup checks and exit")
@@ -528,13 +762,25 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("performance", help="full performance report")
     s.add_argument("--json", action="store_true")
     s.add_argument("--categories", action="store_true")
+    s.add_argument("--aggressive", action="store_true",
+                   help="report Strategy B (aggressive_momentum_v2) only, with "
+                        "its confidence-bucket, ladder-slot and "
+                        "binding-constraint breakdowns")
     s.set_defaults(func=cmd_performance)
 
     s = sub.add_parser("export", help="export closed trades to CSV")
     s.add_argument("--out", default="trades.csv")
     s.set_defaults(func=cmd_export)
 
-    sub.add_parser("research", help="research database summary").set_defaults(func=cmd_research)
+    s = sub.add_parser("research", help="research database summary")
+    s.add_argument("--aggressive", action="store_true",
+                   help="the forward-test view of Strategy B: rejections with "
+                        "their counterfactual outcomes, score buckets, "
+                        "long vs short, and per-gate sensitivity")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--min-sample", type=int, default=20,
+                   help="rows below this many outcomes are flagged, never hidden")
+    s.set_defaults(func=cmd_research)
 
     s = sub.add_parser("resume", help="clear a circuit-breaker halt")
     s.add_argument("--yes", action="store_true")
@@ -554,6 +800,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--skip-telegram", action="store_true")
     s.add_argument("--skip-universe", action="store_true")
     s.set_defaults(func=cmd_verify_live)
+
+    s = sub.add_parser(
+        "preflight",
+        help="everything that must be true before a live forward test: "
+             "5m/15m/1h data, quotes, spreads, universe, BTC regime, breadth, "
+             "Telegram, schema migration, restart recovery and the "
+             "Strategy B parameter contract")
+    s.add_argument("--quote-samples", type=int, default=5)
+    s.add_argument("--quote-interval", type=float, default=2.0)
+    s.add_argument("--skip-universe", action="store_true")
+    s.add_argument("--skip-telegram", action="store_true")
+    s.set_defaults(func=cmd_preflight)
 
     s = sub.add_parser("diagnose",
                        help="explain, per venue market, why it is or is not "

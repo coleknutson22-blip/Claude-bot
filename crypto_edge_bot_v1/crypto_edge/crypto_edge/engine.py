@@ -106,8 +106,12 @@ class TradingEngine:
         # Strategy B rides along on the SAME data: same feed, same candle
         # cache, same universe, same context. It owns its own ledger, entries
         # and exits, so nothing here touches Strategy A's execution path.
+        # Attached when it may TRADE, and also whenever it still holds
+        # something -- turning a strategy off must never strand a live position
+        # with nobody watching its stop.
         self.aggressive = None
-        if getattr(cfg, "aggressive", None) and cfg.aggressive.enabled:
+        a_cfg = getattr(cfg, "aggressive", None)
+        if a_cfg and (a_cfg.enabled or repo.get_positions(a_cfg.name)):
             from .aggressive_runtime import AggressiveRuntime
             self.aggressive = AggressiveRuntime(cfg, repo, feed, notifier,
                                                 self.broker, self.journal)
@@ -724,7 +728,12 @@ class TradingEngine:
             self.status.last_snapshot_ms = now
 
         if now - self.status.last_heartbeat_ms >= c.telegram.heartbeat_minutes * 60_000:
-            self._heartbeat(equity)
+            # Each strategy reports its OWN ledger. One combined heartbeat
+            # would have to pick a single equity figure, and there is no honest
+            # answer to that question once two independent sub-accounts exist.
+            if c.strategy.enabled or self.account.positions():
+                self._heartbeat(equity)
+            self._aggressive_heartbeat()
             self.status.last_heartbeat_ms = now
 
         today = utc_date(now)
@@ -765,6 +774,28 @@ class TradingEngine:
                 poll_s=float(self.cfg.engine.poll_seconds),
                 overruns=self.status.consecutive_overruns),
             kind="heartbeat")
+
+    def _aggressive_heartbeat(self) -> None:
+        """Strategy B's own heartbeat. Contained, like every other B pass."""
+        rt = self.aggressive
+        if rt is None:
+            return
+        try:
+            fast = self.cfg.aggressive.timeframes[0]
+            held = {p.symbol for p in rt.account.positions()}
+            marks_src = {s: self.series_for(fast).get(s) or
+                         self.series_for(self.cfg.aggressive.rank_timeframe).get(s)
+                         for s in held}
+            rt.send_heartbeat(
+                {k: v for k, v in marks_src.items() if v is not None},
+                ctx=MarketContext(ts_ms=now_ms(),
+                                  btc_regime=self.status.btc_regime,
+                                  btc_regime_score=0.0,
+                                  breadth_pct=self.status.breadth),
+                uptime_s=(now_ms() - self.status.started_ms) / 1000.0)
+        except Exception as e:
+            log_event("app", "ERROR", "Strategy B heartbeat failed",
+                      error=str(e))
 
     def _daily_report(self, date: str) -> None:
         marks = self.marks()
@@ -819,7 +850,13 @@ class TradingEngine:
         safe = self.check_safety()
         universe_ok, universe_why = self.entries_allowed()
 
-        if not safe:
+        if not self.cfg.strategy.enabled:
+            # This strategy is not trading this run. Its positions were still
+            # managed above; only new entries are withheld.
+            log_event("strategy", "INFO", "entries disabled by runtime mode",
+                      strategy=self.cfg.strategy.name,
+                      mode=self.cfg.runtime_mode())
+        elif not safe:
             log_event("strategy", "WARNING", "entries suppressed",
                       reason=self.status.halt_reason)
         elif not universe_ok:
@@ -835,7 +872,10 @@ class TradingEngine:
         else:
             signals = self.evaluate_signals(ctx)
             self.rank_and_enter(signals, ctx)
-        self._run_aggressive(ctx, entries_allowed=bool(safe and universe_ok))
+        self._run_aggressive(
+            ctx,
+            entries_allowed=bool(safe and universe_ok
+                                 and self.cfg.aggressive.enabled))
         self.bookkeeping()
 
     def _run_aggressive(self, ctx: MarketContext, *, entries_allowed: bool) -> None:

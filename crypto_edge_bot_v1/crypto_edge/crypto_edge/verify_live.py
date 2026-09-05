@@ -28,6 +28,10 @@ from .timeutils import (candle_close_ms, iso, last_closed_open_ms,
                         now_ms, tf_ms)
 
 CRITICAL, INFO = "CRITICAL", "INFO"
+# A step that never ran says so. "-" reads as "nothing to report", which is
+# indistinguishable from "fine" at a glance -- and the whole point of this
+# summary is that it cannot be misread as more reassuring than it is.
+NOT_RUN = "NOT RUN"
 NEWLINE = chr(10)
 
 
@@ -85,6 +89,41 @@ class VerifyReport:
             return f"FAILED: {', '.join(failed)}"
         return str(self.facts.get(key, default))
 
+    def render_preflight(self, cfg) -> str:
+        """The forward-test readiness summary.
+
+        Every line derives from the recorded checks via `fact`, so the summary
+        physically cannot claim OK for something a check below rejected.
+        """
+        f = self.facts
+        lines = [
+            "", "=" * 72,
+            f"FORWARD-TEST PREFLIGHT — {cfg.aggressive.name}",
+            "=" * 72,
+            f"EXCHANGE                       {f.get('exchange', '?')}",
+            f"RUNTIME MODE                   {f.get('mode', '-')}",
+            f"5m DATA                        {self.fact('b_5m', NOT_RUN)}",
+            f"15m DATA                       {self.fact('b_15m', NOT_RUN)}",
+            f"1h DATA                        {self.fact('btc_1h', NOT_RUN)}",
+            f"FAST FRAMES ON AN ALT          {self.fact('alt', NOT_RUN)}",
+            f"QUOTES                         {self.fact('quote_status', NOT_RUN)}",
+            f"SPREADS                        {f.get('spread_summary', NOT_RUN)}",
+            f"UNIVERSE                       {self.fact('broad_result', NOT_RUN)}",
+            f"  assets / intersecting / kept {f.get('broad_n', '-')} / "
+            f"{f.get('intersecting', '-')} / {f.get('after_filter', '-')}",
+            f"BTC REGIME                     {self.fact('regime', NOT_RUN)}",
+            f"BREADTH                        {self.fact('breadth', NOT_RUN)}",
+            f"TELEGRAM                       {self.fact('telegram', 'NOT RUN')}",
+            f"DATABASE MIGRATION             {self.fact('schema', NOT_RUN)}",
+            f"RESTART RECOVERY               {self.fact('restart', NOT_RUN)}",
+            f"STRATEGY B CONFIG              {self.fact('bcfg', NOT_RUN)}",
+            "=" * 72,
+            "VERDICT: " + ("READY FOR FORWARD TEST" if self.passed
+                           else "NOT READY -- failures above"),
+            "=" * 72,
+        ]
+        return "\n".join(lines)
+
     def render_summary(self) -> str:
         f = self.facts
         lines = [
@@ -110,6 +149,74 @@ class VerifyReport:
 
 
 # ---------------------------------------------------------------- exchange
+def verify_timeframe(cfg: Config, feed, symbol: str, tf: str, label: str,
+                     rep: VerifyReport):
+    """Fetch one timeframe and check it is closed, sane and current.
+
+    Extracted so EVERY timeframe the bot trades on gets the identical
+    treatment. Strategy B reads 5m and 15m, and a preflight that verified only
+    Strategy A's 1h and 4h would have declared the venue sound while saying
+    nothing about two thirds of the data B actually depends on.
+    """
+    try:
+        raw = feed.fetch_ohlcv(symbol, tf, cfg.exchange.ohlcv_limit)
+    except DataUnavailable as e:
+        rep.add(f"fetch_ohlcv {symbol} {tf}", False, str(e), topic=label)
+        rep.facts[label] = f"FAILED: {e}"
+        return None
+    buffer_ms = cfg.safety.candle_close_buffer_s * 1000
+    closed = raw.drop_unclosed(now_ms(), buffer_ms)
+    dropped = len(raw) - len(closed)
+    if len(closed) == 0:
+        rep.add(f"fetch_ohlcv {symbol} {tf}", False, "every candle was unclosed",
+                topic=label)
+        rep.facts[label] = "FAILED: no closed candles"
+        return None
+
+    now = now_ms()
+    step_ms = tf_ms(tf)
+    # CCXT DELIVERS CANDLE **OPEN** TIMESTAMPS. A bar stamped 03:00 on a 1h
+    # series spans 03:00 -> 04:00 and only becomes complete at 04:00, so
+    # every freshness figure below is measured from the CLOSE, never the
+    # stamp. Calling the stamp a "close" -- as this report once did -- makes
+    # a perfectly current 4h series look four hours stale.
+    last_open = int(closed.open_ms[-1])
+    close_ms = candle_close_ms(last_open, tf)
+    age_min = (now - close_ms) / 60_000.0
+    # What the venue SHOULD be able to give us right now.
+    expected_open = last_closed_open_ms(tf, now, buffer_ms)
+    bars_behind = max(0, round((expected_open - last_open) / step_ms))
+
+    # the newest CLOSED candle must genuinely be closed, and no more than
+    # one timeframe old (plus the buffer) or we are behind the market
+    properly_closed = close_ms + buffer_ms <= now
+    fresh = age_min <= (step_ms / 60_000.0) + 5
+    sane_ts = bool(closed.is_sane())
+
+    rep.add(f"fetch_ohlcv {symbol} {tf}", True,
+            f"{len(raw)} rows, {dropped} unclosed discarded, newest "
+            f"retained OPEN {iso(last_open)} -> COMPLETE at {iso(close_ms)}",
+            topic=label)
+    rep.add(f"unclosed candles discarded ({tf})", properly_closed,
+            "newest retained candle is genuinely complete" if properly_closed
+            else "a retained candle has NOT closed yet -- look-ahead risk",
+            topic=label)
+    rep.add(f"timestamps sane ({tf})", sane_ts,
+            "monotonic, evenly spaced, OHLC consistent" if sane_ts
+            else "series failed sanity check", topic=label)
+    rep.add(f"data freshness ({tf})", fresh,
+            f"complete {age_min:.1f} min ago; newest available open is "
+            f"{iso(expected_open)} and we have {iso(last_open)} "
+            f"({bars_behind} bar(s) behind)" if fresh
+            else f"complete {age_min:.1f} min ago -- {bars_behind} bar(s) "
+                 f"behind the newest available {tf} candle",
+            severity=CRITICAL if not fresh else INFO, topic=label)
+    rep.facts[label] = (f"OK ({len(raw)} rows, {dropped} unclosed dropped, "
+                        f"complete {age_min:.1f} min ago, "
+                        f"{bars_behind} bar(s) behind)")
+    return closed
+
+
 def verify_exchange(cfg: Config, feed, rep: VerifyReport) -> dict:
     """Markets, metadata, candles, unclosed-candle discard, clock."""
     print(f"\n[1] EXCHANGE ADAPTER -- {cfg.exchange_label()} "
@@ -176,62 +283,9 @@ def verify_exchange(cfg: Config, feed, rep: VerifyReport) -> dict:
     # --- candles, both timeframes ---
     for label, tf in (("btc_1h", cfg.strategy.entry_timeframe),
                       ("btc_4h", cfg.strategy.regime_timeframe)):
-        try:
-            raw = feed.fetch_ohlcv(btc, tf, cfg.exchange.ohlcv_limit)
-        except DataUnavailable as e:
-            rep.add(f"fetch_ohlcv {btc} {tf}", False, str(e))
-            rep.facts[label] = f"FAILED: {e}"
-            continue
-        buffer_ms = cfg.safety.candle_close_buffer_s * 1000
-        closed = raw.drop_unclosed(now_ms(), buffer_ms)
-        dropped = len(raw) - len(closed)
-        if len(closed) == 0:
-            rep.add(f"fetch_ohlcv {btc} {tf}", False, "every candle was unclosed")
-            rep.facts[label] = "FAILED: no closed candles"
-            continue
-
-        now = now_ms()
-        step_ms = tf_ms(tf)
-        # CCXT DELIVERS CANDLE **OPEN** TIMESTAMPS. A bar stamped 03:00 on a 1h
-        # series spans 03:00 -> 04:00 and only becomes complete at 04:00, so
-        # every freshness figure below is measured from the CLOSE, never the
-        # stamp. Calling the stamp a "close" -- as this report once did -- makes
-        # a perfectly current 4h series look four hours stale.
-        last_open = int(closed.open_ms[-1])
-        close_ms = candle_close_ms(last_open, tf)
-        age_min = (now - close_ms) / 60_000.0
-        # What the venue SHOULD be able to give us right now.
-        expected_open = last_closed_open_ms(tf, now, buffer_ms)
-        bars_behind = max(0, round((expected_open - last_open) / step_ms))
-
-        # the newest CLOSED candle must genuinely be closed, and no more than
-        # one timeframe old (plus the buffer) or we are behind the market
-        properly_closed = close_ms + buffer_ms <= now
-        fresh = age_min <= (step_ms / 60_000.0) + 5
-        sane_ts = bool(closed.is_sane())
-
-        rep.add(f"fetch_ohlcv {btc} {tf}", True,
-                f"{len(raw)} rows, {dropped} unclosed discarded, newest "
-                f"retained OPEN {iso(last_open)} -> COMPLETE at {iso(close_ms)}",
-                topic=label)
-        rep.add(f"unclosed candles discarded ({tf})", properly_closed,
-                "newest retained candle is genuinely complete" if properly_closed
-                else "a retained candle has NOT closed yet -- look-ahead risk",
-                topic=label)
-        rep.add(f"timestamps sane ({tf})", sane_ts,
-                "monotonic, evenly spaced, OHLC consistent" if sane_ts
-                else "series failed sanity check", topic=label)
-        rep.add(f"data freshness ({tf})", fresh,
-                f"complete {age_min:.1f} min ago; newest available open is "
-                f"{iso(expected_open)} and we have {iso(last_open)} "
-                f"({bars_behind} bar(s) behind)" if fresh
-                else f"complete {age_min:.1f} min ago -- {bars_behind} bar(s) "
-                     f"behind the newest available {tf} candle",
-                severity=CRITICAL if not fresh else INFO, topic=label)
-        rep.facts[label] = (f"OK ({len(raw)} rows, {dropped} unclosed dropped, "
-                            f"complete {age_min:.1f} min ago, "
-                            f"{bars_behind} bar(s) behind)")
-        out[label] = closed
+        closed = verify_timeframe(cfg, feed, btc, tf, label, rep)
+        if closed is not None:
+            out[label] = closed
 
     # --- clock ---
     server = feed.server_time_ms()
@@ -283,6 +337,10 @@ def verify_quotes(cfg: Config, feed, broker, samples: int, interval_s: float,
             f"median {statistics.median(spreads):.2f} bps, "
             f"max {max(spreads):.2f} bps, entry limit "
             f"{cfg.execution.max_spread_bps_entry:.0f} bps")
+    rep.facts["spread_summary"] = (
+        f"median {statistics.median(spreads):.2f} bps, "
+        f"max {max(spreads):.2f} bps (entry limit "
+        f"{cfg.execution.max_spread_bps_entry:.0f} bps)")
 
     # ---- timestamp findings -------------------------------------------
     if venue_stamped:
@@ -332,9 +390,16 @@ def verify_quotes(cfg: Config, feed, broker, samples: int, interval_s: float,
 
 # ------------------------------------------------------------- universe
 def verify_universe(cfg: Config, repo, broad_service, markets, tickers,
-                    rep: VerifyReport) -> None:
+                    rep: VerifyReport) -> dict:
+    """Returns what it learned -- notably `universe`, the surviving markets.
+
+    The preflight samples that list for breadth, and sampling the RAW market
+    list instead would measure a different population from the one the strategy
+    trades.
+    """
     from .data.universe import UniverseBuilder
 
+    out: dict = {}
     print("\n[3] BROAD ASSET UNIVERSE")
     before = repo.latest_broad_universe()
     broad = broad_service.get(force=True)
@@ -347,7 +412,7 @@ def verify_universe(cfg: Config, repo, broad_service, markets, tickers,
                 "no cache either -- entries would be correctly suspended"
                 if before is None else "a cache exists; entries would continue",
                 severity=INFO)
-        return
+        return out
 
     p = broad.provenance()
     expected = cfg.universe.broad_limit
@@ -388,7 +453,7 @@ def verify_universe(cfg: Config, repo, broad_service, markets, tickers,
 
     # --- intersection with the venue ---
     if not markets:
-        return
+        return out
     resolved = [s for s, m in markets.items() if broad.resolve(m.base).ok]
     rep.add("exchange intersection", len(resolved) > 0,
             f"{len(resolved)} of {len(markets)} venue markets map to a "
@@ -401,6 +466,7 @@ def verify_universe(cfg: Config, repo, broad_service, markets, tickers,
             f"{len(keep)} candidates survive stage 1 "
             f"(cap {cfg.universe.max_tradable} enter the pipeline)")
     rep.facts["after_filter"] = len(keep)
+    out["universe"] = list(keep)
 
     reasons: dict[str, int] = {}
     for r in audit:
@@ -432,6 +498,8 @@ def verify_universe(cfg: Config, repo, broad_service, markets, tickers,
                     severity=INFO)
     finally:
         broad_service.provider = real
+
+    return out
 
 
 # ------------------------------------------------------------- telegram
@@ -843,3 +911,209 @@ def verify_cycle(cfg: Config, repo, feed, notifier, rep: VerifyReport) -> None:
     rep.facts["cycle"] = (f"OK -- {st.signals_evaluated} signals evaluated, "
                           f"{st.entries} entries, {len(st.universe)} in universe, "
                           f"{elapsed:.1f}s")
+
+
+# ================================================================= preflight
+def verify_fast_timeframes(cfg: Config, feed, rep: VerifyReport) -> None:
+    """Strategy B's own data: 5m and 15m, on BTC and on a real shortlist symbol.
+
+    Checked on TWO symbols deliberately. BTC is the most liquid market on any
+    venue and will serve every timeframe cleanly; a mid-cap alt is where thin
+    5m history and gaps actually show up, and the shortlist is made of mid-cap
+    alts, not BTC.
+    """
+    print(f"\n[2] STRATEGY B FAST TIMEFRAMES -- {cfg.aggressive.name}")
+    btc = cfg.strategy.btc_symbol
+    fast = [tf for tf in cfg.aggressive.timeframes
+            if tf != cfg.aggressive.rank_timeframe]
+    for tf in fast:
+        verify_timeframe(cfg, feed, btc, tf, f"b_{tf}", rep)
+
+
+def verify_fast_timeframes_for(cfg: Config, feed, symbol: str,
+                               rep: VerifyReport) -> None:
+    """The same fast frames on a non-BTC market the strategy would rank."""
+    if not symbol:
+        return
+    print(f"\n[2b] FAST TIMEFRAMES ON A SHORTLIST-GRADE MARKET -- {symbol}")
+    for tf in cfg.aggressive.timeframes:
+        verify_timeframe(cfg, feed, symbol, tf, f"alt_{tf}", rep)
+
+
+def verify_schema(cfg: Config, repo, rep: VerifyReport) -> None:
+    """The database is at the current schema version, on this machine's file."""
+    print("\n[7] DATABASE SCHEMA AND MIGRATION")
+    from .storage import db as _db
+    row = repo.conn.execute(
+        "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    have = int(row["value"]) if row else -1
+    rep.add("schema at current version", have == _db.SCHEMA_VERSION,
+            f"database is v{have}, code expects v{_db.SCHEMA_VERSION}",
+            topic="schema")
+    cols = [r[1] for r in repo.conn.execute("PRAGMA table_info(trades)")]
+    rep.add("financing column present", "financing" in cols,
+            "trades.financing exists (v6) -- short borrow is recordable"
+            if "financing" in cols else "trades.financing MISSING",
+            topic="schema")
+    accounts = repo.all_accounts()
+    names = [a["strategy"] for a in accounts]
+    rep.add("per-strategy sub-accounts", True,
+            f"{len(accounts)} ledger(s): {', '.join(names) or 'none yet'}",
+            severity=INFO, topic="schema")
+    ok, why = _db.integrity_ok(repo.conn)
+    rep.add("database integrity", ok, why, topic="schema")
+    rep.facts["schema"] = f"v{have} OK" if have == _db.SCHEMA_VERSION else \
+        f"v{have} != expected v{_db.SCHEMA_VERSION}"
+
+
+def verify_restart_recovery(cfg: Config, repo, rep: VerifyReport) -> dict:
+    """Re-read the persisted state through a SECOND connection and diff it.
+
+    This is what a restart actually is: the same file, opened again by a new
+    process. Comparing two reads through one connection would prove only that
+    Python can remember a dict.
+    """
+    print("\n[8] RESTART RECOVERY")
+    from .storage import db as _db
+    from .storage.repo import Repo as _Repo
+
+    def snapshot(r):
+        return {
+            "accounts": {a["strategy"]: (float(a["cash"]),
+                                         float(a["starting_equity"]),
+                                         float(a["peak_equity"]),
+                                         int(a["halted"]))
+                         for a in r.all_accounts()},
+            "positions": sorted((p.strategy, p.symbol, round(p.qty, 10),
+                                 round(p.current_stop, 10), p.side)
+                                for p in r.get_positions()),
+            "candles": r.conn.execute(
+                "SELECT COUNT(*) n FROM processed_candles").fetchone()["n"],
+            "observations": r.conn.execute(
+                "SELECT COUNT(*) n FROM observations").fetchone()["n"],
+            "outbox": r.telegram_outbox_counts(),
+        }
+
+    before = snapshot(repo)
+    conn2 = _db.connect(cfg.engine.db_path)
+    _db.init_db(conn2)
+    after = snapshot(_Repo(conn2))
+    conn2.close()
+
+    for key in ("accounts", "positions", "candles", "observations", "outbox"):
+        same = before[key] == after[key]
+        detail = {
+            "accounts": f"{len(after['accounts'])} ledger(s) identical",
+            "positions": f"{len(after['positions'])} open position(s) identical",
+            "candles": f"{after['candles']} claimed candle(s) -- these are what "
+                       f"stop a restart re-entering the same signal",
+            "observations": f"{after['observations']} journal row(s)",
+            "outbox": f"{after['outbox'] or 'empty'}",
+        }[key]
+        rep.add(f"{key} survive a reopen", same,
+                detail if same else f"CHANGED: {before[key]} -> {after[key]}",
+                topic="restart")
+    rep.facts["restart"] = "OK" if not rep.failures_for("restart") else "FAILED"
+    return after
+
+
+# The Strategy B settings the forward test is defined by. Asserted against
+# LITERALS rather than read back from the same config object that supplied
+# them -- a check that compares a value to itself passes no matter what the
+# value is, and the entire point here is to catch a config drift before three
+# weeks of results are collected under settings nobody intended.
+FORWARD_TEST_CONTRACT = [
+    ("starting equity", lambda c: c.starting_equity_for(c.aggressive.name), 10_000.0),
+    ("max open positions", lambda c: c.aggressive.max_open_positions, 3),
+    ("leverage", lambda c: c.aggressive.leverage, 1.0),
+    ("ladder ceilings %", lambda c: c.aggressive.ladder_ceilings_pct, [50.0, 75.0, 100.0]),
+    ("confidence = identity", lambda c: c.aggressive.confidence_is_identity, True),
+    ("min confidence", lambda c: c.aggressive.min_confidence, 60.0),
+    ("min setup score", lambda c: c.aggressive.min_setup_score, 50.0),
+    ("min relative volume", lambda c: c.aggressive.min_rel_volume, 0.9),
+    ("min ATR %", lambda c: c.aggressive.min_atr_pct, 0.25),
+    ("min 15m structure", lambda c: c.aggressive.min_ema_struct_15m, 0.5),
+    ("max loss % of equity", lambda c: c.aggressive.max_loss_pct, 1.0),
+    ("daily buffer fraction", lambda c: c.aggressive.daily_buffer_fraction, 0.60),
+    ("short borrow bps/day", lambda c: c.aggressive.short_borrow_bps_per_day, 15.0),
+    ("forced short close %", lambda c: c.aggressive.short_force_close_at_loss_pct, 80.0),
+]
+
+
+def verify_strategy_b_contract(cfg: Config, repo, rep: VerifyReport) -> None:
+    """The paper account and the parameters the forward test is defined by."""
+    print(f"\n[9] STRATEGY B CONTRACT -- {cfg.aggressive.name}")
+    for label, getter, expected in FORWARD_TEST_CONTRACT:
+        got = getter(cfg)
+        rep.add(label, got == expected, f"{got}  (expected {expected})",
+                topic="bcfg")
+
+    # The sub-account itself, on disk, independent of Strategy A's.
+    name = cfg.aggressive.name
+    repo.ensure_account(name, cfg.starting_equity_for(name))
+    acct = repo.get_account(name)
+    other = [a for a in repo.all_accounts() if a["strategy"] != name]
+    rep.add("independent sub-account", acct is not None,
+            f"cash ${float(acct['cash']):,.2f}, "
+            f"start ${float(acct['starting_equity']):,.2f}, "
+            f"peak ${float(acct['peak_equity']):,.2f}, "
+            f"halted={bool(int(acct['halted']))}", topic="bcfg")
+    rep.add("Strategy A ledger untouched by B", True,
+            "; ".join(f"{a['strategy']}: cash ${float(a['cash']):,.2f}"
+                      for a in other) or "no other ledger yet",
+            severity=INFO, topic="bcfg")
+    # The max-loss formula, evaluated rather than described.
+    from .portfolio.ladder import loss_ceiling
+    eq = float(acct["starting_equity"])
+    cap = loss_ceiling(eq, eq * 0.03,
+                       max_loss_pct=cfg.aggressive.max_loss_pct,
+                       daily_buffer_fraction=cfg.aggressive.daily_buffer_fraction)
+    rep.add("max loss formula", abs(cap - eq * 0.01) < 1e-9,
+            f"on ${eq:,.0f} equity with a full 3% daily buffer the cap is "
+            f"${cap:,.2f} = min(1% of equity, 60% of buffer)", topic="bcfg")
+    rep.facts["bcfg"] = "OK" if not rep.failures_for("bcfg") else "FAILED"
+
+
+def verify_regime_and_breadth(cfg: Config, feed, repo, markets, tickers,
+                              universe: list[str], rep: VerifyReport) -> None:
+    """BTC regime and market breadth, computed from live candles."""
+    print("\n[5] BTC REGIME AND BREADTH")
+    from .strategy.regime import btc_regime, market_breadth
+    buffer_ms = cfg.safety.candle_close_buffer_s * 1000
+    btc = cfg.strategy.btc_symbol
+
+    def closed(sym, tf, limit):
+        return feed.fetch_ohlcv(sym, tf, limit).drop_unclosed(now_ms(), buffer_ms)
+
+    # The regime is read from the REGIME timeframe with the REGIME ema, exactly
+    # as `TradingEngine.build_context` does. A preflight that computed it any
+    # other way would be reporting a number the bot never uses.
+    try:
+        htf = closed(btc, cfg.strategy.regime_timeframe, cfg.exchange.ohlcv_limit)
+    except DataUnavailable as e:
+        rep.add("BTC regime", False, f"no BTC data: {e}", topic="regime")
+        rep.facts["regime"] = f"FAILED: {e}"
+        return
+    label, score = btc_regime(htf, cfg.strategy.regime_ema)
+    rep.add("BTC regime", label != "unknown",
+            f"{label} (score {score:.0f}) from {len(htf)} closed "
+            f"{cfg.strategy.regime_timeframe} candles", topic="regime")
+    rep.facts["regime"] = f"{label} (score {score:.0f})"
+
+    sample = [s for s in universe if s != btc][:40]
+    series = {}
+    for sym in sample:
+        try:
+            series[sym] = closed(sym, cfg.strategy.entry_timeframe, 250)
+        except DataUnavailable:
+            continue
+    if not series:
+        rep.add("market breadth", False, "no symbols returned usable candles",
+                topic="breadth")
+        rep.facts["breadth"] = "FAILED: no data"
+        return
+    b = market_breadth(series, cfg.strategy.ema_slow)
+    rep.add("market breadth", True,
+            f"{b:.0f}% of {len(series)} sampled markets above their "
+            f"{cfg.strategy.ema_slow}-period EMA", topic="breadth")
+    rep.facts["breadth"] = f"{b:.0f}% over {len(series)} markets"
