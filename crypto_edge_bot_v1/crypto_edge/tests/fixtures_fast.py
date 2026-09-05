@@ -18,6 +18,7 @@ from crypto_edge.timeutils import tf_ms
 
 BASE_MS = 1_700_000_000_000
 TF_BARS = {"5m": 1, "15m": 3, "1h": 12}      # 5m bars per bar of that timeframe
+REGIME_BARS = {"4h": 48}                     # opt-in; Strategy A's regime frame
 
 
 def _ohlc_from_closes(symbol, tf, closes, seed, vol_mult=1.0):
@@ -84,7 +85,8 @@ def resample(closes_5m: np.ndarray, bars: int) -> np.ndarray:
 
 def frames(drift: float, seed: int = 11, symbol: str = "SOL/USD",
            n_5m: int = 3600, sigma: float = 0.0018,
-           chop: bool = False, oscillate: bool = False) -> dict[str, Series]:
+           chop: bool = False, oscillate: bool = False,
+           include_4h: bool = False) -> dict[str, Series]:
     """One coherent market across 5m, 15m and 1h."""
     if oscillate:
         p5 = oscillating_path(n_5m, seed=seed)
@@ -93,7 +95,12 @@ def frames(drift: float, seed: int = 11, symbol: str = "SOL/USD",
     else:
         p5 = path(n_5m, drift, seed, sigma)
     out = {}
-    for tf, bars in TF_BARS.items():
+    wanted = dict(TF_BARS)
+    if include_4h:
+        # Strategy A's regime timeframe. Off by default so the aggressive
+        # tests, which never read it, do not pay to build it.
+        wanted.update(REGIME_BARS)
+    for tf, bars in wanted.items():
         closes = resample(p5, bars) if bars > 1 else p5
         out[tf] = _ohlc_from_closes(symbol, tf, closes[-320:], seed + bars,
                                     vol_mult=np.sqrt(bars))
