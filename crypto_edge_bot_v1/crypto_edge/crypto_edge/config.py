@@ -223,6 +223,11 @@ class AggressiveCfg:
     # per cycle rather than all at once, so a research table can never become
     # the dominant cost of the loop. 0 disables backfill entirely.
     excursion_backfill_per_cycle: int = 4
+    # How long a COMPLETE path keeps its tape. The 24h excursion horizon is the
+    # floor; the default keeps a wide margin so a replay written weeks later
+    # still has bars to walk. Pruning is per PATH, never per bar -- half a tape
+    # cannot be replayed, and a half-trimmed row looks replayable and is not.
+    tape_retention_days: int = 90
 
     # ================================ STAGE 3: SIZING AND EXITS ============
     # --- three-position capital ladder ------------------------------------

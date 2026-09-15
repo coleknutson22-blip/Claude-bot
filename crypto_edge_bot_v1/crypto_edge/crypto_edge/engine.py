@@ -756,6 +756,10 @@ class TradingEngine:
         # undelivered critical message can never be silently discarded.
         self.repo.prune_telegram_outbox(
             now - c.telegram.outbox_retention_days * DAY_MS)
+        if getattr(c, "aggressive", None) and c.aggressive.tape_retention_days > 0:
+            # Only COMPLETE paths are eligible -- see Repo.prune_tape.
+            self.repo.prune_tape(
+                now - c.aggressive.tape_retention_days * DAY_MS)
 
     def _heartbeat(self, equity: float) -> None:
         acct = self.account.state

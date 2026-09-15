@@ -23,6 +23,7 @@ from __future__ import annotations
 from ..logging_setup import log_event
 from ..timeutils import now_ms
 from . import excursion as ex
+from .tape import BAR_MS, TapeContext
 
 
 class ExcursionRecorder:
@@ -32,7 +33,8 @@ class ExcursionRecorder:
         self.max_open = max_open
 
     # ------------------------------------------------------------- opening
-    def start_from_signal(self, observation_id: str, sig) -> bool:
+    def start_from_signal(self, observation_id: str, sig,
+                          market=None) -> bool:
         """Begin a path for one journalled signal. Idempotent.
 
         Called for EVERY signal that carries a stop -- entered and rejected
@@ -55,31 +57,70 @@ class ExcursionRecorder:
         path = ex.build(observation_id=observation_id, symbol=sig.symbol,
                         strategy=self.strategy, side=sig.side,
                         direction=sig.direction, ref_price=ref,
-                        stop_price=stop, signal_ms=int(sig.ts_ms))
+                        stop_price=stop, signal_ms=int(sig.ts_ms),
+                        meta=_meta_dict(market))
         if path.stop_distance_pct <= 0:
             return False
         self.repo.upsert_excursion(path)
         return True
 
     # ------------------------------------------------------------- walking
-    def advance(self, series_by_symbol: dict, now: int | None = None) -> int:
+    def advance(self, series_by_symbol: dict, now: int | None = None,
+                frames_by_symbol: dict | None = None) -> int:
         """Fold newly closed 5m bars into every open path. Returns rows changed.
 
         `series_by_symbol` holds ALREADY-CLOSED candles -- the caller drops the
         forming bar before this is reached, exactly as the strategy does.
+        `frames_by_symbol` optionally carries the 15m series per symbol, which
+        is where the chandelier ATR and the momentum-invalidation input come
+        from; without it the tape still records price but marks the derived
+        context unavailable rather than substituting a 5m stand-in.
+
+        Only OPEN paths are advanced. A completed path is never rewritten: its
+        aggregates and its tape are the record of what happened, and a second
+        pass over stale candles could only corrupt them.
         """
         now = now if now is not None else now_ms()
+        frames_by_symbol = frames_by_symbol or {}
         changed = 0
         for path in self.repo.open_excursions(self.strategy, self.max_open):
             s = series_by_symbol.get(path.symbol)
             try:
-                if ex.walk(path, s, now):
+                ctx = None
+                if s is not None and len(s):
+                    ctx = TapeContext(
+                        s, frames_by_symbol.get(path.symbol),
+                        regime_at=self.repo.regime_at)
+                moved, bars = ex.walk(path, s, now, tape_ctx=ctx)
+                if bars:
+                    self.repo.add_tape_bars(path.observation_id, bars)
+                if moved:
                     self.repo.upsert_excursion(path)
                     changed += 1
             except Exception as e:      # one bad path must not stop the rest
                 log_event("performance", "WARNING", "excursion walk failed",
                           observation_id=path.observation_id, error=str(e))
         return changed
+
+    def record_regime(self, ts_ms: int, btc_regime: str,
+                      breadth_pct: float | None = None) -> bool:
+        """Keep the regime timeline current so late-folded bars are stamped
+        with the regime that was in force at the bar, not the one in force
+        when the recorder got around to it.
+
+        Stamped at the START of the current 5m bar rather than at the raw
+        clock. A reading taken mid-bar is in force for that whole bar, and
+        stamping it at `now` would leave every bar folded in the same cycle
+        resolving to "unknown" -- the reading would arrive a few seconds too
+        late to describe the bar it was taken during.
+        """
+        try:
+            floored = int(ts_ms) // BAR_MS * BAR_MS
+            return self.repo.record_regime(floored, btc_regime, breadth_pct)
+        except Exception as e:
+            log_event("performance", "WARNING", "regime record failed",
+                      error=str(e))
+            return False
 
     def counts(self) -> dict:
         return self.repo.excursion_counts()
@@ -107,3 +148,12 @@ def _top_reasons(rows: list[dict], limit: int = 6) -> dict:
         k = normalise_reason(o.get("reject_reason") or "")
         counts[k] = counts.get(k, 0) + 1
     return dict(sorted(counts.items(), key=lambda kv: -kv[1])[:limit])
+
+
+def _meta_dict(market) -> dict:
+    """The venue rounding rules a replayed fill needs. Empty when unknown."""
+    if market is None:
+        return {}
+    return {k: getattr(market, k, None) for k in
+            ("price_precision", "price_step", "amount_precision",
+             "amount_step", "min_amount", "min_cost")}

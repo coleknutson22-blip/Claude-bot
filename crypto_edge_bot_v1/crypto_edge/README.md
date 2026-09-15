@@ -448,6 +448,20 @@ equally consistent with a move that went +2.5% and gave it all back, and
 telling those apart is the whole question behind "is a 2R target leaving money
 on the table".
 
+Each path also stores a **tape**: every closed 5m bar it walked, with the
+inputs the live exit engine actually reads — open/high/low/close, the 15m ATR
+the chandelier would have used, the 15m EMA structure behind momentum
+invalidation, the BTC regime in force, and elapsed time. That is what makes a
+later replay of the *complete* exit set possible: the live stop ratchets to
+breakeven at 1R and trails from 1.5R, so a comparison built only on the initial
+stop would understate the current policy on every trade that runs and gives it
+back.
+
+Each bar's 15m context is resolved at the last 15m bar that had **closed** by
+that 5m bar's own close. Computing the indicator once and stamping it on every
+row would apply a number derived from the end of the window to bars at its
+start — a trail replayed on information the bot never had.
+
 **Where a 5m candle cannot say which came first, we do not guess.** If the stop
 and a target both fall inside one bar, both orderings are consistent with the
 same OHLC. That case is recorded as `AMBIGUOUS_SAME_BAR` and excluded from
@@ -493,7 +507,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 1,063 automated tests, all passing
+### VERIFIED OFFLINE — 1,102 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -573,7 +587,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               1,063 tests
+tests/               1,102 tests
 ```
 
 ## Safety notes

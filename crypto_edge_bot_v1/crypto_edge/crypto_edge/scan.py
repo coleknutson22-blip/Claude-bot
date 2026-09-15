@@ -39,9 +39,12 @@ class ScanResult:
     signals: list[Signal] = field(default_factory=list)  # one per shortlisted symbol
     deep_fetches: int = 0                                # series actually requested
     fetch_failures: dict = field(default_factory=dict)
-    # The 5m series already fetched this cycle, kept so the research excursion
-    # recorder can advance its paths without paying for the same bars twice.
+    # The 5m and 15m series already fetched this cycle, kept so the research
+    # excursion recorder can advance its paths and build its tape without
+    # paying for the same bars twice. 15m is what the live chandelier ATR and
+    # the momentum-invalidation input are computed from.
     frames_5m: dict = field(default_factory=dict)
+    frames_15m: dict = field(default_factory=dict)
 
     @property
     def entries(self) -> list[Signal]:
@@ -114,6 +117,8 @@ def scan(cfg: Config, feed, ctx: MarketContext, *,
         res.signals.append(sig)
         if frames.get("5m") is not None:
             res.frames_5m[cand.symbol] = frames["5m"]
+        if frames.get("15m") is not None:
+            res.frames_15m[cand.symbol] = frames["15m"]
 
     res.deep_fetches = counter[0]
     return res

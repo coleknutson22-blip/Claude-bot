@@ -103,7 +103,8 @@ class AggressiveRuntime:
             equity, float(acct["daily_start_equity"]))
 
     def _journal(self, sig, decision: str, reason: str = "", *,
-                 rank=None, extra: dict | None = None) -> str | None:
+                 rank=None, extra: dict | None = None,
+                 market=None) -> str | None:
         """Record one decision AND open its forward path.
 
         The two are paired HERE rather than at each call site, so a record
@@ -113,7 +114,7 @@ class AggressiveRuntime:
         obs_id = self.journal.record(sig, decision, reason, rank=rank,
                                      extra=extra)
         if obs_id:
-            self.excursions.start_from_signal(obs_id, sig)
+            self.excursions.start_from_signal(obs_id, sig, market)
         return obs_id
 
     # ============================================================== exits
@@ -248,19 +249,21 @@ class AggressiveRuntime:
         for sig in res.signals:
             if not sig.passed:
                 self._journal(sig, REJECTED_STRATEGY,
-                              rank=sig.features.get("rank"))
+                              rank=sig.features.get("rank"),
+                              market=markets.get(sig.symbol))
 
         if not entries_allowed or self.status.halted:
             reason = (self.status.halt_reason if self.status.halted
                       else "entries disabled for this run")
             for sig in res.entries:
                 self._journal(sig, REJECTED_RISK, reason,
-                              rank=sig.features.get("rank"))
+                              rank=sig.features.get("rank"),
+                              market=markets.get(sig.symbol))
             return 0
 
         # Research bookkeeping, AFTER every decision above has been made and
         # recorded. Deliberately last: nothing it computes can reach an entry.
-        self._advance_excursions(res)
+        self._advance_excursions(res, ctx)
 
         taken = 0
         for sig in res.entries:
@@ -269,13 +272,14 @@ class AggressiveRuntime:
                     sig, REJECTED_RISK,
                     f"max new entries per cycle reached "
                     f"({self.cfg.risk.max_new_entries_per_cycle})",
-                    rank=sig.features.get("rank"))
+                    rank=sig.features.get("rank"),
+                    market=markets.get(sig.symbol))
                 continue
             if self._enter(sig, ctx, markets, series_5m):
                 taken += 1
         return taken
 
-    def _advance_excursions(self, res) -> None:
+    def _advance_excursions(self, res, ctx: MarketContext | None = None) -> None:
         """Walk open forward paths on this cycle's 5m candles. Never raises.
 
         Most open paths belong to symbols still on the shortlist, whose bars
@@ -286,21 +290,29 @@ class AggressiveRuntime:
         runs ~34 hours deep against a 24-hour path.
         """
         try:
+            # The regime timeline first, so bars folded this cycle -- including
+            # backfilled ones -- are stamped with the regime in force at the
+            # BAR, not the one in force now.
+            if ctx is not None:
+                self.excursions.record_regime(now_ms(), ctx.btc_regime,
+                                              ctx.breadth_pct)
             series = dict(res.frames_5m)
+            frames15 = dict(res.frames_15m)
             budget = self.cfg.aggressive.excursion_backfill_per_cycle
             if budget > 0:
                 due = [p for p in self.repo.open_excursions(self.name)
                        if p.symbol not in series]
+                buf = self.cfg.safety.candle_close_buffer_s * 1000
                 for path in due[:budget]:
                     try:
-                        raw = self.feed.fetch_ohlcv(
-                            path.symbol, "5m",
-                            self.cfg.required_history_bars("5m"))
-                        series[path.symbol] = raw.drop_unclosed(
-                            now_ms(), self.cfg.safety.candle_close_buffer_s * 1000)
+                        for tf, into in (("5m", series), ("15m", frames15)):
+                            raw = self.feed.fetch_ohlcv(
+                                path.symbol, tf,
+                                self.cfg.required_history_bars(tf))
+                            into[path.symbol] = raw.drop_unclosed(now_ms(), buf)
                     except Exception:
                         continue     # a missing backfill is not a cycle error
-            self.excursions.advance(series, now_ms())
+            self.excursions.advance(series, now_ms(), frames_by_symbol=frames15)
         except Exception as e:
             log_event("performance", "WARNING", "excursion advance failed",
                       strategy=self.name, error=str(e))
@@ -313,7 +325,8 @@ class AggressiveRuntime:
 
         def refuse(reason: str) -> bool:
             self.risk.log_rejection(sym, reason, rank=rank)
-            self._journal(sig, REJECTED_RISK, reason, rank=rank)
+            self._journal(sig, REJECTED_RISK, reason, rank=rank,
+                          market=markets.get(sym))
             return False
 
         meta = markets.get(sym)
@@ -412,7 +425,8 @@ class AggressiveRuntime:
             return refuse("duplicate or insufficient cash")
 
         self.status.entries += 1
-        self._journal(sig, ENTERED, "", rank=rank, extra=journal)
+        self._journal(sig, ENTERED, "", rank=rank, extra=journal,
+                      market=meta)
         open_now = self.account.positions()
         self.notifier.send(
             fmt.aggressive_entry(

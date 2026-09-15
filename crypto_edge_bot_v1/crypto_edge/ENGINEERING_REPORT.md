@@ -8,7 +8,7 @@ Environment: Python 3.12.3, numpy 2.4.4, SQLite 3.45.1, **no outbound network**
 ## WHAT YOU CHANGED
 
 Built from scratch. Nothing from the previous bots was reused, per your
-instruction. 54 modules, ~25,300 lines including tests.
+instruction. 55 modules, ~26,200 lines including tests.
 
 **Foundation.** UTC millisecond epochs everywhere, with a deterministic
 `candle_id(symbol, timeframe, open_ms)` that is the backbone of duplicate
@@ -98,7 +98,7 @@ message text (defect 2 above), not a wrong severity.
 
 ## TEST RESULTS
 
-**1,063 tests, all passing.** Run: `python -m crypto_edge.cli test`
+**1,102 tests, all passing.** Run: `python -m crypto_edge.cli test`
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -133,7 +133,7 @@ message text (defect 2 above), not a wrong severity.
 | `test_cycle_pacing.py` | 33 | Cycles never overlap, no backlog, no zero-pause hot loop, closed-candle cache correctness and fail-closed |
 | `test_quote_currency.py` | 28 | Quote currency as one source of truth: BTC reference, always-include, volume units, provenance on change, no threshold moved |
 | `test_ladder_sizing.py` | 43 | The 50/75/100 ladder, every confidence-bucket boundary, the risk cap overruling the ladder, the daily-buffer taper, long/short sizing symmetry, leverage kept separate from confidence |
-| `test_excursions.py` | 65 | Forward paths: long/short MFE and MAE, every target threshold, target-before-stop, stop-before-target, same-bar ambiguity, exact boundary touches, restart mid-path, duplicate prevention, rejected signals tracked |
+| `test_excursions.py` | 104 | Forward paths: long/short MFE and MAE, every target threshold, target-before-stop, stop-before-target, same-bar ambiguity, exact boundary touches, restart mid-path, duplicate prevention, rejected signals tracked |
 | `test_runtime_modes.py` | 83 | Runtime mode (A only / B only / both), the Strategy B parameter contract, Telegram entry/exit/heartbeat content, per-ledger reporting, the forward-test research views, and the preflight harness |
 | `test_aggressive_execution.py` | 79 | Direction-signed R, stops that only ratchet, all seven deterministic exits, short borrow accrual, forced close before a collateral breach, restart with three open positions, and Strategy B inside a real engine cycle |
 
@@ -312,7 +312,7 @@ live but query tables no production code writes to. **A news event cannot
 currently stop a trade, and no funding or open-interest data is being
 recorded.** See the status table in the README.
 
-**7. Synthetic test data is a limited proxy.** 1,063 passing tests prove the
+**7. Synthetic test data is a limited proxy.** 1,102 passing tests prove the
 system is internally consistent and behaves correctly against data I generated.
 They cannot prove it behaves correctly against data reality generates.
 

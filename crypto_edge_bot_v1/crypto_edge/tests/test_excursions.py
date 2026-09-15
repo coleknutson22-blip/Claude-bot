@@ -402,29 +402,54 @@ class TestRestartSafety(unittest.TestCase):
 
 
 class TestSchemaMigration(unittest.TestCase):
-    def test_the_database_reports_version_seven(self):
+    def version(self, repo):
+        return int(repo.conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()["value"])
+
+    def test_the_database_reports_the_current_version(self):
         from crypto_edge.storage import db
         repo, _ = temp_repo()
-        v = repo.conn.execute(
-            "SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        self.assertEqual(int(v["value"]), db.SCHEMA_VERSION)
-        self.assertEqual(db.SCHEMA_VERSION, 7)
+        self.assertEqual(self.version(repo), db.SCHEMA_VERSION)
+        self.assertEqual(db.SCHEMA_VERSION, 8)
 
-    def test_a_v6_database_migrates_and_keeps_its_rows(self):
-        from crypto_edge.storage import db
-        repo, p = temp_repo()
+    def regress_to(self, repo, path, version, *drops):
         repo.ensure_account(B, 10_000.0)
-        repo.conn.execute("DROP TABLE excursions")
-        repo.conn.execute("UPDATE meta SET value='6' WHERE key='schema_version'")
+        for table in drops:
+            repo.conn.execute(f"DROP TABLE {table}")
+        repo.conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
+                          (str(version),))
         repo.conn.commit()
         repo.conn.close()
+        return open_repo(path)
 
-        repo2 = open_repo(p)
-        v = repo2.conn.execute(
-            "SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        self.assertEqual(int(v["value"]), 7)
+    def test_a_v6_database_migrates_and_keeps_its_rows(self):
+        repo, p = temp_repo()
+        repo2 = self.regress_to(repo, p, 6, "excursion_bars", "market_regime",
+                                "excursions")
+        self.assertEqual(self.version(repo2), 8)
         self.assertEqual(repo2.get_excursions(B), [])
         self.assertIsNotNone(repo2.get_account(B))
+
+    def test_a_v7_database_gains_the_tape_and_keeps_its_paths(self):
+        # v7 paths keep their aggregates; they simply have no tape, which a
+        # replay must report rather than invent.
+        repo, p = temp_repo()
+        rec = ExcursionRecorder(repo, B)
+        rec.start_from_signal("obs1", FakeSignal(ref_price=100.0, stop_price=98.0))
+        repo2 = self.regress_to(repo, p, 7, "excursion_bars", "market_regime")
+        self.assertEqual(self.version(repo2), 8)
+        self.assertEqual(len(repo2.get_excursions(B)), 1)
+        self.assertEqual(repo2.get_tape("obs1"), [])
+        self.assertEqual(repo2.regime_at(T0), "unknown")
+
+    def test_the_new_tables_exist_after_migration(self):
+        repo, p = temp_repo()
+        repo2 = self.regress_to(repo, p, 7, "excursion_bars", "market_regime")
+        names = {r["name"] for r in repo2.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertIn("excursion_bars", names)
+        self.assertIn("market_regime", names)
 
 
 # ============================================ coverage: rejected signals too
@@ -649,3 +674,401 @@ class TestTradingLogicUnchanged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# =========================================================== THE TAPE (A2)
+def series15(symbol, rows, t0=T0, start_i=0):
+    """15m candles. rows = [(high, low, close), ...]."""
+    step = 900_000
+    n = len(rows)
+    ms = np.array([t0 + (start_i + i) * step for i in range(n)], dtype=np.int64)
+    hi = np.array([r[0] for r in rows], dtype=float)
+    lo = np.array([r[1] for r in rows], dtype=float)
+    cl = np.array([r[2] for r in rows], dtype=float)
+    return Series(symbol, "15m", ms, cl.copy(), hi, lo, cl, np.full(n, 1000.0))
+
+
+def ramp15(n=120, start=100.0, step=0.4, t0=None, width=1.0):
+    """A rising 15m series long enough for ema_structure (needs > 50 bars).
+
+    The bar RANGE breathes rather than being constant: a fixed-width ramp has a
+    constant ATR by construction, which would let a frozen-ATR bug pass the
+    causality test for the wrong reason.
+    """
+    # Centred on T0 so the series EXTENDS past the signal, as a live 15m feed
+    # does. Ending it at T0 would make every forward 5m bar resolve to the same
+    # last-closed 15m bar -- correct behaviour, but it would hide a frozen-ATR
+    # bug behind a fixture that never gave the context a chance to advance.
+    t0 = t0 if t0 is not None else T0 - (n - 24) * 900_000
+    rows = []
+    for i in range(n):
+        mid = start + i * step
+        w = width * (1.0 + 0.6 * ((i * 7) % 5) / 4.0)
+        rows.append((mid + w, mid - w, mid))
+    return series15("X/USD", rows, t0=t0)
+
+
+class TestTapePersistence(unittest.TestCase):
+    def setUp(self):
+        self.repo, self.db = temp_repo()
+        self.rec = ExcursionRecorder(self.repo, B)
+        self.sig = FakeSignal(ref_price=100.0, stop_price=98.0)
+
+    def test_a_bar_is_stored_for_every_bar_walked(self):
+        self.rec.start_from_signal("obs1", self.sig)
+        s = series("X/USD", [(101.0, 99.5, 100.2), (101.8, 100.1, 101.5)],
+                   start_i=1)
+        self.rec.advance({"X/USD": s}, T0 + 3 * MIN5)
+        tape = self.repo.get_tape("obs1")
+        self.assertEqual(len(tape), 2)
+        self.assertEqual(self.repo.get_excursion("obs1").bars, len(tape))
+
+    def test_the_tape_carries_full_ohlc_not_just_extremes(self):
+        # `stop_exit` needs the OPEN to detect a gap through the stop. Without
+        # it a replay cannot tell a gap fill from a clean stop fill.
+        self.rec.start_from_signal("obs1", self.sig)
+        self.rec.advance({"X/USD": series(
+            "X/USD", [(101.0, 99.5, 100.2)], start_i=1)}, T0 + 2 * MIN5)
+        bar = self.repo.get_tape("obs1")[0]
+        for field in ("open", "high", "low", "close"):
+            self.assertIn(field, bar)
+            self.assertIsNotNone(bar[field])
+
+    def test_elapsed_time_since_the_signal_is_stored(self):
+        self.rec.start_from_signal("obs1", self.sig)
+        self.rec.advance({"X/USD": series(
+            "X/USD", [(101.0, 99.5, 100.2), (101.2, 100.0, 101.0)],
+            start_i=3)}, T0 + 6 * MIN5)
+        got = [b["elapsed_min"] for b in self.repo.get_tape("obs1")]
+        self.assertEqual(got, [15.0, 20.0])
+
+    def test_bars_are_returned_in_time_order(self):
+        self.rec.start_from_signal("obs1", self.sig)
+        self.rec.advance({"X/USD": series(
+            "X/USD", [(101.0, 99.5, 100.2)] * 5, start_i=1)}, T0 + 9 * MIN5)
+        ms = [b["open_ms"] for b in self.repo.get_tape("obs1")]
+        self.assertEqual(ms, sorted(ms))
+
+    def test_the_venue_rounding_rules_travel_with_the_path(self):
+        from crypto_edge.models import MarketMeta
+        meta = MarketMeta("X/USD", "X", "USD", True, amount_precision=6,
+                          price_precision=4, min_amount=1e-6, min_cost=5.0)
+        self.rec.start_from_signal("obs1", self.sig, meta)
+        stored = self.repo.get_excursion("obs1").meta
+        self.assertEqual(stored["price_precision"], 4)
+        self.assertEqual(stored["amount_precision"], 6)
+
+    def test_a_missing_market_is_recorded_as_unknown_not_invented(self):
+        self.rec.start_from_signal("obs1", self.sig, None)
+        self.assertEqual(self.repo.get_excursion("obs1").meta, {})
+
+
+class TestTapeContextPersistence(unittest.TestCase):
+    """ATR, 15m structure and regime -- the non-price exit inputs."""
+
+    def setUp(self):
+        self.repo, self.db = temp_repo()
+        self.rec = ExcursionRecorder(self.repo, B)
+        self.rec.start_from_signal(
+            "obs1", FakeSignal(ref_price=100.0, stop_price=98.0))
+
+    def advance(self, n=3, s15=None, start_i=1):
+        s5 = series("X/USD", [(101.0 + i, 99.5 + i, 100.2 + i) for i in range(n)],
+                    start_i=start_i)
+        self.rec.advance({"X/USD": s5}, T0 + (start_i + n + 1) * MIN5,
+                         frames_by_symbol={"X/USD": s15} if s15 is not None else None)
+        return self.repo.get_tape("obs1")
+
+    def test_the_chandelier_atr_is_stored_per_bar(self):
+        tape = self.advance(s15=ramp15())
+        self.assertTrue(tape)
+        for b in tape:
+            self.assertIsNotNone(b["atr"])
+            self.assertGreater(b["atr"], 0)
+
+    def test_the_atr_source_timeframe_is_recorded(self):
+        # The live code falls back from 15m to 5m on a short 15m history, so a
+        # replay has to know which series the number came from.
+        tape = self.advance(s15=ramp15())
+        self.assertEqual({b["atr_tf"] for b in tape}, {"15m"})
+
+    def test_a_short_15m_history_falls_back_exactly_as_live_does(self):
+        tape = self.advance(s15=ramp15(n=5))      # below the live 20-bar guard
+        self.assertEqual({b["atr_tf"] for b in tape}, {"5m"})
+
+    def test_the_momentum_invalidation_input_is_stored(self):
+        tape = self.advance(s15=ramp15())
+        for b in tape:
+            self.assertIsNotNone(b["ema_struct_15m"])
+            self.assertGreaterEqual(b["ema_struct_15m"], -1.0)
+            self.assertLessEqual(b["ema_struct_15m"], 1.0)
+
+    def test_structure_is_absent_rather_than_guessed_on_short_history(self):
+        # Live computes ema_structure only when len(s15) > 50.
+        tape = self.advance(s15=ramp15(n=30))
+        self.assertTrue(all(b["ema_struct_15m"] is None for b in tape))
+
+    def test_no_15m_series_means_no_invented_substitute(self):
+        tape = self.advance(s15=None)
+        self.assertTrue(all(b["ema_struct_15m"] is None for b in tape))
+
+    def test_the_regime_in_force_at_the_bar_is_stored(self):
+        self.repo.record_regime(T0 - MIN5, "bull", 55.0)
+        tape = self.advance(s15=ramp15())
+        self.assertEqual({b["btc_regime"] for b in tape}, {"bull"})
+
+    def test_a_bar_predating_any_reading_is_unknown_not_assumed(self):
+        self.repo.record_regime(T0 + 100 * MIN5, "bear", 20.0)
+        tape = self.advance(s15=ramp15())
+        self.assertEqual({b["btc_regime"] for b in tape}, {"unknown"})
+
+    def test_a_backfilled_bar_gets_the_historical_regime(self):
+        # The whole reason for a timeline: a bar folded late must not be
+        # stamped with the regime in force when the recorder caught up.
+        self.repo.record_regime(T0 - MIN5, "bull", 55.0)
+        self.repo.record_regime(T0 + 50 * MIN5, "bear", 15.0)
+        tape = self.advance(n=2, s15=ramp15(), start_i=1)
+        self.assertEqual({b["btc_regime"] for b in tape}, {"bull"})
+
+    def test_the_timeline_only_records_changes(self):
+        self.assertTrue(self.repo.record_regime(T0, "bull"))
+        self.assertFalse(self.repo.record_regime(T0 + MIN5, "bull"))
+        self.assertTrue(self.repo.record_regime(T0 + 2 * MIN5, "bear"))
+        self.assertEqual(len(self.repo.regime_timeline()), 2)
+
+
+class TestTapeIsCausal(unittest.TestCase):
+    """The failure that would quietly invalidate every replay."""
+
+    def test_the_15m_context_advances_with_the_bar(self):
+        # Computing last_valid(atr(s15)) once and stamping it on every bar
+        # would apply a number derived from the END of the window to bars at
+        # its start -- a trail replayed on information the bot never had.
+        from crypto_edge.research.tape import TapeContext
+        s15 = ramp15(n=120)
+        s5 = series("X/USD", [(101.0 + i*0.5, 99.5 + i*0.5, 100.2 + i*0.5)
+                              for i in range(24)], start_i=0)
+        ctx = TapeContext(s5, s15)
+        atrs = [ctx.bar_at(i, T0).atr for i in range(len(s5))]
+        self.assertGreater(len(set(atrs)), 1,
+                           "the ATR is frozen -- it was stamped from the end")
+
+    def test_a_bar_only_sees_15m_bars_that_had_closed(self):
+        from crypto_edge.research.tape import TapeContext
+        s15 = ramp15(n=120)
+        s5 = series("X/USD", [(101.0, 99.5, 100.2)] * 4, start_i=0)
+        ctx = TapeContext(s5, s15)
+        last_close_15 = int(s15.open_ms[-1]) + 900_000
+        for i in range(len(s5)):
+            j = ctx._index_15m_as_of(int(s5.open_ms[i]) + MIN5)
+            if j >= 0:
+                self.assertLessEqual(int(s15.open_ms[j]) + 900_000,
+                                     int(s5.open_ms[i]) + MIN5)
+            self.assertLess(j, len(s15))
+        self.assertGreater(last_close_15, 0)
+
+    def test_the_forward_fill_is_last_valid_evaluated_in_place(self):
+        from crypto_edge.research.tape import _ffill
+        a = np.array([np.nan, np.nan, 1.0, np.nan, 3.0, np.nan])
+        got = _ffill(a)
+        self.assertTrue(np.isnan(got[0]) and np.isnan(got[1]))
+        self.assertEqual(list(got[2:]), [1.0, 1.0, 3.0, 3.0])
+
+    def test_structure_matches_the_live_function_at_the_last_bar(self):
+        # The per-index series must agree with features.ema_structure where
+        # they overlap, or the replay is using a different indicator.
+        from crypto_edge.research.tape import _structure_series
+        from crypto_edge.strategy.features import ema_structure
+        close = np.asarray(ramp15(n=120).close, dtype=float)
+        self.assertAlmostEqual(_structure_series(close)[-1],
+                               ema_structure(close), places=9)
+
+    def test_structure_matches_live_on_a_truncated_prefix_too(self):
+        from crypto_edge.research.tape import _structure_series
+        from crypto_edge.strategy.features import ema_structure
+        close = np.asarray(ramp15(n=120).close, dtype=float)
+        full = _structure_series(close)
+        for cut in (60, 80, 100):
+            self.assertAlmostEqual(full[cut - 1], ema_structure(close[:cut]),
+                                   places=9,
+                                   msg=f"prefix of {cut} bars disagrees with live")
+
+
+class TestTapeIdempotence(unittest.TestCase):
+    def setUp(self):
+        self.repo, self.db = temp_repo()
+        self.rec = ExcursionRecorder(self.repo, B)
+        self.rec.start_from_signal(
+            "obs1", FakeSignal(ref_price=100.0, stop_price=98.0))
+
+    def test_a_duplicate_bar_cannot_be_inserted(self):
+        s = series("X/USD", [(101.0, 99.5, 100.2)], start_i=1)
+        self.rec.advance({"X/USD": s}, T0 + 2 * MIN5)
+        self.assertEqual(self.repo.tape_bar_count("obs1"), 1)
+        # write the same bar again, directly, bypassing the walk guard
+        from crypto_edge.research.tape import TapeBar
+        dup = TapeBar(open_ms=T0 + MIN5, elapsed_min=5.0, open=1.0, high=1.0,
+                      low=1.0, close=1.0, atr=1.0, atr_tf="15m",
+                      ema_struct_15m=0.0, btc_regime="bull")
+        self.assertEqual(self.repo.add_tape_bars("obs1", [dup]), 0)
+        self.assertEqual(self.repo.tape_bar_count("obs1"), 1)
+
+    def test_overlapping_venue_history_replays_to_the_same_tape(self):
+        first = series("X/USD", [(101.0, 99.5, 100.2)], start_i=1)
+        self.rec.advance({"X/USD": first}, T0 + 2 * MIN5)
+        # the venue returns the old bar again plus a new one, as it always does
+        overlap = series("X/USD", [(101.0, 99.5, 100.2), (102.0, 100.5, 101.5)],
+                         start_i=1)
+        ExcursionRecorder(open_repo(self.db), B).advance(
+            {"X/USD": overlap}, T0 + 3 * MIN5)
+        tape = self.repo.get_tape("obs1")
+        self.assertEqual(len(tape), 2)
+        self.assertEqual(len({b["open_ms"] for b in tape}), 2)
+
+    def test_many_restarts_over_one_candle_store_one_bar(self):
+        s = series("X/USD", [(101.0, 99.5, 100.2)], start_i=1)
+        for _ in range(5):
+            ExcursionRecorder(open_repo(self.db), B).advance(
+                {"X/USD": s}, T0 + 2 * MIN5)
+        self.assertEqual(self.repo.tape_bar_count("obs1"), 1)
+
+    def test_a_partially_recorded_path_resumes_from_its_last_bar(self):
+        self.rec.advance({"X/USD": series(
+            "X/USD", [(101.0, 99.5, 100.2), (101.5, 100.0, 101.0)],
+            start_i=1)}, T0 + 3 * MIN5)
+        self.assertEqual(self.repo.tape_bar_count("obs1"), 2)
+
+        rec2 = ExcursionRecorder(open_repo(self.db), B)
+        rec2.advance({"X/USD": series(
+            "X/USD", [(101.0, 99.5, 100.2), (101.5, 100.0, 101.0),
+                      (102.4, 101.0, 102.0)], start_i=1)}, T0 + 4 * MIN5)
+        tape = self.repo.get_tape("obs1")
+        self.assertEqual(len(tape), 3)
+        self.assertEqual(self.repo.get_excursion("obs1").bars, 3)
+
+    def test_a_completed_path_is_never_rewritten(self):
+        self.rec.advance({"X/USD": series(
+            "X/USD", [(99.0, 97.0, 97.5)], start_i=1)}, T0 + 2 * MIN5)
+        p = self.repo.get_excursion("obs1")
+        self.assertEqual(p.status, X.COMPLETE)
+        before = self.repo.get_tape("obs1")
+        self.rec.advance({"X/USD": series(
+            "X/USD", [(110.0, 105.0, 108.0)] * 3, start_i=2)}, T0 + 6 * MIN5)
+        self.assertEqual(self.repo.get_tape("obs1"), before)
+
+    def test_the_bar_that_completes_a_path_is_on_its_tape(self):
+        # The stop bar is the most important row in the whole tape.
+        self.rec.advance({"X/USD": series(
+            "X/USD", [(101.0, 100.0, 100.5), (99.0, 97.0, 97.5)],
+            start_i=1)}, T0 + 3 * MIN5)
+        tape = self.repo.get_tape("obs1")
+        self.assertEqual(len(tape), 2)
+        self.assertEqual(tape[-1]["low"], 97.0)
+
+
+class TestTapeRetention(unittest.TestCase):
+    def test_the_horizon_is_covered_by_the_default_retention(self):
+        from crypto_edge.config import AggressiveCfg
+        from crypto_edge.research import excursion as XX
+        horizon_days = max(XX.HORIZONS_MIN) / (60 * 24)
+        self.assertGreaterEqual(AggressiveCfg().tape_retention_days,
+                                horizon_days)
+
+    def test_pruning_drops_whole_completed_paths_only(self):
+        repo, _ = temp_repo()
+        rec = ExcursionRecorder(repo, B)
+        from crypto_edge.research.tape import TapeBar
+        for oid, ts, status in (("old", T0, X.COMPLETE),
+                                ("new", T0 + 10**7, X.COMPLETE),
+                                ("open", T0, X.OPEN)):
+            rec.start_from_signal(oid, FakeSignal(
+                symbol=f"{oid}/USD", ref_price=100.0, stop_price=98.0,
+                ts_ms=ts))
+            p = repo.get_excursion(oid)
+            p.status = status
+            repo.upsert_excursion(p)
+            repo.add_tape_bars(oid, [TapeBar(
+                open_ms=ts + MIN5, elapsed_min=5.0, open=1.0, high=1.0,
+                low=1.0, close=1.0, atr=1.0, atr_tf="15m",
+                ema_struct_15m=0.0, btc_regime="bull")])
+        repo.prune_tape(T0 + 10**6)
+        self.assertEqual(repo.tape_bar_count("old"), 0)
+        self.assertEqual(repo.tape_bar_count("new"), 1)
+        self.assertEqual(repo.tape_bar_count("open"), 1,
+                         "an OPEN path lost its tape and can no longer resume")
+
+
+class TestTapeInTheEngine(unittest.TestCase):
+    def setUp(self):
+        from crypto_edge.engine import TradingEngine
+        from crypto_edge.notify.telegram import TelegramNotifier
+        from fixtures_fast import engine_feed
+        from helpers import engine_config
+
+        syms = [f"S{i:02d}/USDT" for i in range(6)] + ["BTC/USDT"]
+        self.feed, _ = engine_feed(syms)
+        self.repo, _ = temp_repo()
+        self.cfg = engine_config()
+        self.cfg.apply_runtime_mode("b")
+        self.cfg.universe.broad_static_assets = [s.split("/")[0] for s in syms]
+        self.eng = TradingEngine(
+            self.cfg, self.repo, self.feed,
+            TelegramNotifier("t", "c", self.repo, enabled=False,
+                             transport=None, sleep=lambda _: None))
+        self.eng.cycle()
+
+    def test_a_real_cycle_writes_tape(self):
+        self.assertGreater(self.repo.tape_bar_count(), 0)
+
+    def test_the_regime_timeline_is_written(self):
+        self.assertTrue(self.repo.regime_timeline())
+
+    def test_tape_context_is_populated_from_the_live_frames(self):
+        for p in self.repo.get_excursions(B):
+            tape = self.repo.get_tape(p.observation_id)
+            if tape:
+                self.assertIsNotNone(tape[0]["atr"])
+                self.assertEqual(tape[0]["atr_tf"], "15m")
+                return
+        self.fail("no path recorded any tape")
+
+    def test_a_second_cycle_extends_rather_than_duplicates(self):
+        before = self.repo.tape_bar_count()
+        self.eng.cycle()
+        rows = self.repo.conn.execute(
+            "SELECT observation_id, open_ms, COUNT(*) n FROM excursion_bars "
+            "GROUP BY observation_id, open_ms HAVING n > 1").fetchall()
+        self.assertEqual(rows, [])
+        self.assertGreaterEqual(self.repo.tape_bar_count(), before)
+
+    def test_both_sides_record_tape(self):
+        for p in self.repo.get_excursions(B):
+            self.assertIn(p.side, ("long", "short"))
+        self.assertTrue(self.repo.get_excursions(B))
+
+
+class TestTapeNeverReachesExecution(unittest.TestCase):
+    def test_the_tape_module_cannot_touch_the_ledger(self):
+        import crypto_edge.research.tape as mod
+        with open(mod.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        for forbidden in ("open_position", "close_position", "set_stop",
+                          "update_account", "add_trade", "broker"):
+            self.assertNotIn(forbidden, src)
+
+    def test_the_recorder_runs_after_every_trading_decision(self):
+        # `_advance_excursions` must be called AFTER the entry loop's decisions
+        # are settled, never before one of them.
+        import inspect
+
+        from crypto_edge.aggressive_runtime import AggressiveRuntime
+        src = inspect.getsource(AggressiveRuntime.scan_and_enter)
+        self.assertLess(src.index("_advance_excursions"), src.index("taken = 0"))
+
+    def test_no_tape_field_is_read_by_the_exit_engine(self):
+        import inspect
+
+        from crypto_edge.portfolio import aggressive_exits
+        src = inspect.getsource(aggressive_exits)
+        for forbidden in ("excursion", "tape", "TapeBar", "get_tape"):
+            self.assertNotIn(forbidden, src)

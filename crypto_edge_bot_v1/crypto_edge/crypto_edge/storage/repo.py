@@ -271,13 +271,87 @@ class Repo:
                (observation_id, strategy, symbol, side, direction, signal_ms,
                 ref_price, stop_price, stop_distance_pct, status, bars,
                 last_bar_ms, mfe_pct, mae_pct, mfe_ms, mae_ms, stop_touched,
-                stop_touched_ms, touches, horizons, hypothetical)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                stop_touched_ms, touches, horizons, meta_json, hypothetical)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (ex.observation_id, ex.strategy, ex.symbol, ex.side, ex.direction,
              ex.signal_ms, ex.ref_price, ex.stop_price, ex.stop_distance_pct,
              ex.status, ex.bars, ex.last_bar_ms, ex.mfe_pct, ex.mae_pct,
              ex.mfe_ms, ex.mae_ms, ex.stop_touched, ex.stop_touched_ms,
-             json.dumps(ex.touches), json.dumps(ex.horizons), 1))
+             json.dumps(ex.touches), json.dumps(ex.horizons),
+             json.dumps(ex.meta or {}), 1))
+
+    def add_tape_bars(self, observation_id: str, bars) -> int:
+        """Append tape rows. Returns how many were NEW.
+
+        INSERT OR IGNORE against the (path, bar) primary key, so replaying the
+        overlapping history a venue always returns is a no-op rather than a
+        duplicate or an error.
+        """
+        rows = [(observation_id, b.open_ms, b.elapsed_min, b.open, b.high,
+                 b.low, b.close, b.atr, b.atr_tf, b.ema_struct_15m,
+                 b.btc_regime) for b in bars]
+        if not rows:
+            return 0
+        before = self.conn.total_changes
+        self.conn.executemany(
+            """INSERT OR IGNORE INTO excursion_bars
+               (observation_id, open_ms, elapsed_min, open, high, low, close,
+                atr, atr_tf, ema_struct_15m, btc_regime)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""", rows)
+        return self.conn.total_changes - before
+
+    def get_tape(self, observation_id: str) -> list[dict]:
+        """One path's bars in time order -- what a replay walks."""
+        return [dict(r) for r in self.conn.execute(
+            """SELECT * FROM excursion_bars WHERE observation_id=?
+               ORDER BY open_ms""", (observation_id,))]
+
+    def tape_bar_count(self, observation_id: str | None = None) -> int:
+        if observation_id:
+            return self.conn.execute(
+                "SELECT COUNT(*) n FROM excursion_bars WHERE observation_id=?",
+                (observation_id,)).fetchone()["n"]
+        return self.conn.execute(
+            "SELECT COUNT(*) n FROM excursion_bars").fetchone()["n"]
+
+    def prune_tape(self, before_ms: int) -> int:
+        """Drop tape for paths whose signal predates `before_ms`.
+
+        Retention is expressed in whole paths, never in loose bars: half a tape
+        cannot be replayed, so trimming one would leave a row that looks
+        replayable and is not.
+        """
+        cur = self.conn.execute(
+            """DELETE FROM excursion_bars WHERE observation_id IN
+               (SELECT observation_id FROM excursions
+                WHERE status='complete' AND signal_ms < ?)""", (before_ms,))
+        return cur.rowcount
+
+    # --------------------------------------------------- regime timeline
+    def record_regime(self, ts_ms: int, btc_regime: str,
+                      breadth_pct: float | None = None) -> bool:
+        """Note the regime in force now. Skipped when unchanged since the last
+        reading, so the timeline stays one row per CHANGE plus a heartbeat."""
+        last = self.conn.execute(
+            "SELECT btc_regime FROM market_regime ORDER BY ts_ms DESC LIMIT 1"
+        ).fetchone()
+        if last and last["btc_regime"] == btc_regime:
+            return False
+        self.conn.execute(
+            "INSERT OR REPLACE INTO market_regime(ts_ms, btc_regime, breadth_pct)"
+            " VALUES(?,?,?)", (int(ts_ms), str(btc_regime), breadth_pct))
+        return True
+
+    def regime_at(self, ts_ms: int) -> str:
+        """The regime in force at `ts_ms`, or 'unknown' before records begin."""
+        r = self.conn.execute(
+            "SELECT btc_regime FROM market_regime WHERE ts_ms <= ? "
+            "ORDER BY ts_ms DESC LIMIT 1", (int(ts_ms),)).fetchone()
+        return r["btc_regime"] if r else "unknown"
+
+    def regime_timeline(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM market_regime ORDER BY ts_ms")]
 
     def get_excursion(self, observation_id: str):
         r = self.conn.execute(
@@ -620,4 +694,5 @@ def _excursion_row(r):
         mae_ms=int(r["mae_ms"]), stop_touched=int(r["stop_touched"]),
         stop_touched_ms=int(r["stop_touched_ms"]),
         touches=json.loads(r["touches"] or "{}"),
-        horizons=json.loads(r["horizons"] or "{}"))
+        horizons=json.loads(r["horizons"] or "{}"),
+        meta=json.loads((r["meta_json"] if "meta_json" in r.keys() else "") or "{}"))

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from ..timeutils import now_ms
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -194,11 +194,46 @@ CREATE TABLE IF NOT EXISTS excursions (
     stop_touched_ms INTEGER NOT NULL DEFAULT 0,
     touches TEXT NOT NULL DEFAULT '{}',
     horizons TEXT NOT NULL DEFAULT '{}',
+    -- The venue's price/amount granularity for this symbol, captured at signal
+    -- time. A replay resolves the STOP from the candle but must round the FILL
+    -- exactly as the live broker did, and precision can change under us -- so
+    -- it travels with the path rather than being re-fetched later.
+    meta_json TEXT NOT NULL DEFAULT '{}',
     -- HYPOTHETICAL for rejected signals, and never read by trading code.
     hypothetical INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_excursions_open
     ON excursions(status, strategy);
+
+CREATE TABLE IF NOT EXISTS excursion_bars (
+    observation_id TEXT NOT NULL,
+    open_ms INTEGER NOT NULL,
+    elapsed_min REAL NOT NULL,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    -- The ATR the live chandelier would have used, resolved as of THIS bar.
+    -- `atr_tf` records which series it came from, because the live code falls
+    -- back from 15m to 5m when the 15m history is too short.
+    atr REAL,
+    atr_tf TEXT NOT NULL DEFAULT '15m',
+    ema_struct_15m REAL,
+    btc_regime TEXT NOT NULL DEFAULT 'unknown',
+    -- (path, bar) is the identity of a tape row, so a duplicate insert is a
+    -- constraint violation rather than a silently doubled bar. In SQLite this
+    -- PK is also the index a replay walks the path with.
+    PRIMARY KEY (observation_id, open_ms)
+);
+
+-- The BTC regime timeline. One row per distinct reading, so a bar folded in
+-- late (a backfilled path) can be stamped with the regime that was ACTUALLY in
+-- force at its close rather than whatever is true now.
+CREATE TABLE IF NOT EXISTS market_regime (
+    ts_ms INTEGER PRIMARY KEY,
+    btc_regime TEXT NOT NULL,
+    breadth_pct REAL
+);
 
 CREATE TABLE IF NOT EXISTS counterfactuals (
     observation_id TEXT NOT NULL,
@@ -542,14 +577,22 @@ def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
 def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     """Add forward-excursion paths. Purely additive: the table starts empty and
     back-fills itself as new signals are journalled. Nothing existing moves."""
-    # The CREATE above runs unconditionally via executescript, so there is
-    # nothing to copy -- this migration exists to record that v7 is reachable.
+    return
+
+
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """Add the per-bar tape and the regime timeline.
+
+    Additive. Paths recorded under v7 keep their aggregates and simply have no
+    tape; a replay reports them as un-replayable rather than guessing their
+    bars, which is why `tape_bars` is counted separately from `bars`.
+    """
     return
 
 
 MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4,
               4: _migrate_v4_to_v5, 5: _migrate_v5_to_v6,
-              6: _migrate_v6_to_v7}
+              6: _migrate_v6_to_v7, 7: _migrate_v7_to_v8}
 
 
 def init_db(conn: sqlite3.Connection) -> None:

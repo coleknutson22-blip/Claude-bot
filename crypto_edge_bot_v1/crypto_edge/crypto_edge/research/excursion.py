@@ -108,6 +108,8 @@ class Excursion:
     touches: dict = field(default_factory=dict)
     # minutes-since-signal -> favourable % at that checkpoint
     horizons: dict = field(default_factory=dict)
+    # venue rounding rules, so a replay can reproduce the live fill price
+    meta: dict = field(default_factory=dict)
 
     # ---------------------------------------------------------------- setup
     @property
@@ -238,7 +240,7 @@ class Excursion:
 
 def build(*, observation_id: str, symbol: str, strategy: str, side: str,
           direction: int, ref_price: float, stop_price: float,
-          signal_ms: int) -> Excursion:
+          signal_ms: int, meta: dict | None = None) -> Excursion:
     """Start a path from a signal. No market data needed yet.
 
     The stop distance is derived from the two prices rather than passed in, so
@@ -250,22 +252,31 @@ def build(*, observation_id: str, symbol: str, strategy: str, side: str,
         observation_id=observation_id, symbol=symbol, strategy=strategy,
         side=side or "long", direction=1 if direction >= 0 else -1,
         ref_price=ref, stop_price=float(stop_price), stop_distance_pct=dist,
-        signal_ms=int(signal_ms))
+        signal_ms=int(signal_ms), meta=dict(meta or {}))
     ex.ensure_targets()
     return ex
 
 
-def walk(ex: Excursion, series, now_ms: int) -> bool:
-    """Fold every newly closed bar of `series` into `ex`. Returns changed."""
-    changed = False
+def walk(ex: Excursion, series, now_ms: int, tape_ctx=None) -> tuple[bool, list]:
+    """Fold every newly closed bar of `series` into `ex`.
+
+    Returns `(changed, tape_bars)`. The tape rows are the bars this call
+    actually consumed -- the caller persists them, so a path's aggregates and
+    its tape advance together or not at all.
+    """
+    changed, tape = False, []
     if series is not None and len(series):
         for i in range(len(series)):
             open_ms = int(series.open_ms[i])
             if open_ms <= ex.last_bar_ms or open_ms < ex.signal_ms:
                 continue
+            if tape_ctx is not None:
+                # Built BEFORE apply_bar, because apply_bar may complete the
+                # path and the bar that closed it still belongs on the tape.
+                tape.append(tape_ctx.bar_at(i, ex.signal_ms))
             changed |= ex.apply_bar(open_ms, float(series.high[i]),
                                     float(series.low[i]), float(series.close[i]))
             if ex.status != OPEN:
                 break
     changed |= ex.maybe_complete(now_ms)
-    return changed
+    return changed, tape
