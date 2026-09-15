@@ -25,7 +25,7 @@ from pathlib import Path
 
 from ..timeutils import now_ms
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -169,6 +169,36 @@ CREATE TABLE IF NOT EXISTS observations (
 CREATE INDEX IF NOT EXISTS idx_obs_ts ON observations(ts_ms);
 CREATE INDEX IF NOT EXISTS idx_obs_decision ON observations(decision);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_unique ON observations(candle_id, strategy);
+
+CREATE TABLE IF NOT EXISTS excursions (
+    observation_id TEXT PRIMARY KEY,
+    strategy TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    direction INTEGER NOT NULL,
+    signal_ms INTEGER NOT NULL,
+    ref_price REAL NOT NULL,
+    stop_price REAL NOT NULL,
+    stop_distance_pct REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    bars INTEGER NOT NULL DEFAULT 0,
+    -- The open time of the last 5m bar folded in. This one column is what
+    -- makes a restart safe: the walk resumes strictly after it, so replaying
+    -- an overlapping series can neither double-count a touch nor extend MFE.
+    last_bar_ms INTEGER NOT NULL DEFAULT 0,
+    mfe_pct REAL NOT NULL DEFAULT 0,
+    mae_pct REAL NOT NULL DEFAULT 0,
+    mfe_ms INTEGER NOT NULL DEFAULT 0,
+    mae_ms INTEGER NOT NULL DEFAULT 0,
+    stop_touched INTEGER NOT NULL DEFAULT 0,
+    stop_touched_ms INTEGER NOT NULL DEFAULT 0,
+    touches TEXT NOT NULL DEFAULT '{}',
+    horizons TEXT NOT NULL DEFAULT '{}',
+    -- HYPOTHETICAL for rejected signals, and never read by trading code.
+    hypothetical INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_excursions_open
+    ON excursions(status, strategy);
 
 CREATE TABLE IF NOT EXISTS counterfactuals (
     observation_id TEXT NOT NULL,
@@ -509,8 +539,17 @@ def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
             "ALTER TABLE trades ADD COLUMN financing REAL NOT NULL DEFAULT 0")
 
 
+def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+    """Add forward-excursion paths. Purely additive: the table starts empty and
+    back-fills itself as new signals are journalled. Nothing existing moves."""
+    # The CREATE above runs unconditionally via executescript, so there is
+    # nothing to copy -- this migration exists to record that v7 is reachable.
+    return
+
+
 MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3, 3: _migrate_v3_to_v4,
-              4: _migrate_v4_to_v5, 5: _migrate_v5_to_v6}
+              4: _migrate_v4_to_v5, 5: _migrate_v5_to_v6,
+              6: _migrate_v6_to_v7}
 
 
 def init_db(conn: sqlite3.Connection) -> None:

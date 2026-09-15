@@ -74,6 +74,10 @@ class AggressiveRuntime:
         self.journal = journal
         a = cfg.aggressive
         self.name = a.name
+        # Research only. Writes forward paths for every signal that carries a
+        # stop; nothing it computes is ever read by an entry or exit decision.
+        from .research.excursion_recorder import ExcursionRecorder
+        self.excursions = ExcursionRecorder(repo, a.name)
         self.account = PaperAccount(
             repo, broker, cfg.starting_equity_for(a.name), a.name,
             borrow_bps_per_day=a.short_borrow_bps_per_day)
@@ -97,6 +101,20 @@ class AggressiveRuntime:
         acct = self.account.state
         return self.risk.daily_loss_remaining(
             equity, float(acct["daily_start_equity"]))
+
+    def _journal(self, sig, decision: str, reason: str = "", *,
+                 rank=None, extra: dict | None = None) -> str | None:
+        """Record one decision AND open its forward path.
+
+        The two are paired HERE rather than at each call site, so a record
+        added later cannot silently skip excursion tracking -- which would look
+        exactly like a signal the strategy never produced.
+        """
+        obs_id = self.journal.record(sig, decision, reason, rank=rank,
+                                     extra=extra)
+        if obs_id:
+            self.excursions.start_from_signal(obs_id, sig)
+        return obs_id
 
     # ============================================================== exits
     def manage(self, ctx: MarketContext, frames_by_symbol: dict[str, dict],
@@ -229,21 +247,25 @@ class AggressiveRuntime:
         # said why. That is the exact population this journal exists to study.
         for sig in res.signals:
             if not sig.passed:
-                self.journal.record(sig, REJECTED_STRATEGY,
-                                    rank=sig.features.get("rank"))
+                self._journal(sig, REJECTED_STRATEGY,
+                              rank=sig.features.get("rank"))
 
         if not entries_allowed or self.status.halted:
             reason = (self.status.halt_reason if self.status.halted
                       else "entries disabled for this run")
             for sig in res.entries:
-                self.journal.record(sig, REJECTED_RISK, reason,
-                                    rank=sig.features.get("rank"))
+                self._journal(sig, REJECTED_RISK, reason,
+                              rank=sig.features.get("rank"))
             return 0
+
+        # Research bookkeeping, AFTER every decision above has been made and
+        # recorded. Deliberately last: nothing it computes can reach an entry.
+        self._advance_excursions(res)
 
         taken = 0
         for sig in res.entries:
             if taken >= self.cfg.risk.max_new_entries_per_cycle:
-                self.journal.record(
+                self._journal(
                     sig, REJECTED_RISK,
                     f"max new entries per cycle reached "
                     f"({self.cfg.risk.max_new_entries_per_cycle})",
@@ -253,6 +275,36 @@ class AggressiveRuntime:
                 taken += 1
         return taken
 
+    def _advance_excursions(self, res) -> None:
+        """Walk open forward paths on this cycle's 5m candles. Never raises.
+
+        Most open paths belong to symbols still on the shortlist, whose bars
+        the scan already paid for. The rest are backfilled a few per cycle --
+        bounded, because an unbounded catch-up would make a research table the
+        most expensive thing in the loop. Latency there is harmless: the walk
+        is idempotent and resumes from its own `last_bar_ms`, and 5m history
+        runs ~34 hours deep against a 24-hour path.
+        """
+        try:
+            series = dict(res.frames_5m)
+            budget = self.cfg.aggressive.excursion_backfill_per_cycle
+            if budget > 0:
+                due = [p for p in self.repo.open_excursions(self.name)
+                       if p.symbol not in series]
+                for path in due[:budget]:
+                    try:
+                        raw = self.feed.fetch_ohlcv(
+                            path.symbol, "5m",
+                            self.cfg.required_history_bars("5m"))
+                        series[path.symbol] = raw.drop_unclosed(
+                            now_ms(), self.cfg.safety.candle_close_buffer_s * 1000)
+                    except Exception:
+                        continue     # a missing backfill is not a cycle error
+            self.excursions.advance(series, now_ms())
+        except Exception as e:
+            log_event("performance", "WARNING", "excursion advance failed",
+                      strategy=self.name, error=str(e))
+
     def _enter(self, sig, ctx: MarketContext, markets: dict,
                series_5m: dict) -> bool:
         c, a = self.cfg, self.cfg.aggressive
@@ -261,7 +313,7 @@ class AggressiveRuntime:
 
         def refuse(reason: str) -> bool:
             self.risk.log_rejection(sym, reason, rank=rank)
-            self.journal.record(sig, REJECTED_RISK, reason, rank=rank)
+            self._journal(sig, REJECTED_RISK, reason, rank=rank)
             return False
 
         meta = markets.get(sym)
@@ -360,7 +412,7 @@ class AggressiveRuntime:
             return refuse("duplicate or insufficient cash")
 
         self.status.entries += 1
-        self.journal.record(sig, ENTERED, "", rank=rank, extra=journal)
+        self._journal(sig, ENTERED, "", rank=rank, extra=journal)
         open_now = self.account.positions()
         self.notifier.send(
             fmt.aggressive_entry(

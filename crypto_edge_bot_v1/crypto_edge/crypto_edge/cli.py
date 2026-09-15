@@ -9,6 +9,7 @@
     python -m crypto_edge.cli performance --aggressive
     python -m crypto_edge.cli research
     python -m crypto_edge.cli research --aggressive
+    python -m crypto_edge.cli research --aggressive --excursions
     python -m crypto_edge.cli resume
     python -m crypto_edge.cli test
     python -m crypto_edge.cli verify-live --cycle
@@ -334,6 +335,10 @@ def cmd_export(args) -> int:
 def cmd_research(args) -> int:
     from .research.counterfactual import CounterfactualTracker
     cfg, repo, _, _ = _bootstrap(args, need_feed=False)
+    if getattr(args, "excursions", False):
+        return _research_excursions(
+            cfg, repo, cfg.aggressive.name if getattr(args, "aggressive", False)
+            else _strategy_arg(args, cfg), args)
     if getattr(args, "aggressive", False) or getattr(args, "strategy", None):
         return _research_forward_test(
             cfg, repo, cfg.aggressive.name if getattr(args, "aggressive", False)
@@ -440,6 +445,96 @@ def _research_forward_test(cfg, repo, strategy: str, args) -> int:
     print("\n  The confidence buckets are a HYPOTHESIS, not a calibration:")
     print("  nothing yet shows an 85 wins more often than a 65. These rows are")
     print("  the evidence that will eventually confirm or kill that.")
+    return 0
+
+
+def _research_excursions(cfg, repo, strategy: str, args) -> int:
+    """The take-profit question, answered from recorded forward paths."""
+    from .research.forward_test import ExcursionReport
+    r = ExcursionReport(repo, strategy, cfg=cfg.aggressive,
+                        min_sample=args.min_sample)
+    counts = r.status_counts()
+    done = r.complete()
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "strategy": strategy, "status_counts": counts,
+            "crossover_atr_pct": r.crossover_atr,
+            "excursions": r.excursion_stats(),
+            "hit_rates": r.hit_rates(),
+            "stalled_2pct_to_2r": r.stalled_between_2pct_and_2r(),
+            "two_r_cheaper": r.two_r_cheaper_than_2pct(),
+            "ambiguity": r.ambiguity_share(),
+            "breakdowns": {k: {b: len(v) for b, v in g.items()}
+                           for k, g in r.breakdowns().items()},
+        }, indent=2, default=str))
+        return 0
+
+    def flag(n):
+        return "" if n >= args.min_sample else "  [SAMPLE TOO SMALL]"
+
+    print("=" * 76)
+    print(f"  FORWARD EXCURSIONS — {strategy}   ({cfg.exchange_label()})")
+    print(f"  paths: {counts.get('open', 0)} open, {counts.get('complete', 0)} complete")
+    print(f"  2R and a fixed +2% coincide at atr_pct = {r.crossover_atr:.4f}%")
+    print("=" * 76)
+    if not done:
+        print("\n  No COMPLETE paths yet. A path completes when its stop is")
+        print("  touched or its 24h horizon elapses, so this stays empty until")
+        print("  the forward test has been running. Nothing below can be")
+        print("  computed from open paths without biasing every rate downward.")
+        return 0
+
+    e = r.excursion_stats()
+    print(f"\nMFE / MAE over {e['n']} complete path(s){flag(e['n'])}")
+    print(f"  MFE   mean {e['mfe_mean']:+.2f}%  median {e['mfe_median']:+.2f}%  "
+          f"max {e['mfe_max']:+.2f}%")
+    print(f"  MAE   mean {e['mae_mean']:+.2f}%  median {e['mae_median']:+.2f}%  "
+          f"min {e['mae_min']:+.2f}%")
+    print(f"  median minutes to MFE {e['minutes_to_mfe_median']}, "
+          f"to MAE {e['minutes_to_mae_median']}")
+    print(f"  stopped out: {e['stopped']} ({e['stopped_pct']:.1f}%), "
+          f"median minutes to stop {e['minutes_to_stop_median']}")
+
+    amb = r.ambiguity_share()
+    print(f"\nINTRABAR AMBIGUITY  {amb['any_ambiguous']}/{amb['paths']} paths "
+          f"({amb['share_pct']:.1f}%) had a stop and a target in the SAME 5m bar")
+    print("  Those are excluded from every rate below, on both sides. A large")
+    print("  share here means the answer is finer data, not a bolder assumption.")
+
+    print("\nHIT RATES — reached BEFORE the stop, unambiguously")
+    print(f"  {'target':<10} {'decided':>8} {'hit':>6} {'rate':>8} {'ambig':>7}")
+    for row in r.hit_rates():
+        print(f"  {row['target']:<10} {row['decided']:>8} {row['hit']:>6} "
+              f"{row['hit_rate_pct']:>7.1f}% {row['ambiguous']:>7}"
+              f"{flag(row['decided'])}")
+
+    q1 = r.stalled_between_2pct_and_2r()
+    print(f"\nQ1  {q1['question']}   ({q1['atr_filter']})")
+    print(f"  {q1['stalled']}/{q1['decided']} decided = {q1['stalled_pct']:.1f}% "
+          f"({q1['ambiguous']} ambiguous, {q1['reached_2r']} did reach 2R)"
+          f"{flag(q1['decided'])}")
+    print("  This is the money-on-the-table case: a fixed +2% would have banked")
+    print("  a move the 2R target gave back.")
+
+    q2 = r.two_r_cheaper_than_2pct()
+    print(f"\nQ2  {q2['question']}   ({q2['atr_filter']})")
+    print(f"  {q2['two_r_only']}/{q2['decided']} decided = {q2['two_r_only_pct']:.1f}% "
+          f"({q2['ambiguous']} ambiguous){flag(q2['decided'])}")
+    print("  Below the crossover the CURRENT rule is the less demanding one.")
+
+    print("\nBREAKDOWNS  (hit rate for +2.0% and for 2R, before the stop)")
+    for name, groups in r.breakdowns().items():
+        if not groups:
+            continue
+        print(f"\n  {name}")
+        for bucket, paths in sorted(groups.items()):
+            rows = {x['target']: x for x in r.hit_rates(paths)}
+            p2, r2 = rows['pct_2.0'], rows['r_2.0']
+            print(f"    {bucket:<14} n={len(paths):<5} "
+                  f"+2.0%: {p2['hit_rate_pct']:>5.1f}% ({p2['decided']} decided)   "
+                  f"2R: {r2['hit_rate_pct']:>5.1f}% ({r2['decided']} decided)"
+                  f"{flag(p2['decided'])}")
     return 0
 
 
@@ -780,6 +875,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.add_argument("--min-sample", type=int, default=20,
                    help="rows below this many outcomes are flagged, never hidden")
+    s.add_argument("--excursions", action="store_true",
+                   help="forward-path view: MFE/MAE, which targets were reached "
+                        "before the stop, and the 2R vs fixed +2%% comparison")
     s.set_defaults(func=cmd_research)
 
     s = sub.add_parser("resume", help="clear a circuit-breaker halt")

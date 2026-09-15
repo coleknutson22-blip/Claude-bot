@@ -218,6 +218,12 @@ class AggressiveCfg:
     min_setup_score: float = 50.0       # below this is NO_TRADE, not a small trade
     stop_atr_mult: float = 1.8
 
+    # --- research instrumentation (no effect on any trading decision) -----
+    # Open forward paths whose symbol left the shortlist are re-fetched a few
+    # per cycle rather than all at once, so a research table can never become
+    # the dominant cost of the loop. 0 disables backfill entirely.
+    excursion_backfill_per_cycle: int = 4
+
     # ================================ STAGE 3: SIZING AND EXITS ============
     # --- three-position capital ladder ------------------------------------
     # Percentage of the strategy's REMAINING free cash available to each slot

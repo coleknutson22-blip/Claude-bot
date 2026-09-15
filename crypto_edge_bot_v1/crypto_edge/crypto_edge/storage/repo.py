@@ -261,6 +261,56 @@ class Repo:
             out.append(d)
         return out
 
+    # ------------------------------------------------------- excursions
+    def upsert_excursion(self, ex) -> None:
+        """Write one path. INSERT OR REPLACE keyed on observation_id, so the
+        recorder is idempotent: re-walking a path it already advanced writes
+        the same row rather than a second one."""
+        self.conn.execute(
+            """INSERT OR REPLACE INTO excursions
+               (observation_id, strategy, symbol, side, direction, signal_ms,
+                ref_price, stop_price, stop_distance_pct, status, bars,
+                last_bar_ms, mfe_pct, mae_pct, mfe_ms, mae_ms, stop_touched,
+                stop_touched_ms, touches, horizons, hypothetical)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ex.observation_id, ex.strategy, ex.symbol, ex.side, ex.direction,
+             ex.signal_ms, ex.ref_price, ex.stop_price, ex.stop_distance_pct,
+             ex.status, ex.bars, ex.last_bar_ms, ex.mfe_pct, ex.mae_pct,
+             ex.mfe_ms, ex.mae_ms, ex.stop_touched, ex.stop_touched_ms,
+             json.dumps(ex.touches), json.dumps(ex.horizons), 1))
+
+    def get_excursion(self, observation_id: str):
+        r = self.conn.execute(
+            "SELECT * FROM excursions WHERE observation_id=?",
+            (observation_id,)).fetchone()
+        return _excursion_row(r) if r else None
+
+    def open_excursions(self, strategy: str | None = None,
+                        limit: int = 500) -> list:
+        """Paths still being walked. These are what a restart picks back up."""
+        q = "SELECT * FROM excursions WHERE status='open'"
+        args: list = []
+        if strategy:
+            q += " AND strategy=?"; args.append(strategy)
+        q += " ORDER BY signal_ms LIMIT ?"; args.append(limit)
+        return [_excursion_row(r) for r in self.conn.execute(q, tuple(args))]
+
+    def get_excursions(self, strategy: str | None = None,
+                       status: str | None = None) -> list:
+        q, args, conds = "SELECT * FROM excursions", [], []
+        if strategy:
+            conds.append("strategy=?"); args.append(strategy)
+        if status:
+            conds.append("status=?"); args.append(status)
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY signal_ms"
+        return [_excursion_row(r) for r in self.conn.execute(q, tuple(args))]
+
+    def excursion_counts(self) -> dict:
+        return {r["status"]: r["n"] for r in self.conn.execute(
+            "SELECT status, COUNT(*) n FROM excursions GROUP BY status")}
+
     def add_counterfactual(self, obs_id: str, horizon_h: int, entry_ref: float,
                            price_at: float | None, return_pct: float | None,
                            evaluated_ms: int | None) -> None:
@@ -554,3 +604,20 @@ class Repo:
         self.conn.execute(
             """INSERT INTO strategy_versions(strategy, version, activated_ms, config_json)
                VALUES(?,?,?,?)""", (strategy, version, now_ms(), blob))
+
+
+def _excursion_row(r):
+    """Rehydrate a stored path so it can be walked further after a restart."""
+    from ..research.excursion import Excursion
+    return Excursion(
+        observation_id=r["observation_id"], symbol=r["symbol"],
+        strategy=r["strategy"], side=r["side"], direction=int(r["direction"]),
+        ref_price=float(r["ref_price"]), stop_price=float(r["stop_price"]),
+        stop_distance_pct=float(r["stop_distance_pct"]),
+        signal_ms=int(r["signal_ms"]), status=r["status"], bars=int(r["bars"]),
+        last_bar_ms=int(r["last_bar_ms"]), mfe_pct=float(r["mfe_pct"]),
+        mae_pct=float(r["mae_pct"]), mfe_ms=int(r["mfe_ms"]),
+        mae_ms=int(r["mae_ms"]), stop_touched=int(r["stop_touched"]),
+        stop_touched_ms=int(r["stop_touched_ms"]),
+        touches=json.loads(r["touches"] or "{}"),
+        horizons=json.loads(r["horizons"] or "{}"))

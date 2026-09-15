@@ -433,6 +433,34 @@ target, no fees, no financing. A rejected setup showing +2% did not necessarily
 survive to collect it. They rank filters against each other; they are not
 forgone P&L.
 
+**Measuring whether the exits are right.** Every signal — entered *and*
+rejected — gets a forward path walked bar by bar on closed 5m candles:
+maximum favourable and adverse excursion, when each occurred, whether the stop
+was touched, and for each of +1.0/1.5/2.0/2.5/3.0% and 1R/1.5R/2R whether that
+level was reached **before** the stop.
+
+```bash
+python -m crypto_edge.cli research --aggressive --excursions
+```
+
+A point-in-time counterfactual cannot answer this: a +0.3% reading at 4h is
+equally consistent with a move that went +2.5% and gave it all back, and
+telling those apart is the whole question behind "is a 2R target leaving money
+on the table".
+
+**Where a 5m candle cannot say which came first, we do not guess.** If the stop
+and a target both fall inside one bar, both orderings are consistent with the
+same OHLC. That case is recorded as `AMBIGUOUS_SAME_BAR` and excluded from
+*both* sides of every rate — resolving it by convention would push the
+convention straight into the win-rate comparison the table exists to settle.
+The ambiguous share is reported next to the rates: if it is large, the answer
+is finer data, not a bolder assumption.
+
+Nothing the recorder computes is read by any trading decision. It runs after
+every entry and exit has been decided, writes to a table execution never
+queries, and resumes from its own `last_bar_ms` — so a restart cannot
+double-count a touch or extend an excursion.
+
 **Stopping and restarting.** Ctrl-C (or `SIGTERM`) finishes the current cycle
 and then stops — cycles never overlap and are never interrupted mid-write.
 Everything needed to resume is already on disk, so restarting with the same
@@ -465,7 +493,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 998 automated tests, all passing
+### VERIFIED OFFLINE — 1,063 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -545,7 +573,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               998 tests
+tests/               1,063 tests
 ```
 
 ## Safety notes

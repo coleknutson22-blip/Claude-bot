@@ -39,6 +39,9 @@ class ScanResult:
     signals: list[Signal] = field(default_factory=list)  # one per shortlisted symbol
     deep_fetches: int = 0                                # series actually requested
     fetch_failures: dict = field(default_factory=dict)
+    # The 5m series already fetched this cycle, kept so the research excursion
+    # recorder can advance its paths without paying for the same bars twice.
+    frames_5m: dict = field(default_factory=dict)
 
     @property
     def entries(self) -> list[Signal]:
@@ -109,6 +112,8 @@ def scan(cfg: Config, feed, ctx: MarketContext, *,
         sig.features["rank_score"] = cand.score
         sig.features["rank_components"] = cand.components
         res.signals.append(sig)
+        if frames.get("5m") is not None:
+            res.frames_5m[cand.symbol] = frames["5m"]
 
     res.deep_fetches = counter[0]
     return res
