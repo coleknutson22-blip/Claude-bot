@@ -475,6 +475,40 @@ every entry and exit has been decided, writes to a table execution never
 queries, and resumes from its own `last_bar_ms` — so a restart cannot
 double-count a touch or extend an excursion.
 
+**Comparing exit policies without a second live arm.** With tapes stored, the
+same signal can be replayed twice — once under the current rules, once with the
+2R target replaced by a fixed +2% — and the difference measured as a *paired*
+observation:
+
+```bash
+python -m crypto_edge.cli research --aggressive --policy-sim
+```
+
+The simulator does not reimplement the exit engine; it re-drives it. Every bar
+calls the same `stop_exit`, `check_exit`, `update_stop` and `realise_pnl` the
+live runtime calls, in the live order: stop intrabar, then `check_exit` on the
+close, then the ratchet — so a new stop never applies on the bar that set it.
+A reimplementation would be a second copy of the rules, and the first thing it
+would do is drift.
+
+TP2 is expressed as `target_r = 2.0 / stop_distance_pct`, which is exactly
+`entry × 1.02` for a long and `entry × 0.98` for a short. That means the fixed
+target runs through the *identical* code branch — there is no second target
+implementation to get subtly wrong, and one variable changes.
+
+**Reconciliation runs first, and its verdict gates everything else.** Every
+replayable closed trade is replayed under CONTROL and compared to the recorded
+ledger field by field. "Same direction of profit" is not reconciliation: the
+exit reason must match exactly, and fills and net P&L must fall inside
+tolerances derived from named differences — stop fills consult no quote and get
+0.5 bps, quote-priced exits forgo the book spread and get 15. Anything else is
+listed as a discrepancy, not averaged away.
+
+No winner is declared below 100 paired paths (`INSUFFICIENT SAMPLE`), and the
+sample is split chronologically so an advantage present in only one half —
+a regime artefact wearing the costume of an edge — is visible rather than
+averaged into a result.
+
 **Stopping and restarting.** Ctrl-C (or `SIGTERM`) finishes the current cycle
 and then stops — cycles never overlap and are never interrupted mid-write.
 Everything needed to resume is already on disk, so restarting with the same
@@ -507,7 +541,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 1,102 automated tests, all passing
+### VERIFIED OFFLINE — 1,182 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -587,7 +621,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               1,102 tests
+tests/               1,182 tests
 ```
 
 ## Safety notes

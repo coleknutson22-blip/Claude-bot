@@ -10,6 +10,7 @@
     python -m crypto_edge.cli research
     python -m crypto_edge.cli research --aggressive
     python -m crypto_edge.cli research --aggressive --excursions
+    python -m crypto_edge.cli research --aggressive --policy-sim
     python -m crypto_edge.cli resume
     python -m crypto_edge.cli test
     python -m crypto_edge.cli verify-live --cycle
@@ -335,6 +336,10 @@ def cmd_export(args) -> int:
 def cmd_research(args) -> int:
     from .research.counterfactual import CounterfactualTracker
     cfg, repo, _, _ = _bootstrap(args, need_feed=False)
+    if getattr(args, "policy_sim", False):
+        return _research_policy_sim(
+            cfg, repo, cfg.aggressive.name if getattr(args, "aggressive", False)
+            else _strategy_arg(args, cfg), args)
     if getattr(args, "excursions", False):
         return _research_excursions(
             cfg, repo, cfg.aggressive.name if getattr(args, "aggressive", False)
@@ -536,6 +541,146 @@ def _research_excursions(cfg, repo, strategy: str, args) -> int:
                   f"2R: {r2['hit_rate_pct']:>5.1f}% ({r2['decided']} decided)"
                   f"{flag(p2['decided'])}")
     return 0
+
+
+def _research_policy_sim(cfg, repo, strategy: str, args) -> int:
+    """CONTROL vs a fixed +2% target, replayed from stored tapes."""
+    from .research import policy_report as rep
+    from .research import policy_sim as sim
+
+    cmp_ = rep.PolicyComparison(repo, strategy, cfg,
+                                fixed_tp_pct=args.fixed_tp)
+    recon = cmp_.reconcile()
+    pairs = cmp_.pairs()
+    summary = cmp_.summarise(pairs)
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "strategy": strategy,
+            "reconciliation": {
+                "compared": recon.compared,
+                "exit_reason_match_pct": recon.reason_match_pct,
+                "exact_bar": recon.exact_bar,
+                "within_one_bar": recon.within_one_bar,
+                "fill_ok": recon.fill_ok, "net_ok": recon.net_ok,
+                "trustworthy": recon.trustworthy,
+                "unreplayable": recon.unreplayable,
+                "by_exit_reason": recon.by_exit_reason,
+                "discrepancies": [vars(d) for d in recon.discrepancies[:100]],
+            },
+            "summary": summary,
+            "pairs": [p.as_dict() for p in pairs if p.ok][:500],
+        }, indent=2, default=str))
+        return 0
+
+    print("=" * 78)
+    print(f"  EXIT-POLICY REPLAY — {strategy}   ({cfg.exchange_label()})")
+    print(f"  CONTROL = 2R close-based target   "
+          f"TP2 = fixed +{args.fixed_tp:.2f}% close-based")
+    print("=" * 78)
+
+    # ---- reconciliation FIRST. Nothing below it is worth reading until
+    #      the simulator has shown it can reproduce what already happened.
+    print("\n[1] RECONCILIATION — CONTROL replayed against the real ledger")
+    if not recon.compared:
+        print("  No closed Strategy B trade could be replayed yet.")
+        for why, n in sorted(recon.unreplayable.items()):
+            print(f"    {n:>5}  {why}")
+        print("  Until this reconciles, every TP2 number below is UNVALIDATED.")
+    else:
+        print(f"  compared            {recon.compared}")
+        print(f"  exit reason matched {recon.exact_reason} "
+              f"({recon.reason_match_pct:.1f}%)")
+        print(f"  same bar            {recon.exact_bar}   "
+              f"within one bar: {recon.within_one_bar}")
+        print(f"  fill within tol     {recon.fill_ok}")
+        print(f"  net P&L within tol  {recon.net_ok}")
+        for why, n in sorted(recon.unreplayable.items()):
+            print(f"  unreplayable        {n:>5}  {why}")
+        if recon.by_exit_reason:
+            print("  by exit reason:")
+            for k, v in sorted(recon.by_exit_reason.items()):
+                print(f"    {k:<26} n={v['n']:<4} reason {v['reason_match']}"
+                      f"  fill {v['fill_ok']}")
+        if recon.discrepancies:
+            print(f"\n  {len(recon.discrepancies)} DISCREPANCY(IES):")
+            for d in recon.discrepancies[:12]:
+                print(f"    {d.trade_id} {d.field}: live={d.live} "
+                      f"sim={d.simulated}  ({d.note})")
+        verdict = ("TRUSTWORTHY" if recon.trustworthy
+                   else "NOT VALIDATED — treat everything below as suspect")
+        print(f"\n  VERDICT: {verdict}")
+
+    # ---- coverage -----------------------------------------------------
+    print(f"\n[2] COVERAGE")
+    print(f"  total paths         {summary['total_paths']}")
+    print(f"  replayable pairs    {summary['replayable']}")
+    for why, n in sorted(summary["unreplayable"].items()):
+        print(f"  excluded            {n:>5}  {why}")
+
+    label = summary["label"]
+    print(f"\n[3] PAIRED RESULT — {label}")
+    if label == rep.INSUFFICIENT:
+        print(f"  Fewer than {rep.MIN_PROVISIONAL} paired complete paths. No")
+        print("  winner is declared, and the numbers below are shown only so")
+        print("  the pipeline can be seen working.")
+    _print_pair_block(summary, indent="  ")
+
+    h = summary["halves"]
+    print(f"\n[4] CHRONOLOGICAL HALVES")
+    print(f"  first  n={h['first']['n']:<5} mean diff "
+          f"{h['first']['mean_diff_pct']:+.4f}%  sign {h['first']['sign']}")
+    print(f"  second n={h['second']['n']:<5} mean diff "
+          f"{h['second']['mean_diff_pct']:+.4f}%  sign {h['second']['sign']}")
+    print(f"  same sign in both halves: {h['same_sign']}")
+    print("  An advantage present in only one half is a regime artefact")
+    print("  wearing the costume of an edge.")
+
+    print(f"\n[5] CROSSOVER GROUPS  (2R and +{args.fixed_tp:.2f}% coincide at "
+          f"atr_pct {cmp_.crossover_atr:.4f}%)")
+    for name, block in summary["crossover"].items():
+        print(f"\n  {name}")
+        _print_pair_block(block, indent="    ")
+
+    for title, key in (("BY SIDE", "by_side"),
+                       ("BY CONFIDENCE BUCKET", "by_confidence_bucket"),
+                       ("BY SETUP-SCORE BUCKET", "by_score_bucket"),
+                       ("BY ATR% BUCKET", "by_atr_bucket"),
+                       ("BY BTC REGIME", "by_btc_regime")):
+        groups = summary[key]
+        if not groups:
+            continue
+        print(f"\n[6] {title}")
+        print(f"  {'bucket':<16}{'n':>5}{'CTRL win':>9}{'TP2 win':>8}"
+              f"{'mean diff':>11}{'CTRL exp':>10}{'TP2 exp':>9}")
+        for bucket, st_ in groups.items():
+            print(f"  {bucket:<16}{st_['n']:>5}{st_['control_wins']:>9}"
+                  f"{st_['tp2_wins']:>8}{st_['mean_diff_pct']:>10.4f}%"
+                  f"{st_['CONTROL']['expectancy_pct']:>9.4f}%"
+                  f"{st_['TP2']['expectancy_pct']:>8.4f}%")
+    return 0
+
+
+def _print_pair_block(s: dict, indent: str = "  ") -> None:
+    i = indent
+    print(f"{i}pairs {s['n']}   CONTROL wins {s['control_wins']}   "
+          f"TP2 wins {s['tp2_wins']}   ties {s['ties']}")
+    print(f"{i}mean paired diff (TP2 - CONTROL) {s['mean_diff_pct']:+.4f}%   "
+          f"median {s['median_diff_pct']:+.4f}%")
+    c, t = s["CONTROL"], s["TP2"]
+    print(f"{i}{'':<22}{'CONTROL':>12}{'TP2':>12}")
+    for label, key, fmt in (
+            ("net expectancy %", "expectancy_pct", "{:>12.4f}"),
+            ("gross expectancy %", "gross_expectancy_pct", "{:>12.4f}"),
+            ("win rate %", "win_rate_pct", "{:>12.1f}"),
+            ("profit factor", "profit_factor", "{:>12.2f}"),
+            ("avg winner %", "avg_winner_pct", "{:>12.4f}"),
+            ("avg loser %", "avg_loser_pct", "{:>12.4f}"),
+            ("median hold (min)", "hold_minutes_median", "{:>12.0f}")):
+        cv, tv = c.get(key, 0.0), t.get(key, 0.0)
+        cs = "         inf" if cv == float("inf") else fmt.format(cv)
+        ts = "         inf" if tv == float("inf") else fmt.format(tv)
+        print(f"{i}{label:<22}{cs}{ts}")
 
 
 def cmd_resume(args) -> int:
@@ -875,6 +1020,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.add_argument("--min-sample", type=int, default=20,
                    help="rows below this many outcomes are flagged, never hidden")
+    s.add_argument("--policy-sim", action="store_true",
+                   help="replay each stored tape under the CURRENT exit rules "
+                        "and under a fixed +2%% target, paired on the same "
+                        "signals; reconciles against the real ledger first")
+    s.add_argument("--fixed-tp", type=float, default=2.0,
+                   help="the fixed take-profit percentage TP2 tests "
+                        "(default 2.0)")
     s.add_argument("--excursions", action="store_true",
                    help="forward-path view: MFE/MAE, which targets were reached "
                         "before the stop, and the 2R vs fixed +2%% comparison")
