@@ -336,6 +336,10 @@ def cmd_export(args) -> int:
 def cmd_research(args) -> int:
     from .research.counterfactual import CounterfactualTracker
     cfg, repo, _, _ = _bootstrap(args, need_feed=False)
+    if getattr(args, "short_funnel", False):
+        return _research_short_funnel(
+            cfg, repo, cfg.aggressive.name if getattr(args, "aggressive", False)
+            else _strategy_arg(args, cfg), args)
     if getattr(args, "policy_sim", False):
         return _research_policy_sim(
             cfg, repo, cfg.aggressive.name if getattr(args, "aggressive", False)
@@ -540,6 +544,207 @@ def _research_excursions(cfg, repo, strategy: str, args) -> int:
                   f"+2.0%: {p2['hit_rate_pct']:>5.1f}% ({p2['decided']} decided)   "
                   f"2R: {r2['hit_rate_pct']:>5.1f}% ({r2['decided']} decided)"
                   f"{flag(p2['decided'])}")
+    return 0
+
+
+def _research_short_funnel(cfg, repo, strategy: str, args) -> int:
+    """Why no shorts, and whether the score floor is in the right place.
+
+    Everything printed here is recomputed from stored features, never parsed
+    out of a rejection label -- see `research/short_funnel` for why the labels
+    cannot answer it.
+    """
+    from .research import short_funnel as sf
+
+    floors = tuple(sorted({float(x) for x in str(args.score_floors).split(",")
+                           if x.strip()})) or (60.0, 70.0, 75.0, 80.0)
+    f = sf.ShortFunnel(repo, strategy, cfg,
+                       horizon_h=getattr(args, "horizon", None))
+    directional = tuple(g for g in sf.ALL_GATES
+                        if g not in (sf.GATE_SCORE, sf.GATE_CONFIDENCE))
+    funnel = f.funnel()
+    overlap, overlap_dir = f.overlap(), f.overlap(directional)
+    ablations, floors_out = f.ablations(), f.score_floors(floors)
+    costs, buckets = f.cost_split(), f.score_bucket_costs()
+    contest = f.side_contest()
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "strategy": strategy, "cost_bps": f.cost_bps,
+            "cost_bps_measured": f.measured_cost,
+            "horizon_h": f.horizon_h, "observations": len(f.candidates),
+            "funnel": funnel, "overlap": overlap,
+            "overlap_directional": overlap_dir, "side_contest": contest,
+            "ablations": ablations, "score_floors": floors_out,
+            "cost_split": costs, "score_buckets": buckets,
+        }, indent=2, default=str))
+        return 0
+
+    def pc(v, w=7):
+        return f"{v:+{w}.2f}%" if isinstance(v, (int, float)) else " " * (w - 1) + "--"
+
+    src = "measured from the ledger" if f.measured_cost else "DEFAULT, no trades yet"
+    print("=" * 78)
+    print(f"  SHORT FUNNEL — {strategy}   ({cfg.exchange_label()})")
+    print(f"  {len(f.candidates)} observation(s); round-trip cost drag "
+          f"{f.cost_bps:.1f} bps ({src})")
+    hz = (f"horizon {f.horizon_h}h only" if f.horizon_h is not None
+          else "all recorded horizons, averaged per observation")
+    print(f"  counterfactuals: {hz}; signed TOWARD THE SHORT")
+    print("=" * 78)
+    print("\nHYPOTHETICAL / NOT EXECUTED. A counterfactual is a raw price move")
+    print("with no stop, no target and no costs. `after cost` subtracts the")
+    print("measured drag only -- it does NOT model a stop, so a positive")
+    print("figure is an upper bound on what the signal could have paid.")
+
+    print("\n1. SEQUENTIAL FUNNEL  (live order; `rejected` is out of `reached`)")
+    print(f"  {'stage':<24} {'reached':>8} {'rejected':>9} {'survivor cf':>12} "
+          f"{'rejected cf':>12}")
+    for r in funnel:
+        rs = r["rejected_stats"]
+        print(f"  {r['stage']:<24} {r['reached']:>8} {r['rejected']:>9} "
+              f"{pc(r['mean_cf_pct'], 11):>12} {pc(rs['mean_cf_pct'], 11):>12}")
+        if r["stage"] != "observations evaluated":
+            extra = (f"   [{r['unavailable']} of those had no recorded value]"
+                     if r.get("unavailable") else "")
+            print(f"      rule: {r['gate']}{extra}")
+    print(f"\n  side contest: {contest['short_clear']} observation(s) cleared all"
+          f" three short blockers;")
+    print(f"  {contest['short_and_long_both_clear']} would ALSO have cleared the"
+          " long structure gates.")
+    print(f"  {contest['note']}.")
+
+    print("\n2. OVERLAPPING SHORT REJECTIONS  (each gate judged INDEPENDENTLY)")
+    print("  The recorded rejection labels are MUTUALLY EXCLUSIVE by")
+    print("  construction -- `choose_side` joins every blocker into one")
+    print("  string -- so a single-gate count there UNDERSTATES that gate's")
+    print("  reach. These totals are recomputed per gate, ignoring order.")
+    print("  `total` is what a gate would stop on its own. `only this` is what")
+    print("  NOTHING else would have stopped -- the only figure that says what")
+    print("  relaxing it ALONE would admit.")
+
+    def show_overlap(o, title):
+        print(f"\n  {title}")
+        print(f"  {'gate':<24} {'total':>7} {'only this':>10}   also blocked by")
+        any_row = False
+        for g in o["gates"]:
+            if not o["totals"][g]:
+                continue
+            any_row = True
+            co = [f"{h}:{n}" for h, n in o["matrix"][g].items()
+                  if h != g and n]
+            print(f"  {g:<24} {o['totals'][g]:>7} "
+                  f"{o['only_this_gate'][g]:>10}   "
+                  f"{', '.join(co) if co else '(nothing)'}")
+        if not any_row:
+            print("  (no gate rejected anything)")
+        print(f"  gates blocking each observation: {o['n_blockers_histogram']}")
+
+    show_overlap(overlap_dir, "DIRECTIONAL GATES ONLY (score/confidence excluded)")
+    show_overlap(overlap, "EVERY GATE, including the score and confidence floors")
+
+    print("\n3. SHORT-GATE ABLATION  (offline; nothing is applied)")
+    print("  Each variant DROPS the gate rather than nudging it, so")
+    print("  `extra` is a CEILING on what relaxing it could admit.")
+    print("  `extra dir` counts what clears the DIRECTIONAL gates once the")
+    print("  named one is dropped; `extra all` also requires the score and")
+    print("  confidence floors. Where the two differ, the structural gate was")
+    print("  never the binding constraint -- the score floor was.")
+    print(f"  {'variant':<38} {'extra dir':>9} {'extra all':>9} {'cf':>9} "
+          f"{'after cost':>11} {'replayable':>11}")
+    for a in ablations:
+        e = a["extra_directional_stats"]
+        print(f"  {a['variant']:<38} {a['extra_directional']:>9} "
+              f"{a['extra_admitted']:>9} "
+              f"{pc(e['mean_cf_pct'], 8):>9} "
+              f"{pc(e['mean_after_cost_pct'], 10):>11} "
+              f"{e['replayable']:>4}/{e['n']:<6}")
+    unreplayable = sum(1 for a in ablations
+                       if a["extra_directional"]
+                       and a["extra_directional_stats"]["replayable"]
+                       < a["extra_directional_stats"]["n"])
+    if unreplayable:
+        print(f"\n  WARNING: {unreplayable} variant(s) admit candidates whose"
+              " forward path was")
+        print("  NOT taped. For those, stop and take-profit P&L cannot be")
+        print("  reproduced from this data AT ALL -- only the raw forward move")
+        print("  exists, and a 1.8-ATR stop sits well inside most of these")
+        print("  moves. Nothing in this table says those shorts would have")
+        print("  survived to collect the figure beside them.")
+
+    print("\n4. SCORE THRESHOLD COMPARISON")
+    print(f"  REALISED (closed trades only; {floors_out['total_closed_trades']}"
+          f" total, {floors_out['trades_without_recorded_score']} without a"
+          " recorded score)")
+    print(f"  {'floor':>6} {'trades':>7} {'win%':>6} {'gross':>10} {'fees':>9} "
+          f"{'slip':>9} {'net':>10} {'net bps':>9}")
+    for r in floors_out["realised"]:
+        nb = (f"{r['net_bps']:+9.1f}" if r["net_bps"] is not None else "       --")
+        print(f"  {r['floor']:>6.0f} {r['closed_trades']:>7} "
+              f"{r['win_rate_pct']:>5.0f}% {r['gross_pnl']:>+10.2f} "
+              f"{-r['fees']:>+9.2f} {-r['slippage']:>+9.2f} "
+              f"{r['net_pnl']:>+10.2f} {nb}")
+    print(f"\n  HYPOTHETICAL (observations at or above the floor, short-side"
+          " score)")
+    print(f"  recomputed short score available on"
+          f" {floors_out['short_score_computable']} observation(s),"
+          f" missing on {floors_out['short_score_missing']}")
+    print(f"  distribution: {floors_out['short_score_histogram']}")
+    print(f"  {'floor':>6} {'obs':>7} {'with outcome':>13} {'cf':>9} "
+          f"{'after cost':>11} {'share +':>9}")
+    for r in floors_out["hypothetical"]:
+        sp = (f"{r['share_positive']:>8.1f}%" if r["share_positive"] is not None
+              else "       --")
+        print(f"  {r['floor']:>6.0f} {r['observations']:>7} "
+              f"{r['with_outcome']:>13} {pc(r['mean_cf_pct'], 8):>9} "
+              f"{pc(r['mean_after_cost_pct'], 10):>11} {sp}")
+    print(f"\n  {floors_out['warning']}.")
+    for c in floors_out["caveats"]:
+        print(f"  - {c}")
+
+    print("\n5. CONFIDENCE CALIBRATION  (realised, per unit of notional risked)")
+    print("  Dollar P&L confounds quality with size: the ladder gives a higher")
+    print("  score more notional. bps of turnover separates them, and adding")
+    print("  the cost back recovers the GROSS edge -- which is what says")
+    print("  whether a bucket has no edge or an edge smaller than its costs.")
+    print(f"  {'bucket':<10} {'n':>4} {'win%':>6} {'avg notional':>13} "
+          f"{'net $':>10} {'net bps':>9} {'cost bps':>9} {'gross bps':>10}")
+    for b in buckets:
+        def bp(v):
+            return f"{v:+9.1f}" if v is not None else "       --"
+        print(f"  {b['bucket']:<10} {b['n']:>4} {b['win_rate_pct']:>5.0f}% "
+              f"{b['avg_notional']:>13,.0f} {b['net_pnl']:>+10.2f} "
+              f"{bp(b['net_bps'])} {bp(b['cost_bps'])} {bp(b['gross_bps']):>10}")
+
+    print("\n6. COST-DRAG BREAKDOWN  (rebuilt from the four stored prices)")
+    if not costs["n_trades"]:
+        print("  No closed trades yet -- nothing to decompose.")
+        return 0
+    b = costs.get("bps", {})
+    print(f"  turnover {costs['turnover']:>14,.2f}  over {costs['n_trades']}"
+          f" trade(s), {costs['stop_exits']} stop exit(s),"
+          f" {costs['gapped_exits']} GAPPED")
+    for label, key in (("entry fee", "entry_fee"), ("exit fee", "exit_fee"),
+                       ("entry slippage", "entry_slippage"),
+                       ("exit slippage", "exit_slippage"),
+                       ("  of which modelled stop bps",
+                        "stop_slippage_modelled"),
+                       ("  of which GAP through the stop", "gap_component"),
+                       ("  of which non-stop exits", "exit_slippage_non_stop"),
+                       ("financing", "financing")):
+        print(f"  {label:<34} {-costs[key]:>+12.2f} "
+              f"{-b.get(key, 0.0):>+9.1f} bps")
+    print(f"  {'gross P&L':<34} {costs['gross_pnl']:>+12.2f} "
+          f"{b.get('gross_pnl', 0.0):>+9.1f} bps")
+    print(f"  {'net P&L':<34} {costs['net_pnl']:>+12.2f} "
+          f"{b.get('net_pnl', 0.0):>+9.1f} bps")
+    print("\n  reconstruction residuals (must be ~0, else read nothing above):")
+    print(f"    fees {costs['fee_residual']:+.6f}   "
+          f"slippage {costs['slippage_residual']:+.6f}   "
+          f"gap split {costs['gap_residual']:+.6f}")
+    print("\n  The GAP line is not a modelling assumption -- it is the distance")
+    print("  a 5m bar opened beyond the stop. Lowering `slippage_bps` cannot")
+    print("  remove it, and doing so would only hide the part that is.")
     return 0
 
 
@@ -1033,6 +1238,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--excursions", action="store_true",
                    help="forward-path view: MFE/MAE, which targets were reached "
                         "before the stop, and the 2R vs fixed +2%% comparison")
+    s.add_argument("--short-funnel", action="store_true",
+                   help="why no shorts: every short gate recomputed from stored "
+                        "features, which gates overlap, what relaxing each "
+                        "would admit, the score-floor comparison and the "
+                        "cost-drag split")
+    s.add_argument("--score-floors", default="60,70,75,80",
+                   help="comma-separated setup-score floors to compare "
+                        "(default 60,70,75,80)")
+    s.add_argument("--horizon", type=int, default=None,
+                   help="restrict counterfactual outcomes to one horizon in "
+                        "hours; the default averages every recorded horizon")
     s.set_defaults(func=cmd_research)
 
     s = sub.add_parser("resume", help="clear a circuit-breaker halt")

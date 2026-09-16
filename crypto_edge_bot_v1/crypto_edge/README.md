@@ -511,6 +511,47 @@ sample is split chronologically so an advantage present in only one half —
 a regime artefact wearing the costume of an edge — is visible rather than
 averaged into a result.
 
+**Asking why no shorts were taken, and whether the score floor is in the
+right place.**
+
+```bash
+python -m crypto_edge.cli research --aggressive --short-funnel
+```
+
+The recorded rejection reasons cannot answer this, and reading them as if they
+could produces a confident wrong answer. `choose_side` writes ONE label per
+observation and it is lossy three times over: it joins *every* blocker for a
+side into a single string, so the rows are mutually exclusive and each
+single-gate count understates that gate's reach; it reports only the side that
+came closest, with LONG winning ties, so markets that were plainly long never
+appear in the short rows at all; and the gates that run *after* a side is
+chosen — the bullish-BTC veto, breadth, exhaustion, trend quality, the score
+floor — were never applied to a signal an earlier blocker already killed, so
+their counts are over survivors rather than over signals.
+
+So the diagnostic ignores the labels and recomputes all thirteen short gates
+from the feature vector stored on every observation, using the strategy's own
+`momentum_votes`, `score_components` and `combine` — a change to a rule changes
+the diagnostic with it. The score in particular *has* to be recomputed:
+`observations.score` is direction-dependent and is `0.0` on every `NO_TRADE`,
+so reading it as a short's score would be wrong on every long and meaningless
+on every rejection.
+
+It prints the sequential funnel in live order; a per-gate overlap matrix whose
+`only this gate` column is the only figure that says what relaxing a gate
+*alone* would admit; seven offline ablations, each reported twice — once
+against the directional gates and once against the score and confidence floors
+as well, because where those two diverge the structural gate was never the
+binding constraint; the score-floor comparison with realised and hypothetical
+kept in separate structures that must not be added; and a cost decomposition
+rebuilt from the four stored prices, which is what separates the basis points
+the model *chooses* from the gap through the stop it does not.
+
+Every counterfactual figure is a raw forward price move with no stop, no target
+and no costs, reported beside the measured cost drag and never as forgone P&L.
+Where no v8 tape exists the row says so: stop and take-profit P&L cannot be
+reproduced for it at all.
+
 **Stopping and restarting.** Ctrl-C (or `SIGTERM`) finishes the current cycle
 and then stops — cycles never overlap and are never interrupted mid-write.
 Everything needed to resume is already on disk, so restarting with the same
