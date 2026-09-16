@@ -745,7 +745,8 @@ def cmd_preflight(args) -> int:
     in this codebase, and nothing here can open a position.
     """
     from .execution.paper_broker import PaperBroker
-    from .verify_live import (VerifyReport, verify_fast_timeframes,
+    from .verify_live import (VerifyReport, verify_circuit_breakers,
+                              verify_fast_timeframes,
                               verify_fast_timeframes_for, verify_exchange,
                               verify_pending_first, verify_quotes,
                               verify_regime_and_breadth, verify_restart_recovery,
@@ -796,6 +797,8 @@ def cmd_preflight(args) -> int:
     verify_schema(cfg, repo, rep)
     verify_restart_recovery(cfg, repo, rep)
     verify_strategy_b_contract(cfg, repo, rep)
+    # Last, and it can veto the whole verdict: a halted strategy opens nothing.
+    verify_circuit_breakers(cfg, repo, rep)
 
     print(rep.render_preflight(cfg))
     return 0 if rep.passed else 1

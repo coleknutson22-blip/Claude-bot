@@ -400,7 +400,9 @@ the universe, BTC regime, breadth, Telegram delivery, the schema version and
 migration, restart recovery through a second connection, and every parameter
 the forward test is defined by — checked against **literals**, so a config
 drift is caught before three weeks of results are collected under settings
-nobody intended. It exits non-zero and prints `NOT READY` if anything fails,
+nobody intended. It also fails if a **selected** strategy's circuit breaker is latched — a halted strategy opens nothing, so a forward test started in that state produces zero trades and looks exactly like one that found no setups. A halt on a strategy that is *not* trading this run is reported as stale state and does not block. Preflight never clears a halt; that is a decision for whoever reads why the breaker tripped.
+
+It exits non-zero and prints `NOT READY` if anything fails,
 and a step that could not run says `NOT RUN` rather than showing a dash that
 reads as "fine".
 
@@ -541,7 +543,7 @@ is a passing result. Credentials are masked in all output.
 If a check fails, fix it before running continuously; the summary block ends
 with an explicit verdict.
 
-### VERIFIED OFFLINE — 1,182 automated tests, all passing
+### VERIFIED OFFLINE — 1,200 automated tests, all passing
 
 Exercised against deterministic synthetic data with no network:
 
@@ -621,7 +623,7 @@ crypto_edge/
   notify/            formatters, Telegram notifier
 config/config.toml   all parameters, commented
 scripts/             start/stop/status wrappers, offline smoke test
-tests/               1,182 tests
+tests/               1,200 tests
 ```
 
 ## Safety notes

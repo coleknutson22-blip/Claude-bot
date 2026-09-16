@@ -23,6 +23,7 @@ from crypto_edge.config import AggressiveCfg, Config, StrategyCfg
 from crypto_edge.notify import formatters as fmt
 from crypto_edge.notify.telegram import TelegramNotifier
 from crypto_edge.verify_live import (FORWARD_TEST_CONTRACT, VerifyReport,
+                                     verify_circuit_breakers,
                                      verify_fast_timeframes,
                                      verify_restart_recovery, verify_schema,
                                      verify_strategy_b_contract)
@@ -817,3 +818,181 @@ class TestNoStrategyLogicChanged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ======================================= a halted strategy is NOT ready
+class TestAHaltedStrategyFailsPreflight(unittest.TestCase):
+    """Regression: preflight reported READY while Strategy B was halted.
+
+    The old sub-account check asserted only that the ledger EXISTED and printed
+    `halted=True` inside the detail of a line already marked PASS. A reader had
+    to notice and interpret that on a passing line. A strategy whose circuit
+    breaker is latched cannot open anything, so a forward test started in that
+    state produces zero trades and looks exactly like a strategy that found no
+    setups -- which is the worst possible way to lose a week.
+    """
+
+    def setUp(self):
+        self.repo, _ = temp_repo()
+        self.cfg = engine_config()
+        self.cfg.exchange.name = "kraken"
+        self.cfg.exchange.quote = "USD"
+        self.cfg.resolve_symbols()
+        self.rep = VerifyReport()
+
+    def halt(self, strategy, reason="DAILY LOSS limit: -3.23% >= 3.0%"):
+        self.repo.ensure_account(strategy, 10_000.0)
+        self.repo.set_halt(strategy, True, reason)
+
+    def run_check(self):
+        return quiet(verify_circuit_breakers, self.cfg, self.repo, self.rep)
+
+    # --- the reported bug ---------------------------------------------
+    def test_a_halted_selected_strategy_fails(self):
+        self.cfg.apply_runtime_mode("b")
+        self.halt(B)
+        self.run_check()
+        self.assertFalse(self.rep.passed)
+        self.assertIn(f"{B} can open positions", self.rep.failures_for("halt"))
+
+    def test_the_halt_reason_is_printed(self):
+        self.cfg.apply_runtime_mode("b")
+        self.halt(B, "DAILY LOSS limit: -3.23% >= 3.0%")
+        _, out = self.run_check()
+        self.assertIn("-3.23%", out)
+        self.assertIn("HALTED", out)
+
+    def test_the_verdict_is_not_ready(self):
+        self.cfg.apply_runtime_mode("b")
+        self.halt(B)
+        self.run_check()
+        summary = self.rep.render_preflight(self.cfg)
+        self.assertIn("NOT READY", summary)
+        self.assertNotIn("READY FOR FORWARD TEST", summary)
+
+    def test_the_summary_line_reports_the_failure(self):
+        # `fact()` OVERRIDES its stored string with the names of the checks
+        # that failed, so the summary can never read better than the detail.
+        # The reason lives on the detail line and in the block below it.
+        self.cfg.apply_runtime_mode("b")
+        self.halt(B, "DRAWDOWN limit breached")
+        self.run_check()
+        summary = self.rep.render_preflight(self.cfg)
+        self.assertIn("CIRCUIT BREAKERS", summary)
+        self.assertIn("FAILED", self.rep.fact("halt"))
+        self.assertIn(B, self.rep.fact("halt"))
+
+    def test_the_reason_is_on_the_failing_check_itself(self):
+        self.cfg.apply_runtime_mode("b")
+        self.halt(B, "DRAWDOWN limit breached")
+        self.run_check()
+        step = next(st for st in self.rep.steps
+                    if st.name == f"{B} can open positions")
+        self.assertFalse(step.ok)
+        self.assertIn("DRAWDOWN limit breached", step.detail)
+
+    def test_preflight_never_clears_the_halt(self):
+        self.cfg.apply_runtime_mode("b")
+        self.halt(B)
+        self.run_check()
+        acct = self.repo.get_account(B)
+        self.assertTrue(bool(int(acct["halted"])),
+                        "preflight resumed the ledger by itself")
+        self.assertIn("3.0%", acct["halt_reason"])
+
+    def test_it_says_how_to_clear_the_halt_without_doing_it(self):
+        self.cfg.apply_runtime_mode("b")
+        self.halt(B)
+        _, out = self.run_check()
+        self.assertIn("resume --yes", out)
+        self.assertIn("will NOT clear it", out)
+
+    # --- a stale halt on an UNSELECTED strategy must not block ---------
+    def test_a_halt_on_an_unselected_strategy_does_not_block(self):
+        self.cfg.apply_runtime_mode("b")
+        self.halt(A, "old drawdown from last week")
+        self.repo.ensure_account(B, 10_000.0)
+        self.run_check()
+        self.assertTrue(self.rep.passed,
+                        "Strategy A's stale halt blocked a Strategy B run")
+
+    def test_a_stale_halt_is_still_reported_as_information(self):
+        self.cfg.apply_runtime_mode("b")
+        self.halt(A, "old drawdown")
+        self.repo.ensure_account(B, 10_000.0)
+        _, out = self.run_check()
+        self.assertIn("halted but not selected", out)
+        self.assertIn("old drawdown", out)
+
+    def test_the_other_direction_holds_too(self):
+        # A-only run, B halted: B is not trading, so it must not block.
+        self.cfg.apply_runtime_mode("a")
+        self.halt(B)
+        self.repo.ensure_account(A, 10_000.0)
+        self.run_check()
+        self.assertTrue(self.rep.passed)
+
+    # --- both selected -------------------------------------------------
+    def test_running_both_fails_if_either_is_halted(self):
+        self.cfg.apply_runtime_mode("both")
+        self.halt(B)
+        self.repo.ensure_account(A, 10_000.0)
+        self.run_check()
+        self.assertFalse(self.rep.passed)
+
+    def test_running_both_fails_if_the_other_is_halted(self):
+        self.cfg.apply_runtime_mode("both")
+        self.halt(A)
+        self.repo.ensure_account(B, 10_000.0)
+        self.run_check()
+        self.assertFalse(self.rep.passed)
+
+    # --- the healthy path ---------------------------------------------
+    def test_a_clear_ledger_passes(self):
+        self.cfg.apply_runtime_mode("b")
+        self.repo.ensure_account(B, 10_000.0)
+        self.run_check()
+        self.assertTrue(self.rep.passed)
+        self.assertIn("clear", self.rep.fact("halt"))
+
+    def test_a_fresh_database_passes(self):
+        self.cfg.apply_runtime_mode("b")
+        self.run_check()
+        self.assertTrue(self.rep.passed)
+
+    def test_selecting_nothing_fails(self):
+        self.cfg.strategy.enabled = False
+        self.cfg.aggressive.enabled = False
+        self.run_check()
+        self.assertFalse(self.rep.passed)
+        self.assertIn("FAILED", self.rep.fact("halt"))
+        self.assertIn("NOT READY", self.rep.render_preflight(self.cfg))
+
+    # --- the line that used to mislead --------------------------------
+    def test_the_sub_account_check_no_longer_vouches_for_the_halt(self):
+        self.cfg.apply_runtime_mode("b")
+        self.halt(B)
+        quiet(verify_strategy_b_contract, self.cfg, self.repo, self.rep)
+        line = next(st for st in self.rep.steps
+                    if st.name == "independent sub-account")
+        self.assertTrue(line.ok)            # it only claims the ledger exists
+        self.assertNotIn("halted", line.detail,
+                         "a PASS line mentions the halt again -- that is how "
+                         "the breaker was missed the first time")
+
+    def test_the_summary_header_names_the_selected_strategies(self):
+        self.cfg.apply_runtime_mode("a")
+        self.assertIn(A, self.rep.render_preflight(self.cfg))
+        self.cfg.apply_runtime_mode("b")
+        self.assertIn(B, self.rep.render_preflight(self.cfg))
+        self.cfg.apply_runtime_mode("both")
+        head = self.rep.render_preflight(self.cfg)
+        self.assertIn(A, head)
+        self.assertIn(B, head)
+
+    def test_the_preflight_wires_the_check_in(self):
+        import inspect
+
+        from crypto_edge import cli
+        src = inspect.getsource(cli.cmd_preflight)
+        self.assertIn("verify_circuit_breakers", src)

@@ -98,7 +98,11 @@ class VerifyReport:
         f = self.facts
         lines = [
             "", "=" * 72,
-            f"FORWARD-TEST PREFLIGHT — {cfg.aggressive.name}",
+            # Names the strategies actually SELECTED, not a hardcoded one:
+            # a header naming Strategy B on an A-only run is the same class of
+            # misreport as a PASS line that mentions a halt in passing.
+            f"FORWARD-TEST PREFLIGHT — "
+            f"{', '.join(cfg.enabled_strategies()) or 'NO STRATEGY SELECTED'}",
             "=" * 72,
             f"EXCHANGE                       {f.get('exchange', '?')}",
             f"RUNTIME MODE                   {f.get('mode', '-')}",
@@ -116,6 +120,7 @@ class VerifyReport:
             f"TELEGRAM                       {self.fact('telegram', 'NOT RUN')}",
             f"DATABASE MIGRATION             {self.fact('schema', NOT_RUN)}",
             f"RESTART RECOVERY               {self.fact('restart', NOT_RUN)}",
+            f"CIRCUIT BREAKERS               {self.fact('halt', NOT_RUN)}",
             f"STRATEGY B CONFIG              {self.fact('bcfg', NOT_RUN)}",
             "=" * 72,
             "VERDICT: " + ("READY FOR FORWARD TEST" if self.passed
@@ -1053,11 +1058,13 @@ def verify_strategy_b_contract(cfg: Config, repo, rep: VerifyReport) -> None:
     repo.ensure_account(name, cfg.starting_equity_for(name))
     acct = repo.get_account(name)
     other = [a for a in repo.all_accounts() if a["strategy"] != name]
+    # Deliberately says nothing about the halt state: a PASS line that
+    # mentions `halted=True` in passing is how the breaker got missed. The
+    # halt is a check of its own -- see verify_circuit_breakers.
     rep.add("independent sub-account", acct is not None,
             f"cash ${float(acct['cash']):,.2f}, "
             f"start ${float(acct['starting_equity']):,.2f}, "
-            f"peak ${float(acct['peak_equity']):,.2f}, "
-            f"halted={bool(int(acct['halted']))}", topic="bcfg")
+            f"peak ${float(acct['peak_equity']):,.2f}", topic="bcfg")
     rep.add("Strategy A ledger untouched by B", True,
             "; ".join(f"{a['strategy']}: cash ${float(a['cash']):,.2f}"
                       for a in other) or "no other ledger yet",
@@ -1072,6 +1079,70 @@ def verify_strategy_b_contract(cfg: Config, repo, rep: VerifyReport) -> None:
             f"on ${eq:,.0f} equity with a full 3% daily buffer the cap is "
             f"${cap:,.2f} = min(1% of equity, 60% of buffer)", topic="bcfg")
     rep.facts["bcfg"] = "OK" if not rep.failures_for("bcfg") else "FAILED"
+
+
+def verify_circuit_breakers(cfg: Config, repo, rep: VerifyReport) -> None:
+    """Is every SELECTED strategy actually able to open a position?
+
+    A strategy whose circuit breaker is latched cannot enter anything, so a
+    forward test started in that state produces zero trades and looks like a
+    strategy that found no setups. The preflight reported READY through exactly
+    that: the sub-account check asserted only that the ledger EXISTED, and
+    printed `halted=True` as part of its detail string -- information the
+    reader had to notice and interpret, on a line already marked PASS.
+
+    Scoped to `enabled_strategies()` on purpose. A halt left on a strategy that
+    is NOT trading this run is stale state, not a blocker: `--strategies b`
+    must not be held up by something Strategy A did last week. It must be held
+    up by something STRATEGY B did.
+
+    This never clears anything. Resuming is a decision that belongs to whoever
+    looks at why the breaker tripped -- see `cli resume --yes`.
+    """
+    print(f"\n[10] CIRCUIT BREAKERS -- selected: "
+          f"{', '.join(cfg.enabled_strategies()) or 'NONE'}")
+    selected = cfg.enabled_strategies()
+    if not selected:
+        rep.add("a strategy is selected", False,
+                "no strategy is enabled, so nothing would trade", topic="halt")
+        rep.facts["halt"] = "FAILED: no strategy selected"
+        return
+
+    halted_now = []
+    for name in selected:
+        repo.ensure_account(name, cfg.starting_equity_for(name))
+        acct = repo.get_account(name)
+        halted = bool(int(acct["halted"]))
+        reason = (acct["halt_reason"] or "").strip() or "no reason recorded"
+        if halted:
+            halted_now.append((name, reason))
+        rep.add(f"{name} can open positions", not halted,
+                "circuit breaker clear" if not halted
+                else f"HALTED: {reason}", topic="halt")
+
+    # A halt on a strategy that is not trading this run is reported, never
+    # allowed to fail the run.
+    for a in repo.all_accounts():
+        name = a["strategy"]
+        if name in selected or not int(a["halted"]):
+            continue
+        rep.add(f"{name} is halted but not selected", True,
+                f"stale halt, does not block this run: "
+                f"{(a['halt_reason'] or '').strip() or 'no reason recorded'}",
+                severity=INFO, topic="halt")
+
+    if halted_now:
+        for name, reason in halted_now:
+            print(f"        !! {name} IS HALTED: {reason}")
+        print("        !! This strategy cannot open a position. Review why the")
+        print("        !! breaker tripped, then clear it deliberately with:")
+        print("        !!   python -m crypto_edge.cli --strategy "
+              f"{halted_now[0][0]} resume --yes")
+        print("        !! The preflight will NOT clear it for you.")
+        rep.facts["halt"] = "FAILED: " + "; ".join(
+            f"{n} halted ({r})" for n, r in halted_now)
+    else:
+        rep.facts["halt"] = f"clear for {', '.join(selected)}"
 
 
 def verify_regime_and_breadth(cfg: Config, feed, repo, markets, tickers,
