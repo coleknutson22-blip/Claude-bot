@@ -304,6 +304,39 @@ class RiskCfg:
     min_stop_distance_pct: float = 0.3  # reject absurdly tight stops
 
 
+# Kraken spot taker rates by 30-day-volume tier, in basis points PER SIDE.
+# Source: the operator's reading of Kraken's published spot schedule. It is
+# recorded here as DATA, not baked into the fill logic, because a fee schedule
+# is the exchange's to change and ours to track -- and because the number
+# silently assumed by a paper model is the number that decides whether a
+# strategy looks viable. Which tier a given account is on depends on its own
+# 30-day volume, so nothing here guesses one: `fee_tier` must be chosen
+# explicitly, and every report names the tier it simulated.
+#
+# VERIFY BEFORE RELYING ON THESE. They are not fetched from the venue.
+KRAKEN_SPOT_TAKER_BPS: dict[str, float] = {
+    "tier1": 80.0,
+    "tier2": 60.0,
+    "tier3": 38.0,
+    "tier4": 35.0,
+    "tier5": 30.0,
+    "tier6": 25.0,
+}
+
+# The tier a config selects when it names none. "custom" means "use
+# taker_fee_bps as written" and is the default so that adding this mechanism
+# changes no existing behaviour: a config that never mentions a tier prices
+# exactly as it did before.
+FEE_TIER_CUSTOM = "custom"
+
+
+def fee_tier_bps(tier: str, custom_bps: float) -> float:
+    """The per-side taker rate a tier name selects."""
+    if tier == FEE_TIER_CUSTOM:
+        return float(custom_bps)
+    return KRAKEN_SPOT_TAKER_BPS[tier]
+
+
 @dataclass
 class ExecutionCfg:
     starting_equity: float = 10_000.0
@@ -314,6 +347,11 @@ class ExecutionCfg:
     per_strategy_equity: dict = field(default_factory=dict)
     taker_fee_bps: float = 7.5          # 0.075%
     maker_fee_bps: float = 7.5
+    # Names a row of KRAKEN_SPOT_TAKER_BPS, or "custom" to use taker_fee_bps as
+    # written. Default "custom" so this field changes nothing until it is set.
+    # `effective_taker_bps()` is what every fill and every report must read --
+    # reading `taker_fee_bps` directly would silently ignore a selected tier.
+    fee_tier: str = FEE_TIER_CUSTOM
     slippage_bps: float = 6.0           # market-order slippage assumption
     stop_slippage_bps: float = 15.0     # stops fill worse than limit orders
     use_book_spread: bool = True        # cross the spread when a quote exists
@@ -339,6 +377,23 @@ class ExecutionCfg:
     # close. This is the tolerance on the post-sizing risk revalidation, and
     # exists only to absorb float/rounding noise -- not real risk drift.
     risk_overshoot_tolerance_pct: float = 1.0
+
+    def effective_taker_bps(self) -> float:
+        """The per-side taker rate in force. READ THIS, never `taker_fee_bps`.
+
+        A selected tier must win over the raw field, or a config that names a
+        tier would price its fills at one rate and report them at another --
+        the single worst failure mode this mechanism can have, because it makes
+        a strategy look viable at a fee it is not actually paying.
+        """
+        return fee_tier_bps(self.fee_tier, self.taker_fee_bps)
+
+    def fee_label(self) -> str:
+        """What the active fee is, for any report that prints a cost."""
+        bps = self.effective_taker_bps()
+        if self.fee_tier == FEE_TIER_CUSTOM:
+            return f"custom {bps:g} bps/side"
+        return f"{self.fee_tier} ({bps:g} bps/side)"
 
 
 @dataclass
@@ -477,6 +532,12 @@ class Config:
                         "(set one, or explicitly disable the requirement)")
         if self.execution.taker_fee_bps < 0 or self.execution.slippage_bps < 0:
             errs.append("fees and slippage must be non-negative")
+        if (self.execution.fee_tier != FEE_TIER_CUSTOM
+                and self.execution.fee_tier not in KRAKEN_SPOT_TAKER_BPS):
+            errs.append(
+                f"execution.fee_tier '{self.execution.fee_tier}' is not a known "
+                f"tier; choose one of "
+                f"{', '.join([FEE_TIER_CUSTOM, *KRAKEN_SPOT_TAKER_BPS])}")
         probe_span_days = (self.universe.age_probe_bars
                            * tf_ms(self.universe.age_probe_timeframe) / 86_400_000.0)
         if probe_span_days < self.universe.min_market_age_days:

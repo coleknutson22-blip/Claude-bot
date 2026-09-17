@@ -322,7 +322,7 @@ def broker_from(execution_cfg):
     change cannot reach one arm and not the other.
     """
     from ..execution.paper_broker import PaperBroker
-    return PaperBroker(execution_cfg.taker_fee_bps, execution_cfg.slippage_bps,
+    return PaperBroker(execution_cfg.effective_taker_bps(), execution_cfg.slippage_bps,
                        execution_cfg.stop_slippage_bps,
                        execution_cfg.use_book_spread,
                        execution_cfg.max_spread_bps_entry)

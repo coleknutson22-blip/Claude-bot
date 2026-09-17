@@ -552,6 +552,66 @@ and no costs, reported beside the measured cost drag and never as forgone P&L.
 Where no v8 tape exists the row says so: stop and take-profit P&L cannot be
 reproduced for it at all.
 
+**Exit quality, on one accounting basis at a time.**
+
+```bash
+python -m crypto_edge.cli research --aggressive --exit-quality
+```
+
+An earlier analysis concluded the exit system was working by combining
+`gross_pnl` — P&L *before* fees and slippage — with a win/loss count from the
+performance report, which partitions on `net_pnl > 0`, *after* costs. Those are
+different accounting bases and the conclusion was withdrawn. The collision is
+easy to make because the performance report uses "gross" for two different
+things at once: `summary["gross_pnl"]` is before costs, while
+`trading["gross_profit"]` is the sum of **net** P&L over net-winning trades —
+the standard profit-factor sense. Both are right in their own idiom and mixing
+them is silent.
+
+So this report computes gross and net from the *same* per-trade rows, carries
+the basis in the data rather than in the caller's memory, and never combines
+the two. The number that makes the difference concrete is **`cost_flipped`**:
+trades with gross P&L above zero and net P&L at or below it — the market paid
+and the costs took it back. Its size is exactly how wrong a gross/net mix-up
+can be, measured rather than argued.
+
+It also reports **R-multiples**: P&L over the risk each trade was *opened*
+with, `|entry_fill − initial_stop| × qty`. The initial stop, not the final one
+— dividing by a ratcheted stop measures the trail and turns every trailed
+winner into a multiple of a risk nobody ever had on. Dollars confound exit
+behaviour with position size; R does not.
+
+This reads the ledger, it does not model an exit. Exit *questions* belong to
+`--policy-sim`, which replays the real engine over the stored v8 tape.
+
+**Fee tiers, and what the strategy costs at each one.**
+
+```bash
+python -m crypto_edge.cli research --aggressive --fee-scenarios
+python -m crypto_edge.cli research --aggressive --atr-economics
+```
+
+`execution.fee_tier` names a row of `KRAKEN_SPOT_TAKER_BPS`, or `"custom"` to
+use `taker_fee_bps` as written. It defaults to `"custom"`, so adding the
+mechanism moves no existing fill. Everything that charges or reports a fee
+reads `execution.effective_taker_bps()` — never the raw field — because a
+config that priced fills at one rate and reported them at another would make a
+strategy look viable at a fee it was not paying. The active tier is printed on
+the preflight summary, on `status`, and at the head of every report above.
+
+`--fee-scenarios` re-prices every closed trade at each tier while holding
+fills, slippage and gross P&L **exactly** as recorded: a fee change moves what
+the venue takes, not where the order filled. `--atr-economics` needs no trades
+at all — it is arithmetic over the configured stop multiple and target R,
+giving the stop, the 2R target, round-trip costs and the break-even win rate
+per ATR band per tier. It flags a band as **structurally untradeable** when a
+*perfect* trade still loses money, which is a different problem from a merely
+high break-even rate and needs a different answer.
+
+The tier figures are recorded from the operator's reading of Kraken's published
+schedule. They are data, not a measurement, and the code says so: verify them
+against the venue before relying on them.
+
 **Stopping and restarting.** Ctrl-C (or `SIGTERM`) finishes the current cycle
 and then stops — cycles never overlap and are never interrupted mid-write.
 Everything needed to resume is already on disk, so restarting with the same

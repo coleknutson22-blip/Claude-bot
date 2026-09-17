@@ -106,6 +106,10 @@ class VerifyReport:
             "=" * 72,
             f"EXCHANGE                       {f.get('exchange', '?')}",
             f"RUNTIME MODE                   {f.get('mode', '-')}",
+            # A paper result is only as honest as the fee it charged, so the
+            # simulated rate is stated on the readiness summary rather than
+            # left implicit in a config file nobody re-reads.
+            f"FEE MODEL (SIMULATED)          {cfg.execution.fee_label()}",
             f"5m DATA                        {self.fact('b_5m', NOT_RUN)}",
             f"15m DATA                       {self.fact('b_15m', NOT_RUN)}",
             f"1h DATA                        {self.fact('btc_1h', NOT_RUN)}",

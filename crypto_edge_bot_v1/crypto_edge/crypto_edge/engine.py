@@ -93,7 +93,7 @@ class TradingEngine:
         self.feed = feed
         self.notifier = notifier
         self.broker = PaperBroker(
-            cfg.execution.taker_fee_bps, cfg.execution.slippage_bps,
+            cfg.execution.effective_taker_bps(), cfg.execution.slippage_bps,
             cfg.execution.stop_slippage_bps, cfg.execution.use_book_spread,
             cfg.execution.max_spread_bps_entry)
         self.account = PaperAccount(repo, self.broker,

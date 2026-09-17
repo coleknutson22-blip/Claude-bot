@@ -87,7 +87,7 @@ class Backtester:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.strategy = TrendBreakoutStrategy(cfg.strategy)
-        self.broker = PaperBroker(cfg.execution.taker_fee_bps,
+        self.broker = PaperBroker(cfg.execution.effective_taker_bps(),
                                   cfg.execution.slippage_bps,
                                   cfg.execution.stop_slippage_bps,
                                   use_book_spread=False)

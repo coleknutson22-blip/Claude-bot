@@ -216,7 +216,8 @@ def cmd_status(args) -> int:
     print(f"  Total P&L         ${a['total_pnl']:>14,.2f}  ({a['account_return_pct']:+.2f}%)")
     print(f"  Realized          ${a['realized_pnl']:>14,.2f}")
     print(f"  Unrealized        ${a['unrealized_pnl']:>14,.2f}")
-    print(f"  Fees              ${a['total_fees']:>14,.2f}")
+    print(f"  Fees              ${a['total_fees']:>14,.2f}"
+          f"   [{cfg.execution.fee_label()}]")
     print(f"  Slippage          ${a['estimated_slippage_cost']:>14,.2f}")
     print("-" * 62)
     print(f"  Open positions    {r['open_positions']:>15}")
@@ -336,6 +337,13 @@ def cmd_export(args) -> int:
 def cmd_research(args) -> int:
     from .research.counterfactual import CounterfactualTracker
     cfg, repo, _, _ = _bootstrap(args, need_feed=False)
+    for flag, fn in (("exit_quality", _research_exit_quality),
+                     ("fee_scenarios", _research_fee_scenarios),
+                     ("atr_economics", _research_atr_economics)):
+        if getattr(args, flag, False):
+            return fn(cfg, repo,
+                      cfg.aggressive.name if getattr(args, "aggressive", False)
+                      else _strategy_arg(args, cfg), args)
     if getattr(args, "short_funnel", False):
         return _research_short_funnel(
             cfg, repo, cfg.aggressive.name if getattr(args, "aggressive", False)
@@ -544,6 +552,198 @@ def _research_excursions(cfg, repo, strategy: str, args) -> int:
                   f"+2.0%: {p2['hit_rate_pct']:>5.1f}% ({p2['decided']} decided)   "
                   f"2R: {r2['hit_rate_pct']:>5.1f}% ({r2['decided']} decided)"
                   f"{flag(p2['decided'])}")
+    return 0
+
+
+def _research_exit_quality(cfg, repo, strategy: str, args) -> int:
+    """Exit behaviour on one accounting basis at a time.
+
+    Gross and net are computed from the same per-trade rows and printed side by
+    side. They are never combined: a trade can be a gross win and a net loss,
+    and mixing a win count from one basis with a total from the other is how a
+    working exit system gets certified from numbers that do not describe the
+    same trades.
+    """
+    from .research import economics as ec
+
+    q = ec.exit_quality(repo, strategy)
+    if getattr(args, "json", False):
+        print(json.dumps({"strategy": strategy, **q}, indent=2, default=str))
+        return 0
+
+    def num(v, w=10, p=2, sign=True):
+        if v is None:
+            return " " * (w - 2) + "--"
+        return f"{v:{'+' if sign else ''}{w}.{p}f}"
+
+    print("=" * 78)
+    print(f"  EXIT QUALITY — {strategy}   ({cfg.exchange_label()})")
+    print(f"  {q['closed_trades']} closed trade(s); fees simulated at "
+          f"{cfg.execution.fee_label()}")
+    print("=" * 78)
+    if not q["closed_trades"]:
+        print("\n  No closed trades. Nothing to measure.")
+        return 0
+
+    print("\nTWO BASES, NEVER COMBINED")
+    print("  GROSS = (exit_ref - entry_ref) x qty x direction, BEFORE fees and")
+    print("  slippage. NET = after both. A win count from one and a total from")
+    print("  the other do not describe the same trades.")
+    print(f"  {'':<22} {'GROSS':>14} {'NET':>14}")
+    g, n = q["gross"], q["net"]
+    for label, key, pct in (("trades", "n", False), ("wins", "wins", False),
+                            ("losses", "losses", False),
+                            ("win rate", "win_rate_pct", True),
+                            ("total P&L", "total", False),
+                            ("average winner", "avg_win", False),
+                            ("average loser", "avg_loss", False),
+                            ("win/loss ratio", "win_loss_ratio", False),
+                            ("expectancy/trade", "expectancy", False),
+                            ("profit factor", "profit_factor", False)):
+        def cell(d):
+            v = d[key]
+            if v is None:
+                return f"{'--':>14}"
+            if isinstance(v, int) and not pct:
+                return f"{v:>14}"
+            return f"{v:>13.1f}%" if pct else f"{v:>14.3f}"
+        print(f"  {label:<22} {cell(g)} {cell(n)}")
+
+    print(f"\n  COST-FLIPPED: {q['cost_flipped']} trade(s) had gross P&L > 0 and")
+    print(f"  net P&L <= 0 — the market paid and the costs took it back. Those")
+    print(f"  carried {q['cost_flipped_gross']:+.2f} of gross P&L while counting")
+    print("  as losses on the net basis. This figure IS the size of the error a")
+    print("  gross/net mix-up produces.")
+    if q["impossible_rows"]:
+        print(f"  !! {q['impossible_rows']} row(s) have net > gross, which the")
+        print("     cost model cannot produce. The ledger is inconsistent —")
+        print("     stop here and investigate before reading anything above.")
+
+    print("\nR-MULTIPLES — P&L over the risk each trade was OPENED with")
+    print("  |entry_fill - initial_stop| x qty. The initial stop, not the final")
+    print("  one: dividing by a ratcheted stop measures the trail and makes")
+    print("  every trailed winner a multiple of a risk nobody took.")
+    print(f"  measurable on {q['r_measurable']}/{q['closed_trades']} trades"
+          f" ({q['r_unmeasurable']} had no usable initial stop)")
+    rg, rn = q["r_gross"], q["r_net"]
+    print(f"  {'':<22} {'GROSS R':>14} {'NET R':>14}")
+    for label, key in (("average winner", "avg_win"),
+                       ("average loser", "avg_loss"),
+                       ("win/loss ratio", "win_loss_ratio"),
+                       ("expectancy (R)", "expectancy"),
+                       ("largest winner", "largest_win"),
+                       ("largest loser", "largest_loss")):
+        def rcell(d):
+            v = d[key]
+            return f"{'--':>14}" if v is None else f"{v:>14.3f}"
+        print(f"  {label:<22} {rcell(rg)} {rcell(rn)}")
+
+    print("\nBY EXIT REASON  (gross and net kept apart)")
+    print(f"  {'reason':<18} {'n':>4} {'gross W':>8} {'net W':>7} "
+          f"{'gross $':>11} {'net $':>11} {'avg R gross':>12}")
+    for b in q["by_exit_reason"]:
+        ar = ("--" if b["avg_r_gross"] is None
+              else f"{b['avg_r_gross']:+.2f}")
+        print(f"  {b['reason']:<18} {b['n']:>4} {b['gross_wins']:>8} "
+              f"{b['net_wins']:>7} {b['gross']:>+11.2f} {b['net']:>+11.2f} "
+              f"{ar:>12}")
+
+    print(f"\n  {q['warning']}.")
+    print("\n  This reads the ledger; it does not model an exit. For exit")
+    print("  QUESTIONS use `--policy-sim`, which replays the real engine over")
+    print("  the stored v8 tape. This report exists to stop an aggregate")
+    print("  shortcut being taken, not to become one.")
+    return 0
+
+
+def _research_fee_scenarios(cfg, repo, strategy: str, args) -> int:
+    """The same closed trades priced at every fee tier, fills unchanged."""
+    from .research import economics as ec
+
+    out = ec.fee_scenarios(repo, strategy, cfg.execution.effective_taker_bps())
+    if getattr(args, "json", False):
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+
+    print("=" * 78)
+    print(f"  FEE SCENARIOS — {strategy}   ({cfg.exchange_label()})")
+    print(f"  simulating at: {cfg.execution.fee_label()}")
+    print(f"  {out['closed_trades']} closed trade(s); entry turnover "
+          f"{out['entry_turnover']:,.2f}; two-leg notional "
+          f"{out['two_leg_notional']:,.2f}")
+    print("=" * 78)
+    if not out["closed_trades"]:
+        print("\n  No closed trades. Nothing to re-price.")
+        return 0
+    print(f"\n  HELD FIXED: gross P&L {out['gross_pnl']:+.2f} "
+          f"({out['gross_bps']:+.1f} bps of turnover), slippage "
+          f"{-out['slippage']:+.2f}, financing {-out['financing']:+.2f}.")
+    print(f"  {out['note']}.")
+
+    print(f"\n  {'tier':<8} {'bps/side':>8} {'total fees':>11} {'net P&L':>11} "
+          f"{'exp/trade':>10} {'PF':>6} {'BE gross':>10} {'vs actual':>10}")
+    for r in out["rows"]:
+        pf = ("--" if r["profit_factor"] is None
+              else ("inf" if r["profit_factor"] == float("inf")
+                    else f"{r['profit_factor']:.2f}"))
+        mult = ("no edge" if r["gross_shortfall_multiple"] is None
+                else f"{r['gross_shortfall_multiple']:,.1f}x")
+        print(f"  {r['tier']:<8} {r['bps_per_side']:>8.1f} "
+              f"{-r['total_fees']:>+11.2f} {r['net_pnl']:>+11.2f} "
+              f"{r['expectancy_per_trade']:>+10.2f} {pf:>6} "
+              f"{r['breakeven_gross_bps']:>9.1f}b {mult:>10}")
+    print("\n  BE gross = the gross edge, in bps of entry turnover, needed for")
+    print("  net zero at that tier with slippage unchanged. `vs actual` is how")
+    print(f"  many times the realised gross edge ({out['gross_bps']:+.1f} bps)"
+          " that is;")
+    print("  `no edge` means gross P&L is not positive, so NO fee tier can")
+    print("  rescue it -- the sign is the problem, not the size.")
+    viable = [r["tier"] for r in out["rows"] if r["viable"]]
+    print(f"\n  PROFITABLE AT: {', '.join(viable) if viable else 'NO TIER'}")
+    return 0
+
+
+def _research_atr_economics(cfg, repo, strategy: str, args) -> int:
+    """What each ATR band can pay for. Arithmetic — needs no trades."""
+    from .research import economics as ec
+
+    atrs = tuple(float(x) for x in str(args.atr_pcts).split(",") if x.strip())
+    out = ec.atr_economics(cfg.aggressive, cfg.execution, atrs)
+    if getattr(args, "json", False):
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+
+    print("=" * 78)
+    print(f"  ATR ECONOMICS — {strategy}")
+    print(f"  stop = {out['stop_atr_mult']}x ATR; target = {out['target_r']}R"
+          f" = {out['target_r'] * out['stop_atr_mult']}x ATR")
+    print(f"  configured ATR floor: {out['min_atr_pct_configured']:g}%")
+    print(f"  break-even win rate at ZERO cost: "
+          f"{out['zero_cost_breakeven_win_rate_pct']:.1f}%")
+    print("=" * 78)
+    print(f"\n  {out['caveat']}.")
+
+    for row in out["rows"]:
+        print(f"\n  ATR {row['atr_pct']:g}%   stop {row['stop_pct']:.2f}%   "
+              f"2R target {row['target_pct']:.2f}%")
+        print(f"    {'tier':<8} {'fee r/t':>8} {'slip win':>9} {'slip loss':>10} "
+              f"{'net target':>11} {'cost/target':>12} {'BE win rate':>12}")
+        for t in row["tiers"]:
+            be = ("UNTRADEABLE" if t["structurally_untradeable"]
+                  else f"{t['breakeven_win_rate_pct']:.1f}%")
+            print(f"    {t['tier']:<8} {t['fee_round_trip_pct']:>7.2f}% "
+                  f"{t['slippage_win_pct']:>8.2f}% {t['slippage_loss_pct']:>9.2f}% "
+                  f"{t['net_target_pct']:>10.2f}% "
+                  f"{t['cost_share_of_target_pct']:>11.1f}% {be:>12}")
+
+    print("\n  MINIMUM TRADABLE ATR% BY TIER")
+    print("  Below this the 2R target does not cover a WINNING round trip, so")
+    print("  no win rate rescues it. A setup under this line is structurally")
+    print("  untradeable, not merely marginal.")
+    floor = out["min_atr_pct_configured"]
+    for name, a in out["min_tradable_atr_pct"].items():
+        flag = "  <-- ABOVE the configured ATR floor" if a > floor else ""
+        print(f"    {name:<8} {a:>6.3f}%{flag}")
     return 0
 
 
@@ -920,7 +1120,7 @@ def cmd_verify_live(args) -> int:
 
     ex = verify_exchange(cfg, feed, rep)
 
-    broker = PaperBroker(cfg.execution.taker_fee_bps, cfg.execution.slippage_bps,
+    broker = PaperBroker(cfg.execution.effective_taker_bps(), cfg.execution.slippage_bps,
                          cfg.execution.stop_slippage_bps,
                          cfg.execution.use_book_spread,
                          cfg.execution.max_spread_bps_entry)
@@ -974,7 +1174,7 @@ def cmd_preflight(args) -> int:
     ex = verify_exchange(cfg, feed, rep)
     verify_fast_timeframes(cfg, feed, rep)
 
-    broker = PaperBroker(cfg.execution.taker_fee_bps, cfg.execution.slippage_bps,
+    broker = PaperBroker(cfg.execution.effective_taker_bps(), cfg.execution.slippage_bps,
                          cfg.execution.stop_slippage_bps,
                          cfg.execution.use_book_spread,
                          cfg.execution.max_spread_bps_entry)
@@ -1249,6 +1449,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--horizon", type=int, default=None,
                    help="restrict counterfactual outcomes to one horizon in "
                         "hours; the default averages every recorded horizon")
+    s.add_argument("--exit-quality", action="store_true",
+                   help="exit behaviour on ONE accounting basis at a time: "
+                        "gross and net side by side, R-multiples over the "
+                        "risk each trade was opened with, and how many trades "
+                        "flip sign between the two")
+    s.add_argument("--fee-scenarios", action="store_true",
+                   help="re-price every closed trade at each Kraken spot fee "
+                        "tier, holding fills and slippage exactly as recorded")
+    s.add_argument("--atr-economics", action="store_true",
+                   help="what each ATR band can pay for at each fee tier: "
+                        "stop, 2R target, round-trip costs and the break-even "
+                        "win rate; needs no trades")
+    s.add_argument("--atr-pcts", default="0.25,0.40,0.55,0.70,1.00,1.50",
+                   help="comma-separated ATR%% values for --atr-economics")
     s.set_defaults(func=cmd_research)
 
     s = sub.add_parser("resume", help="clear a circuit-breaker halt")
