@@ -549,5 +549,85 @@ class TestDefaultIsUnchanged(unittest.TestCase):
         self.assertNotIn("fee_tier", src)
 
 
+# ================================ 8. which ledger did this actually read
+class TestLedgerProvenance(Base):
+    """An empty report and a wrong path must not look identical.
+
+    `db.connect` CREATES a database that is not there, so a research command
+    run from the wrong working directory prints "0 closed trades" against a
+    file it made a moment ago. In the output that is indistinguishable from a
+    real ledger belonging to a strategy that has not traded -- and one of those
+    is a finding while the other is a mistake.
+    """
+
+    def cfg_for(self, path):
+        cfg = Config()
+        cfg.engine.db_path = path
+        return cfg
+
+    def test_it_names_the_resolved_path(self):
+        import os
+        repo, path = temp_repo()
+        p = ec.ledger_provenance(self.cfg_for(path), repo, B)
+        self.assertEqual(p["db_path"], os.path.abspath(path))
+        self.assertTrue(os.path.isabs(p["db_path"]))
+
+    def test_a_relative_path_is_resolved_before_it_is_printed(self):
+        # `db_path` defaults to the RELATIVE "data/crypto_edge.db", so the
+        # whole point of printing it -- telling an operator which file was
+        # read -- fails unless it is resolved against the working directory
+        # the command actually ran in.
+        import os
+        p = ec.ledger_provenance(self.cfg_for("data/crypto_edge.db"),
+                                 self.repo, B)
+        self.assertTrue(os.path.isabs(p["db_path"]), p["db_path"])
+        self.assertNotEqual(p["db_path"], "data/crypto_edge.db")
+        self.assertEqual(p["db_path"],
+                         os.path.join(os.getcwd(), "data", "crypto_edge.db"))
+
+    def test_an_empty_ledger_is_flagged(self):
+        repo, path = temp_repo()
+        p = ec.ledger_provenance(self.cfg_for(path), repo, B)
+        self.assertTrue(p["empty"])
+        self.assertEqual(p["closed_trades"], 0)
+        lines = "\n".join(ec.provenance_lines(p, B))
+        self.assertIn("EMPTY", lines)
+        self.assertIn(path.split("/")[-1], lines)
+
+    def test_a_populated_ledger_is_not_flagged(self):
+        self.trade(gross=10.0, fees=1.0, slippage=1.0)
+        cfg = Config()
+        p = ec.ledger_provenance(cfg, self.repo, B)
+        self.assertFalse(p["empty"])
+        self.assertEqual(p["closed_trades"], 1)
+        self.assertNotIn("EMPTY", "\n".join(ec.provenance_lines(p, B)))
+
+    def test_observations_alone_are_enough_to_count_as_populated(self):
+        # A strategy that evaluated signals and took none has a real ledger.
+        # Calling that "empty" would send an operator chasing a path bug that
+        # is not there -- the mirror image of the failure this guards.
+        self.repo.add_observation({
+            "ts_ms": T0, "symbol": "S/USD", "candle_id": "c1", "strategy": B,
+            "strategy_version": "v2", "decision": "REJECTED_STRATEGY",
+            "reject_reason": "x", "side": "long", "score": 0.0, "rank": None,
+            "price": 100.0, "features": "{}"})
+        p = ec.ledger_provenance(Config(), self.repo, B)
+        self.assertFalse(p["empty"])
+        self.assertEqual(p["closed_trades"], 0)
+        self.assertEqual(p["observations"], 1)
+
+    def test_it_is_scoped_to_the_strategy_being_reported(self):
+        # Rows belonging to Strategy A must not make Strategy B look populated.
+        self.trade(gross=10.0, fees=1.0, slippage=1.0)
+        p = ec.ledger_provenance(Config(), self.repo, "trend_breakout")
+        self.assertTrue(p["empty"])
+        self.assertEqual(p["closed_trades"], 0)
+
+    def test_a_missing_file_reports_no_size_rather_than_raising(self):
+        p = ec.ledger_provenance(self.cfg_for("/nonexistent/x.db"),
+                                 self.repo, B)
+        self.assertIsNone(p["db_bytes"])
+
+
 if __name__ == "__main__":
     unittest.main()

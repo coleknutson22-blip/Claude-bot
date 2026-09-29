@@ -337,3 +337,52 @@ def breakeven_win_rate(target_pct: float, stop_pct: float,
 __all__ = ["exit_quality", "basis_stats", "BasisStats", "fee_scenarios",
            "refee_trade", "atr_economics", "breakeven_win_rate",
            "r_multiples", "initial_risk", "tier_bps_table", "GROSS", "NET"]
+
+
+def ledger_provenance(cfg, repo, strategy: str) -> dict:
+    """WHICH ledger a report just read, and whether it held anything.
+
+    `db.connect` CREATES a database that is not there, so a research command
+    pointed at the wrong working directory reports "0 closed trades" against a
+    file it made a moment ago -- indistinguishable, in the output, from a real
+    ledger of a strategy that has not traded. An operator reading a fee table
+    has no way to tell those apart, and the second one is a finding while the
+    first is a mistake.
+
+    So every report states its source: the resolved path, whether the file was
+    already populated, and the row counts behind the numbers above it.
+    """
+    import os
+
+    path = cfg.engine.db_path
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = None
+    trades = len(repo.get_trades(strategy))
+    obs = len(repo.get_observations(strategy=strategy))
+    return {
+        "db_path": os.path.abspath(path),
+        "db_bytes": size,
+        "closed_trades": trades,
+        "observations": obs,
+        # A schema-only file is what `db.connect` leaves behind when it had to
+        # create one. Empty of BOTH is the signature of a wrong path.
+        "empty": trades == 0 and obs == 0,
+    }
+
+
+def provenance_lines(p: dict, strategy: str) -> list[str]:
+    """The source block every report prints under its heading."""
+    out = [f"  ledger: {p['db_path']}",
+           f"  rows for {strategy}: {p['closed_trades']} closed trade(s), "
+           f"{p['observations']} observation(s)"]
+    if p["empty"]:
+        out += [
+            "  !! THIS LEDGER IS EMPTY FOR THIS STRATEGY.",
+            "     `db.connect` creates a database that is not there, so this",
+            "     may be a file this command just made rather than the one the",
+            "     bot trades into. Check the path above, and run from the same",
+            "     working directory as the bot (or pass --config).",
+        ]
+    return out

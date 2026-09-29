@@ -568,7 +568,9 @@ def _research_exit_quality(cfg, repo, strategy: str, args) -> int:
 
     q = ec.exit_quality(repo, strategy)
     if getattr(args, "json", False):
-        print(json.dumps({"strategy": strategy, **q}, indent=2, default=str))
+        print(json.dumps({"strategy": strategy,
+                          "ledger": ec.ledger_provenance(cfg, repo, strategy),
+                          **q}, indent=2, default=str))
         return 0
 
     def num(v, w=10, p=2, sign=True):
@@ -580,6 +582,9 @@ def _research_exit_quality(cfg, repo, strategy: str, args) -> int:
     print(f"  EXIT QUALITY — {strategy}   ({cfg.exchange_label()})")
     print(f"  {q['closed_trades']} closed trade(s); fees simulated at "
           f"{cfg.execution.fee_label()}")
+    for line in ec.provenance_lines(ec.ledger_provenance(cfg, repo, strategy),
+                                    strategy):
+        print(line)
     print("=" * 78)
     if not q["closed_trades"]:
         print("\n  No closed trades. Nothing to measure.")
@@ -661,6 +666,8 @@ def _research_fee_scenarios(cfg, repo, strategy: str, args) -> int:
     from .research import economics as ec
 
     out = ec.fee_scenarios(repo, strategy, cfg.execution.effective_taker_bps())
+    out["ledger"] = ec.ledger_provenance(cfg, repo, strategy)
+    out["fee_label"] = cfg.execution.fee_label()
     if getattr(args, "json", False):
         print(json.dumps(out, indent=2, default=str))
         return 0
@@ -671,6 +678,9 @@ def _research_fee_scenarios(cfg, repo, strategy: str, args) -> int:
     print(f"  {out['closed_trades']} closed trade(s); entry turnover "
           f"{out['entry_turnover']:,.2f}; two-leg notional "
           f"{out['two_leg_notional']:,.2f}")
+    for line in ec.provenance_lines(ec.ledger_provenance(cfg, repo, strategy),
+                                    strategy):
+        print(line)
     print("=" * 78)
     if not out["closed_trades"]:
         print("\n  No closed trades. Nothing to re-price.")
@@ -754,6 +764,7 @@ def _research_short_funnel(cfg, repo, strategy: str, args) -> int:
     out of a rejection label -- see `research/short_funnel` for why the labels
     cannot answer it.
     """
+    from .research import economics as sf_ec
     from .research import short_funnel as sf
 
     floors = tuple(sorted({float(x) for x in str(args.score_floors).split(",")
@@ -771,6 +782,7 @@ def _research_short_funnel(cfg, repo, strategy: str, args) -> int:
     if getattr(args, "json", False):
         print(json.dumps({
             "strategy": strategy, "cost_bps": f.cost_bps,
+            "ledger": sf_ec.ledger_provenance(cfg, repo, strategy),
             "cost_bps_measured": f.measured_cost,
             "horizon_h": f.horizon_h, "observations": len(f.candidates),
             "funnel": funnel, "overlap": overlap,
@@ -791,6 +803,9 @@ def _research_short_funnel(cfg, repo, strategy: str, args) -> int:
     hz = (f"horizon {f.horizon_h}h only" if f.horizon_h is not None
           else "all recorded horizons, averaged per observation")
     print(f"  counterfactuals: {hz}; signed TOWARD THE SHORT")
+    for line in sf_ec.provenance_lines(
+            sf_ec.ledger_provenance(cfg, repo, strategy), strategy):
+        print(line)
     print("=" * 78)
     print("\nHYPOTHETICAL / NOT EXECUTED. A counterfactual is a raw price move")
     print("with no stop, no target and no costs. `after cost` subtracts the")
