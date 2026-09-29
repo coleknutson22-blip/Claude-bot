@@ -612,6 +612,37 @@ behaviour with position size; R does not.
 This reads the ledger, it does not model an exit. Exit *questions* belong to
 `--policy-sim`, which replays the real engine over the stored v8 tape.
 
+**Auditing a single trade that looks wrong.**
+
+```bash
+python -m crypto_edge.cli research --aggressive --trade-audit
+python -m crypto_edge.cli research --aggressive --trade-audit --trade-id trd_0123
+```
+
+Re-derives every closed trade's gross, slippage and net from its four stored
+prices by re-driving the live `realise_pnl` — the same function that wrote the
+row — and prints the full row for anything that fails to reconcile or has
+`net > gross`.
+
+The distinction it exists to draw: **`net > gross` is not corruption.**
+`slippage_cost` is the *signed* difference between the fill and the signal
+reference, and `buy()`/`sell()` base the fill on the live quote a moment after
+the candle closed:
+
+```
+buy():   base = quote.ask     fill = base * (1 + slippage_bps)
+         slip = (fill - ref) * qty
+sell():  base = quote.bid     fill = base * (1 - slippage_bps)
+         slip = (ref - fill) * qty
+```
+
+If the market ticked in the trade's favour by more than `slippage_bps` in that
+interval, the leg's slippage is negative — the order filled better than the
+price the signal was measured at. When such a credit exceeds the fees, net
+lands above gross. The only real corruption signature is a *stored* figure that
+disagrees with what the *stored prices* produce, which is what `reconciles`
+tests.
+
 **Fee tiers, and what the strategy costs at each one.**
 
 ```bash

@@ -137,10 +137,18 @@ def exit_quality(repo, strategy: str) -> dict:
     net = [float(t["net_pnl"]) for t in trades]
     flipped = [t for t in trades
                if float(t["gross_pnl"]) > 0 >= float(t["net_pnl"])]
-    # The reverse can only happen with negative costs, which the model cannot
-    # produce. Counted anyway: if it is ever non-zero the ledger is wrong.
-    impossible = [t for t in trades
-                  if float(t["net_pnl"]) > float(t["gross_pnl"])]
+    # net > gross means the costs summed NEGATIVE. That is reachable and
+    # legitimate: `slippage_cost` is the signed difference between the fill and
+    # the signal reference, and `buy()`/`sell()` base the fill on the live
+    # quote, so a favourable tick between the candle close and the fill credits
+    # that leg. When the credit exceeds the fees, net lands above gross.
+    #
+    # An earlier version of this report called such rows impossible and told
+    # the operator the ledger was corrupt. It is not: the only real corruption
+    # signature is a stored figure that disagrees with what the stored prices
+    # produce, which `trade_audit` checks by re-driving `realise_pnl`.
+    cost_credit = [t for t in trades
+                   if float(t["net_pnl"]) > float(t["gross_pnl"])]
     by_reason: dict[str, dict] = {}
     for t in trades:
         k = str(t["exit_reason"])
@@ -167,7 +175,8 @@ def exit_quality(repo, strategy: str) -> dict:
         "net": basis_stats(net, NET).as_dict(),
         "cost_flipped": len(flipped),
         "cost_flipped_gross": sum(float(t["gross_pnl"]) for t in flipped),
-        "impossible_rows": len(impossible),
+        "net_exceeds_gross": len(cost_credit),
+        "net_exceeds_gross_ids": [t["id"] for t in cost_credit],
         "r_gross": basis_stats(rg, GROSS).as_dict(),
         "r_net": basis_stats(rn, NET).as_dict(),
         "r_measurable": len(rg),
@@ -386,3 +395,132 @@ def provenance_lines(p: dict, strategy: str) -> list[str]:
             "     working directory as the bot (or pass --config).",
         ]
     return out
+
+
+# ===================================================== per-trade forensics
+# How far a recomputed component may sit from the stored one before the row is
+# called inconsistent. The ledger stores float64 written through SQLite, so the
+# only legitimate difference is representation noise; a cent is orders of
+# magnitude above that and still far below any real accounting error.
+RECON_TOL = 0.01
+
+
+def audit_trade(t, tol: float = RECON_TOL) -> dict:
+    """Re-derive one trade's P&L from its stored prices and compare.
+
+    This is the test that actually distinguishes a corrupt ledger from a
+    surprising-but-correct one. It re-drives the live `realise_pnl` -- the same
+    function `close_position` called when the row was written -- rather than
+    reimplementing the arithmetic, so a change to the cost model changes this
+    audit with it.
+
+    NEGATIVE SLIPPAGE IS NOT AN ERROR, AND THIS IS THE POINT
+    --------------------------------------------------------
+    `slippage_cost` is not a microstructure cost. It is the signed difference
+    between the fill and the REFERENCE, and the reference is the signal
+    candle's price while the fill comes from the live book a moment later:
+
+        buy():  base = quote.ask         fill = base * (1 + slippage_bps)
+                slip = (fill - ref) * qty
+        sell(): base = quote.bid         fill = base * (1 - slippage_bps)
+                slip = (ref - fill) * qty
+
+    If the market ticked in the trade's favour between the candle close and the
+    fill by more than `slippage_bps`, that leg's slippage is NEGATIVE -- the
+    order filled better than the price the signal was measured at. When such a
+    credit exceeds the fees, `net > gross`. That is the cost model working as
+    designed, not a broken row.
+
+    What is genuinely impossible is a stored value that disagrees with what the
+    stored prices produce. That is what `reconciles` reports.
+    """
+    d = -1 if str(t["side"]) == "short" else 1
+    qty = float(t["qty"])
+    e_ref, e_fill = float(t["entry_ref_price"]), float(t["entry_fill_price"])
+    x_ref, x_fill = float(t["exit_ref_price"]), float(t["exit_fill_price"])
+    fees, fin = float(t["fees"]), float(t["financing"])
+
+    # Re-driven, not reimplemented. Fees are stored already summed, so they go
+    # in on one leg; `realise_pnl` only ever adds them together.
+    from ..execution.paper_broker import realise_pnl
+    rp = realise_pnl(e_ref, e_fill, x_ref, x_fill, qty, fees, 0.0, d)
+    # `close_position` subtracts financing from net AFTER realise_pnl returns.
+    recomputed_net = rp["net_pnl"] - fin
+
+    entry_slip = (e_fill - e_ref) * qty * d
+    exit_slip = (x_ref - x_fill) * qty * d
+    deltas = {
+        "gross_pnl": float(t["gross_pnl"]) - rp["gross_pnl"],
+        "slippage_cost": float(t["slippage_cost"]) - rp["slippage_cost"],
+        "net_pnl": float(t["net_pnl"]) - recomputed_net,
+    }
+    reconciles = all(abs(v) <= tol for v in deltas.values())
+
+    legs = []
+    if entry_slip < 0:
+        legs.append("entry")
+    if exit_slip < 0:
+        legs.append("exit")
+    net_gt_gross = float(t["net_pnl"]) > float(t["gross_pnl"])
+    return {
+        "id": t["id"], "symbol": t["symbol"], "side": t["side"],
+        "entry_ms": int(t["entry_ms"]), "exit_ms": int(t["exit_ms"]),
+        "exit_reason": t["exit_reason"], "qty": qty,
+        "entry_ref_price": e_ref, "entry_fill_price": e_fill,
+        "exit_ref_price": x_ref, "exit_fill_price": x_fill,
+        "initial_stop": float(t["initial_stop"]),
+        "final_stop": float(t["final_stop"]),
+        "stored": {"gross_pnl": float(t["gross_pnl"]), "fees": fees,
+                   "slippage_cost": float(t["slippage_cost"]),
+                   "financing": fin, "net_pnl": float(t["net_pnl"])},
+        "recomputed": {"gross_pnl": rp["gross_pnl"], "fees": rp["fees"],
+                       "slippage_cost": rp["slippage_cost"],
+                       "financing": fin, "net_pnl": recomputed_net},
+        "deltas": deltas,
+        "reconciles": reconciles,
+        "entry_slippage": entry_slip,
+        "exit_slippage": exit_slip,
+        "entry_slippage_bps": (entry_slip / (qty * e_fill) * 10_000.0
+                               if qty * e_fill else None),
+        "exit_slippage_bps": (exit_slip / (qty * x_fill) * 10_000.0
+                              if qty * x_fill else None),
+        "net_exceeds_gross": net_gt_gross,
+        "negative_slippage_legs": legs,
+        "verdict": _verdict(reconciles, net_gt_gross, legs, entry_slip,
+                            exit_slip, fees),
+    }
+
+
+def _verdict(reconciles, net_gt_gross, legs, entry_slip, exit_slip, fees):
+    """Name the cause in the caller's own terms, or say it cannot be named."""
+    if not reconciles:
+        return ("LEDGER INCONSISTENT -- a stored figure disagrees with what "
+                "the stored prices produce. This one IS a real accounting or "
+                "schema fault; see the deltas.")
+    if not net_gt_gross:
+        return "consistent; net <= gross, nothing to explain"
+    if not legs:
+        return ("net > gross with NO negative slippage leg -- this should be "
+                "unreachable and needs investigation")
+    total = entry_slip + exit_slip
+    where = " and ".join(legs)
+    return (f"EXPECTED BEHAVIOUR: the {where} leg filled BETTER than its "
+            f"reference, crediting {-total:+.4f} against {fees:.4f} of fees. "
+            f"`slippage_cost` is a signed fill-vs-reference difference, not a "
+            f"one-way cost, so a favourable tick larger than the fees puts net "
+            f"above gross. Not a bug.")
+
+
+def trade_audit(repo, strategy: str, tol: float = RECON_TOL) -> dict:
+    """Audit every closed trade; surface the ones worth a human's attention."""
+    trades = repo.get_trades(strategy)
+    rows = [audit_trade(t, tol) for t in trades]
+    return {
+        "strategy": strategy, "closed_trades": len(rows), "tolerance": tol,
+        "reconciled": sum(1 for r in rows if r["reconciles"]),
+        "failed_reconciliation": [r for r in rows if not r["reconciles"]],
+        "net_exceeds_gross": [r for r in rows if r["net_exceeds_gross"]],
+        "negative_entry_leg": sum(1 for r in rows if r["entry_slippage"] < 0),
+        "negative_exit_leg": sum(1 for r in rows if r["exit_slippage"] < 0),
+        "rows": rows,
+    }

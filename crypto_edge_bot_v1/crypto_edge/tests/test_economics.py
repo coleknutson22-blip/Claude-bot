@@ -115,11 +115,30 @@ class TestAccountingBasis(Base):
         self.assertEqual(q["r_gross"]["basis"], ec.GROSS)
         self.assertEqual(q["r_net"]["basis"], ec.NET)
 
-    def test_a_net_above_gross_is_flagged_as_impossible(self):
-        # The cost model cannot produce it. If the ledger ever shows one, the
-        # ledger is wrong and nothing computed from it can be trusted.
-        self.trade(gross=1.0, fees=-5.0, slippage=0.0)
-        self.assertEqual(ec.exit_quality(self.repo, B)["impossible_rows"], 1)
+    def test_net_above_gross_is_reported_without_calling_it_corrupt(self):
+        # It is reachable by design: `slippage_cost` is a SIGNED fill-vs-
+        # reference difference, so a favourable tick credits a leg, and a
+        # credit larger than the fees puts net above gross. An earlier version
+        # of this report called such rows impossible and told the operator
+        # their ledger was broken.
+        self.trade(gross=1.0, fees=0.15, slippage=-5.0)
+        q = ec.exit_quality(self.repo, B)
+        self.assertEqual(q["net_exceeds_gross"], 1)
+        self.assertEqual(len(q["net_exceeds_gross_ids"]), 1)
+        self.assertGreater(q["net"]["total"], q["gross"]["total"])
+
+    def test_a_row_with_no_cost_credit_is_not_reported_as_net_above_gross(self):
+        self.trade(gross=10.0, fees=1.0, slippage=1.0)
+        self.assertEqual(ec.exit_quality(self.repo, B)["net_exceeds_gross"], 0)
+
+    def test_net_exactly_equal_to_gross_is_not_flagged(self):
+        # Costs of exactly zero make net == gross. Nothing was credited, so
+        # there is nothing to explain and flagging it would send an operator
+        # looking for a favourable tick that never happened.
+        self.trade(gross=10.0, fees=0.0, slippage=0.0)
+        q = ec.exit_quality(self.repo, B)
+        self.assertEqual(q["net_exceeds_gross"], 0)
+        self.assertEqual(q["net"]["total"], q["gross"]["total"])
 
     def test_a_zero_gross_trade_is_not_cost_flipped(self):
         # Flipped means the MARKET paid and the costs took it back. A trade
@@ -627,6 +646,170 @@ class TestLedgerProvenance(Base):
         p = ec.ledger_provenance(self.cfg_for("/nonexistent/x.db"),
                                  self.repo, B)
         self.assertIsNone(p["db_bytes"])
+
+
+# ============================================= 9. per-trade forensics
+class TestTradeAudit(Base):
+    """Distinguishing a corrupt row from a correct but surprising one.
+
+    An earlier version of the exit-quality report told the operator that
+    `net > gross` meant their ledger was broken. It does not. The model
+    produces it whenever a fill beats its reference by more than the fees, and
+    the ONLY real corruption signature is a stored figure that disagrees with
+    what the stored prices produce.
+    """
+
+    def priced(self, *, side="long", qty=25.0, e_ref=100.0, e_fill=100.06,
+               x_ref=102.0, x_fill=101.94, reason="target", financing=0.0):
+        """A row whose stored P&L is what `realise_pnl` actually produces."""
+        from crypto_edge.execution.paper_broker import realise_pnl
+        d = -1 if side == "short" else 1
+        fees = (qty * e_fill + qty * x_fill) * 0.00075
+        rp = realise_pnl(e_ref, e_fill, x_ref, x_fill, qty, fees, 0.0, d)
+        self.i += 1
+        self.repo.add_trade(ClosedTrade(
+            id=f"aud{self.i}", position_id=f"p{self.i}", symbol="X/USD",
+            strategy=B, strategy_version="v2", side=side, qty=qty,
+            entry_ref_price=e_ref, entry_fill_price=e_fill, entry_ms=T0,
+            exit_ref_price=x_ref, exit_fill_price=x_fill,
+            exit_ms=T0 + 3_600_000, exit_reason=reason,
+            initial_stop=98.0 if d > 0 else 102.0, final_stop=99.0,
+            gross_pnl=rp["gross_pnl"], fees=rp["fees"],
+            slippage_cost=rp["slippage_cost"],
+            net_pnl=rp["net_pnl"] - financing, financing=financing,
+            return_pct=0.0, account_return_pct=0.0, mfe=1.0, mae=-1.0,
+            duration_s=3600.0, equity_after=10_000.0, journal={}))
+        return f"aud{self.i}"
+
+    def one(self, tid):
+        return {r["id"]: r
+                for r in ec.trade_audit(self.repo, B)["rows"]}[tid]
+
+    # ------------------------------------------------ reconciliation
+    def test_a_well_formed_row_reconciles(self):
+        r = self.one(self.priced())
+        self.assertTrue(r["reconciles"], r["deltas"])
+        for v in r["deltas"].values():
+            self.assertAlmostEqual(v, 0.0, places=9)
+
+    def test_a_short_reconciles_too(self):
+        r = self.one(self.priced(side="short", e_ref=100.0, e_fill=99.94,
+                                 x_ref=98.0, x_fill=98.06))
+        self.assertTrue(r["reconciles"], r["deltas"])
+        self.assertGreater(r["stored"]["gross_pnl"], 0.0)
+
+    def test_financing_is_carried_through_the_recomputation(self):
+        # `close_position` subtracts borrow AFTER realise_pnl returns. An audit
+        # that forgot that would declare every short inconsistent.
+        r = self.one(self.priced(side="short", e_ref=100.0, e_fill=99.94,
+                                 x_ref=98.0, x_fill=98.06, financing=2.5))
+        self.assertTrue(r["reconciles"], r["deltas"])
+        self.assertAlmostEqual(r["stored"]["financing"], 2.5, places=9)
+
+    def test_a_tampered_net_fails_reconciliation(self):
+        # THE corruption signature.
+        tid = self.priced()
+        self.repo.conn.execute("UPDATE trades SET net_pnl = net_pnl + 5.0"
+                               " WHERE id=?", (tid,))
+        r = self.one(tid)
+        self.assertFalse(r["reconciles"])
+        self.assertAlmostEqual(r["deltas"]["net_pnl"], 5.0, places=6)
+        self.assertIn("LEDGER INCONSISTENT", r["verdict"])
+
+    def test_a_tampered_gross_fails_reconciliation(self):
+        tid = self.priced()
+        self.repo.conn.execute("UPDATE trades SET gross_pnl = gross_pnl * 2"
+                               " WHERE id=?", (tid,))
+        self.assertFalse(self.one(tid)["reconciles"])
+
+    def test_a_difference_inside_tolerance_still_reconciles(self):
+        tid = self.priced()
+        self.repo.conn.execute("UPDATE trades SET net_pnl = net_pnl + 0.001"
+                               " WHERE id=?", (tid,))
+        self.assertTrue(self.one(tid)["reconciles"])
+
+    # ------------------------------------------- the net > gross case
+    def test_a_favourable_entry_tick_credits_the_entry_leg(self):
+        # The book ticked DOWN between the signal candle and the fill, so a
+        # long bought below its reference.
+        r = self.one(self.priced(e_ref=100.0, e_fill=99.50,
+                                 x_ref=100.0, x_fill=100.0))
+        self.assertTrue(r["reconciles"])
+        self.assertLess(r["entry_slippage"], 0.0)
+        self.assertIn("entry", r["negative_slippage_legs"])
+        self.assertTrue(r["net_exceeds_gross"])
+        self.assertIn("EXPECTED BEHAVIOUR", r["verdict"])
+        self.assertNotIn("INCONSISTENT", r["verdict"])
+
+    def test_a_favourable_exit_tick_credits_the_exit_leg(self):
+        r = self.one(self.priced(e_ref=100.0, e_fill=100.0,
+                                 x_ref=100.0, x_fill=100.5))
+        self.assertLess(r["exit_slippage"], 0.0)
+        self.assertIn("exit", r["negative_slippage_legs"])
+        self.assertTrue(r["net_exceeds_gross"])
+
+    def test_a_credit_smaller_than_the_fees_does_not_lift_net_above_gross(self):
+        # The boundary: a negative leg alone is not enough.
+        r = self.one(self.priced(e_ref=100.0, e_fill=99.999,
+                                 x_ref=100.0, x_fill=100.0))
+        self.assertLess(r["entry_slippage"], 0.0)
+        self.assertFalse(r["net_exceeds_gross"])
+        self.assertIn("nothing to explain", r["verdict"])
+
+    def test_an_ordinary_trade_has_both_legs_positive(self):
+        r = self.one(self.priced())
+        self.assertGreater(r["entry_slippage"], 0.0)
+        self.assertGreater(r["exit_slippage"], 0.0)
+        self.assertEqual(r["negative_slippage_legs"], [])
+        self.assertFalse(r["net_exceeds_gross"])
+
+    def test_the_legs_sum_to_the_stored_slippage(self):
+        r = self.one(self.priced(e_ref=100.0, e_fill=99.50,
+                                 x_ref=102.0, x_fill=101.90))
+        self.assertAlmostEqual(r["entry_slippage"] + r["exit_slippage"],
+                               r["stored"]["slippage_cost"], places=9)
+
+    def test_reconciliation_and_net_above_gross_are_independent(self):
+        # A row can be surprising and sound, or unsurprising and corrupt. The
+        # report must not conflate them -- that conflation is what sent an
+        # operator hunting a ledger bug that was not there.
+        good_odd = self.priced(e_ref=100.0, e_fill=99.50,
+                               x_ref=100.0, x_fill=100.0)
+        bad_plain = self.priced()
+        self.repo.conn.execute("UPDATE trades SET net_pnl = net_pnl + 5.0"
+                               " WHERE id=?", (bad_plain,))
+        out = ec.trade_audit(self.repo, B)
+        self.assertEqual([r["id"] for r in out["net_exceeds_gross"]], [good_odd])
+        self.assertEqual([r["id"] for r in out["failed_reconciliation"]],
+                         [bad_plain])
+
+    # ------------------------------------------------------- summary
+    def test_the_summary_counts_every_row(self):
+        self.priced()
+        self.priced(e_ref=100.0, e_fill=99.50, x_ref=100.0, x_fill=100.0)
+        out = ec.trade_audit(self.repo, B)
+        self.assertEqual(out["closed_trades"], 2)
+        self.assertEqual(out["reconciled"], 2)
+        self.assertEqual(out["negative_entry_leg"], 1)
+        self.assertEqual(out["negative_exit_leg"], 0)
+
+    def test_the_audit_does_not_modify_the_ledger(self):
+        self.priced()
+        before = [dict(r) for r in
+                  self.repo.conn.execute("SELECT * FROM trades")]
+        ec.trade_audit(self.repo, B)
+        after = [dict(r) for r in
+                 self.repo.conn.execute("SELECT * FROM trades")]
+        self.assertEqual(before, after)
+
+    def test_every_field_the_operator_asked_for_is_present(self):
+        r = self.one(self.priced())
+        for k in ("id", "symbol", "side", "entry_ms", "exit_ms", "qty",
+                  "entry_ref_price", "entry_fill_price", "exit_ref_price",
+                  "exit_fill_price", "exit_reason"):
+            self.assertIn(k, r)
+        for k in ("gross_pnl", "fees", "slippage_cost", "financing", "net_pnl"):
+            self.assertIn(k, r["stored"])
 
 
 if __name__ == "__main__":

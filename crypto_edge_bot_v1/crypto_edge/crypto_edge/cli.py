@@ -337,7 +337,8 @@ def cmd_export(args) -> int:
 def cmd_research(args) -> int:
     from .research.counterfactual import CounterfactualTracker
     cfg, repo, _, _ = _bootstrap(args, need_feed=False)
-    for flag, fn in (("exit_quality", _research_exit_quality),
+    for flag, fn in (("trade_audit", _research_trade_audit),
+                     ("exit_quality", _research_exit_quality),
                      ("fee_scenarios", _research_fee_scenarios),
                      ("atr_economics", _research_atr_economics)):
         if getattr(args, flag, False):
@@ -555,6 +556,104 @@ def _research_excursions(cfg, repo, strategy: str, args) -> int:
     return 0
 
 
+def _research_trade_audit(cfg, repo, strategy: str, args) -> int:
+    """Re-derive every trade's P&L from its stored prices and compare.
+
+    Read-only forensics. It answers one question the aggregate reports cannot:
+    is a surprising row corrupt, or correct and merely surprising.
+    """
+    from .research import economics as ec
+
+    out = ec.trade_audit(repo, strategy, tol=args.recon_tol)
+    only = getattr(args, "trade_id", None)
+    if only:
+        out["rows"] = [r for r in out["rows"] if r["id"] == only]
+
+    if getattr(args, "json", False):
+        print(json.dumps({**out,
+                          "ledger": ec.ledger_provenance(cfg, repo, strategy)},
+                         indent=2, default=str))
+        return 0
+
+    def ts(ms):
+        import datetime as dt
+        return dt.datetime.fromtimestamp(
+            ms / 1000, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+    print("=" * 78)
+    print(f"  TRADE AUDIT — {strategy}   ({cfg.exchange_label()})")
+    print(f"  {out['closed_trades']} closed trade(s); fees simulated at "
+          f"{cfg.execution.fee_label()}")
+    for line in ec.provenance_lines(ec.ledger_provenance(cfg, repo, strategy),
+                                    strategy):
+        print(line)
+    print("=" * 78)
+    if not out["closed_trades"]:
+        print("\n  No closed trades. Nothing to audit.")
+        return 0
+
+    print(f"\nRECONCILIATION  (tolerance ±{out['tolerance']:.4f})")
+    print("  Every row's gross, slippage and net are re-derived from its four")
+    print("  stored prices by re-driving the live `realise_pnl` — the same")
+    print("  function that wrote the row. A disagreement here is the ONLY")
+    print("  signature of a corrupt ledger; everything else is arithmetic.")
+    print(f"  reconciled: {out['reconciled']}/{out['closed_trades']}")
+    bad = out["failed_reconciliation"]
+    print(f"  FAILED    : {len(bad)}"
+          + ("   <-- real accounting/schema fault" if bad else "   (clean)"))
+
+    print("\nSIGNED SLIPPAGE LEGS")
+    print("  `slippage_cost` is the signed difference between the fill and the")
+    print("  signal REFERENCE, not a one-way microstructure cost. The fill")
+    print("  comes from the live book a moment after the candle closed, so a")
+    print("  favourable tick makes a leg negative — a credit, by design.")
+    print(f"  trades with a negative ENTRY leg: {out['negative_entry_leg']}")
+    print(f"  trades with a negative EXIT  leg: {out['negative_exit_leg']}")
+    print(f"  trades where net > gross        : {len(out['net_exceeds_gross'])}")
+
+    flagged = {r["id"]: r for r in bad}
+    for r in out["net_exceeds_gross"]:
+        flagged.setdefault(r["id"], r)
+    if only:
+        flagged = {r["id"]: r for r in out["rows"]}
+    if not flagged:
+        print("\n  Nothing flagged. Every row reconciles and none has net > gross.")
+        return 0
+
+    for r in flagged.values():
+        print("\n" + "-" * 78)
+        print(f"TRADE {r['id']}   {r['symbol']}   {r['side'].upper()}"
+              f"   exit_reason={r['exit_reason']}")
+        print(f"  entry {ts(r['entry_ms'])}   ->   exit {ts(r['exit_ms'])}")
+        print(f"  quantity            {r['qty']:>18,.10g}")
+        print(f"  entry_ref_price     {r['entry_ref_price']:>18,.10g}")
+        print(f"  entry_fill_price    {r['entry_fill_price']:>18,.10g}")
+        print(f"  exit_ref_price      {r['exit_ref_price']:>18,.10g}")
+        print(f"  exit_fill_price     {r['exit_fill_price']:>18,.10g}")
+        print(f"  initial_stop        {r['initial_stop']:>18,.10g}")
+        print(f"  final_stop          {r['final_stop']:>18,.10g}")
+        st, rc, dl = r["stored"], r["recomputed"], r["deltas"]
+        print(f"\n  {'component':<16}{'STORED':>16}{'RECOMPUTED':>16}"
+              f"{'DELTA':>14}")
+        for k in ("gross_pnl", "fees", "slippage_cost", "financing", "net_pnl"):
+            d = dl.get(k)
+            ds = "        (input)" if d is None else f"{d:>+14.6f}"
+            print(f"  {k:<16}{st[k]:>+16.6f}{rc[k]:>+16.6f}{ds}")
+        print(f"\n  slippage split (signed; negative = filled BETTER than ref)")
+        print(f"    entry leg  {r['entry_slippage']:>+14.6f}"
+              f"   ({r['entry_slippage_bps']:+.2f} bps of entry notional)")
+        print(f"    exit  leg  {r['exit_slippage']:>+14.6f}"
+              f"   ({r['exit_slippage_bps']:+.2f} bps of exit notional)")
+        print(f"    total      "
+              f"{r['entry_slippage'] + r['exit_slippage']:>+14.6f}")
+        print(f"\n  identity: net = gross - slippage - fees - financing")
+        print(f"            {st['net_pnl']:+.6f} = {st['gross_pnl']:+.6f}"
+              f" - ({st['slippage_cost']:+.6f}) - {st['fees']:.6f}"
+              f" - {st['financing']:.6f}")
+        print(f"\n  VERDICT: {r['verdict']}")
+    return 0
+
+
 def _research_exit_quality(cfg, repo, strategy: str, args) -> int:
     """Exit behaviour on one accounting basis at a time.
 
@@ -619,10 +718,17 @@ def _research_exit_quality(cfg, repo, strategy: str, args) -> int:
     print(f"  carried {q['cost_flipped_gross']:+.2f} of gross P&L while counting")
     print("  as losses on the net basis. This figure IS the size of the error a")
     print("  gross/net mix-up produces.")
-    if q["impossible_rows"]:
-        print(f"  !! {q['impossible_rows']} row(s) have net > gross, which the")
-        print("     cost model cannot produce. The ledger is inconsistent —")
-        print("     stop here and investigate before reading anything above.")
+    if q["net_exceeds_gross"]:
+        print(f"\n  NET ABOVE GROSS: {q['net_exceeds_gross']} row(s)"
+              f" — {', '.join(q['net_exceeds_gross_ids'][:6])}"
+              + (" …" if len(q["net_exceeds_gross_ids"]) > 6 else ""))
+        print("  Those trades' costs summed NEGATIVE. `slippage_cost` is the")
+        print("  signed difference between the fill and the signal reference,")
+        print("  and the fill comes from the live book a moment later — so a")
+        print("  favourable tick credits that leg, and a credit larger than the")
+        print("  fees puts net above gross. This is the cost model working, not")
+        print("  a corrupt ledger. Confirm per row with `--trade-audit`, which")
+        print("  re-derives each figure from the four stored prices.")
 
     print("\nR-MULTIPLES — P&L over the risk each trade was OPENED with")
     print("  |entry_fill - initial_stop| x qty. The initial stop, not the final")
@@ -1478,6 +1584,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "win rate; needs no trades")
     s.add_argument("--atr-pcts", default="0.25,0.40,0.55,0.70,1.00,1.50",
                    help="comma-separated ATR%% values for --atr-economics")
+    s.add_argument("--trade-audit", action="store_true",
+                   help="re-derive every closed trade's P&L from its four "
+                        "stored prices and compare; dumps the full row for "
+                        "anything that fails to reconcile or has net > gross")
+    s.add_argument("--trade-id", default=None,
+                   help="with --trade-audit, dump this one trade whatever its "
+                        "verdict")
+    s.add_argument("--recon-tol", type=float, default=0.01,
+                   help="how far a recomputed component may sit from the "
+                        "stored one before the row is called inconsistent")
     s.set_defaults(func=cmd_research)
 
     s = sub.add_parser("resume", help="clear a circuit-breaker halt")
