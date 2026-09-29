@@ -552,6 +552,34 @@ and no costs, reported beside the measured cost drag and never as forgone P&L.
 Where no v8 tape exists the row says so: stop and take-profit P&L cannot be
 reproduced for it at all.
 
+**Finding which ledger and which config are actually in force.**
+
+```bash
+python3 scripts/find_ledger.py ~          # every ledger, most trades first
+python3 scripts/show_config.py            # what THIS directory resolves to
+```
+
+Both default paths are relative — `--config config/config.toml` and
+`engine.db_path = "data/crypto_edge.db"` — so the answer to "which file" is a
+property of the working directory, which is exactly what is uncertain when
+something looks wrong. Worse, `db.connect` *creates* a database that is not
+there and `init_db` migrates one that is behind, so a command run from the
+wrong place reports `0 closed trade(s)` against a file it made a second
+earlier. That is indistinguishable, in the output, from a real ledger for a
+strategy that has not traded.
+
+`find_ledger.py` is stdlib-only, so it runs even where numpy is broken — it
+cannot import the package it is looking for. `show_config.py` calls the bot's
+own `load_config`, so `.env` values and `CRYPTO_EDGE_EXCHANGE` /
+`CRYPTO_EDGE_QUOTE` overrides land exactly as they do in a real run, and it
+prints `effective_taker_bps()` rather than the raw field.
+
+Neither can write. Both open every candidate through `open_readonly`, which
+tries `mode=ro` first and falls back to `immutable=1` — in that order, because
+`immutable` makes SQLite skip the write-ahead log, and on a database the bot
+is *currently running against* that silently omits the most recent trades.
+When the fallback is used the output says so.
+
 **Exit quality, on one accounting basis at a time.**
 
 ```bash
